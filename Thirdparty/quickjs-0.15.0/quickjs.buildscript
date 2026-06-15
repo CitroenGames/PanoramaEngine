@@ -52,6 +52,14 @@ generate_debug_info = true
 outdir = ../../bin/posix/Debug
 intdir = ../../build/obj/posix/Debug/QuickJS
 
+[config:Debug|Linux]
+runtime_library = MultiThreadedDebug
+optimization = Disabled
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../../bin/posix/Debug
+intdir = ../../build/obj/posix/Debug/QuickJS
+
 [config:Release|x64]
 runtime_library = MultiThreaded
 optimization = MaxSpeed
@@ -61,6 +69,14 @@ outdir = ../../bin/x64/Release
 intdir = ../../build/obj/x64/Release/QuickJS
 
 [config:Release|macOS]
+runtime_library = MultiThreaded
+optimization = MaxSpeed
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../../bin/posix/Release
+intdir = ../../build/obj/posix/Release/QuickJS
+
+[config:Release|Linux]
 runtime_library = MultiThreaded
 optimization = MaxSpeed
 debug_info = ProgramDatabase

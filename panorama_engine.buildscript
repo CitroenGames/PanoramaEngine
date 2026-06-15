@@ -4,29 +4,15 @@
 # parsed by the library's own panorama_xml SAX parser; the converter emits RML
 # markup as plain text for the host's transitional RmlUi render path.
 include = Thirdparty/quickjs-0.15.0/quickjs.buildscript
-include = examples/examples.buildscript
 
 [project:PanoramaEngine]
 type = lib
 std = 20
-sources = {
-    src/panorama_converter.cpp
-    src/panorama_xml.cpp
-    src/panorama_document_session.cpp
-    src/panorama_package.cpp
-    src/panorama_resource_provider.cpp
-    src/panorama_runtime.cpp
-    src/panorama_render_backend.cpp
-    src/panorama_input.cpp
-    src/panorama_log.cpp
-    src/panorama_dom.cpp
-    src/panorama_style.cpp
-    src/panorama_text_break.cpp
-    src/panorama_layout.cpp
-    src/panorama_paint.cpp
-    src/panorama_anim.cpp
+sources = src/*.cpp
+headers = {
+    include/**/*.hpp
+    src/*.hpp
 }
-headers = include/**/*.hpp
 includes = include
 public_includes = include
 warning_level = Level3
@@ -55,6 +41,14 @@ generate_debug_info = true
 outdir = ../../../bin/posix/Debug
 intdir = ../../../build/obj/posix/Debug/PanoramaEngine
 
+[config:Debug|Linux]
+runtime_library = MultiThreadedDebug
+optimization = Disabled
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../../../bin/posix/Debug
+intdir = ../../../build/obj/posix/Debug/PanoramaEngine
+
 [config:Release|x64]
 runtime_library = MultiThreaded
 optimization = MaxSpeed
@@ -64,6 +58,14 @@ outdir = ../../../bin/x64/Release
 intdir = ../../../build/obj/x64/Release/PanoramaEngine
 
 [config:Release|macOS]
+runtime_library = MultiThreaded
+optimization = MaxSpeed
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../../../bin/posix/Release
+intdir = ../../../build/obj/posix/Release/PanoramaEngine
+
+[config:Release|Linux]
 runtime_library = MultiThreaded
 optimization = MaxSpeed
 debug_info = ProgramDatabase
