@@ -1,0 +1,147 @@
+# PanoramaEngine examples: small standalone console apps that embed the engine
+# with no host integration (no RmlUi, no GPU, no game filesystem). Each one is a
+# single main.cpp linking only PanoramaEngine (+ its vendored QuickJS).
+
+[project:PanoramaExampleHelloLayout]
+type = exe
+std = 20
+sources = 01_hello_layout/main.cpp
+includes = ../include
+warning_level = Level4
+multiprocessor = true
+exceptions = true
+rtti = true
+subsystem = Console
+target_link_libraries(PRIVATE PanoramaEngine)
+if(Windows)
+{
+    defines = NOMINMAX, WIN32_LEAN_AND_MEAN
+}
+
+[config:Debug|x64]
+runtime_library = MultiThreadedDebug
+optimization = Disabled
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../../../../bin/x64/Debug
+intdir = ../../../../build/obj/x64/Debug/PanoramaExampleHelloLayout
+
+[config:Debug|macOS]
+runtime_library = MultiThreadedDebug
+optimization = Disabled
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../../../../bin/posix/Debug
+intdir = ../../../../build/obj/posix/Debug/PanoramaExampleHelloLayout
+
+[config:Release|x64]
+runtime_library = MultiThreaded
+optimization = MaxSpeed
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../../../../bin/x64/Release
+intdir = ../../../../build/obj/x64/Release/PanoramaExampleHelloLayout
+
+[config:Release|macOS]
+runtime_library = MultiThreaded
+optimization = MaxSpeed
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../../../../bin/posix/Release
+intdir = ../../../../build/obj/posix/Release/PanoramaExampleHelloLayout
+
+[project:PanoramaExampleSoftwareRaster]
+type = exe
+std = 20
+sources = 02_software_raster/main.cpp
+includes = ../include
+warning_level = Level4
+multiprocessor = true
+exceptions = true
+rtti = true
+subsystem = Console
+target_link_libraries(PRIVATE PanoramaEngine)
+if(Windows)
+{
+    defines = NOMINMAX, WIN32_LEAN_AND_MEAN
+}
+
+[config:Debug|x64]
+runtime_library = MultiThreadedDebug
+optimization = Disabled
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../../../../bin/x64/Debug
+intdir = ../../../../build/obj/x64/Debug/PanoramaExampleSoftwareRaster
+
+[config:Debug|macOS]
+runtime_library = MultiThreadedDebug
+optimization = Disabled
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../../../../bin/posix/Debug
+intdir = ../../../../build/obj/posix/Debug/PanoramaExampleSoftwareRaster
+
+[config:Release|x64]
+runtime_library = MultiThreaded
+optimization = MaxSpeed
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../../../../bin/x64/Release
+intdir = ../../../../build/obj/x64/Release/PanoramaExampleSoftwareRaster
+
+[config:Release|macOS]
+runtime_library = MultiThreaded
+optimization = MaxSpeed
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../../../../bin/posix/Release
+intdir = ../../../../build/obj/posix/Release/PanoramaExampleSoftwareRaster
+
+[project:PanoramaExampleScriptedUi]
+type = exe
+std = 20
+sources = 03_scripted_ui/main.cpp
+includes = ../include
+warning_level = Level4
+multiprocessor = true
+exceptions = true
+rtti = true
+subsystem = Console
+target_link_libraries(PRIVATE PanoramaEngine)
+if(Windows)
+{
+    defines = NOMINMAX, WIN32_LEAN_AND_MEAN
+}
+
+[config:Debug|x64]
+runtime_library = MultiThreadedDebug
+optimization = Disabled
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../../../../bin/x64/Debug
+intdir = ../../../../build/obj/x64/Debug/PanoramaExampleScriptedUi
+
+[config:Debug|macOS]
+runtime_library = MultiThreadedDebug
+optimization = Disabled
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../../../../bin/posix/Debug
+intdir = ../../../../build/obj/posix/Debug/PanoramaExampleScriptedUi
+
+[config:Release|x64]
+runtime_library = MultiThreaded
+optimization = MaxSpeed
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../../../../bin/x64/Release
+intdir = ../../../../build/obj/x64/Release/PanoramaExampleScriptedUi
+
+[config:Release|macOS]
+runtime_library = MultiThreaded
+optimization = MaxSpeed
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../../../../bin/posix/Release
+intdir = ../../../../build/obj/posix/Release/PanoramaExampleScriptedUi

@@ -1,0 +1,17 @@
+#pragma once
+
+#include "ui/panorama/panorama_anim.hpp"
+#include "ui/panorama/panorama_converter.hpp"
+#include "ui/panorama/panorama_document_session.hpp"
+#include "ui/panorama/panorama_dom.hpp"
+#include "ui/panorama/panorama_input.hpp"
+#include "ui/panorama/panorama_layout.hpp"
+#include "ui/panorama/panorama_localization.hpp"
+#include "ui/panorama/panorama_log.hpp"
+#include "ui/panorama/panorama_package.hpp"
+#include "ui/panorama/panorama_paint.hpp"
+#include "ui/panorama/panorama_render_backend.hpp"
+#include "ui/panorama/panorama_resource_provider.hpp"
+#include "ui/panorama/panorama_runtime.hpp"
+#include "ui/panorama/panorama_style.hpp"
+#include "ui/panorama/panorama_xml.hpp"

@@ -1,0 +1,72 @@
+# PanoramaEngine: self-contained CS:GO Panorama UI engine.
+# QuickJS is vendored as a private dependency under this library's own Thirdparty/.
+# The library is standalone: no engine or RmlUi dependency. Panorama XML is
+# parsed by the library's own panorama_xml SAX parser; the converter emits RML
+# markup as plain text for the host's transitional RmlUi render path.
+include = Thirdparty/quickjs-0.15.0/quickjs.buildscript
+include = examples/examples.buildscript
+
+[project:PanoramaEngine]
+type = lib
+std = 20
+sources = {
+    src/panorama_converter.cpp
+    src/panorama_xml.cpp
+    src/panorama_document_session.cpp
+    src/panorama_package.cpp
+    src/panorama_resource_provider.cpp
+    src/panorama_runtime.cpp
+    src/panorama_render_backend.cpp
+    src/panorama_input.cpp
+    src/panorama_log.cpp
+    src/panorama_dom.cpp
+    src/panorama_style.cpp
+    src/panorama_text_break.cpp
+    src/panorama_layout.cpp
+    src/panorama_paint.cpp
+    src/panorama_anim.cpp
+}
+headers = include/**/*.hpp
+includes = include
+public_includes = include
+warning_level = Level3
+multiprocessor = true
+exceptions = true
+rtti = true
+target_link_libraries(PUBLIC QuickJS)
+if(Windows)
+{
+    defines = NOMINMAX, WIN32_LEAN_AND_MEAN
+}
+
+[config:Debug|x64]
+runtime_library = MultiThreadedDebug
+optimization = Disabled
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../../../bin/x64/Debug
+intdir = ../../../build/obj/x64/Debug/PanoramaEngine
+
+[config:Debug|macOS]
+runtime_library = MultiThreadedDebug
+optimization = Disabled
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../../../bin/posix/Debug
+intdir = ../../../build/obj/posix/Debug/PanoramaEngine
+
+[config:Release|x64]
+runtime_library = MultiThreaded
+optimization = MaxSpeed
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../../../bin/x64/Release
+intdir = ../../../build/obj/x64/Release/PanoramaEngine
+
+[config:Release|macOS]
+runtime_library = MultiThreaded
+optimization = MaxSpeed
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../../../bin/posix/Release
+intdir = ../../../build/obj/posix/Release/PanoramaEngine
