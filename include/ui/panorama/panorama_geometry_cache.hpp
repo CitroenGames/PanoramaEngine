@@ -14,7 +14,7 @@
 // tree edit that shifts command order) is easy to get subtly wrong. This class
 // is the host-independent solution, factored out of OpenStrike's own Panorama
 // host bridge after it had already had these bugs found and fixed once.
-namespace openstrike
+namespace panorama
 {
 // Content signature of a single draw command, scaled by `ui_scale` (geometry is
 // compiled in framebuffer pixels = design pixels * ui_scale, so the same command

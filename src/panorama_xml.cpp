@@ -7,14 +7,14 @@
 #include <cctype>
 #include <cstring>
 
-namespace openstrike
+namespace panorama
 {
 namespace
 {
-using panorama_strings::to_lower;
+using strings::to_lower;
 
 // XML whitespace is the spec's fixed set (space/tab/newline/CR), intentionally
-// narrower than panorama_strings::is_space's locale set.
+// narrower than strings::is_space's locale set.
 bool is_whitespace(char ch)
 {
     return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r';

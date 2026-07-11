@@ -14,7 +14,7 @@
 //
 // We own the property set, so Panorama's own units (fit-children,
 // fill-parent-flow, width/height-percentage) and box model are first-class.
-namespace openstrike
+namespace panorama
 {
 struct PanoramaNode;
 

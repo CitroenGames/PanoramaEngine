@@ -12,7 +12,7 @@
 // panorama_xml.cpp intentionally keeps its own is_whitespace/strip helpers:
 // XML whitespace is the spec's space/tab/newline/carriage-return set, not the
 // locale-aware std::isspace set used here.
-namespace openstrike::panorama_strings
+namespace panorama::strings
 {
 inline bool is_space(char ch)
 {

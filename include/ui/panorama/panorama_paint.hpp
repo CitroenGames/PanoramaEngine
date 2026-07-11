@@ -12,7 +12,7 @@
 // display list of textured/coloured quads. The host translates the display list
 // into its own backend calls. Nothing here depends on FreeType or a GPU — colours
 // are straight (non-premultiplied) RGBA; the host premultiplies if it must.
-namespace openstrike
+namespace panorama
 {
 struct PanoramaPaintVertex
 {

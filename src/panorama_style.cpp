@@ -12,7 +12,7 @@
 #include <tuple>
 #include <unordered_map>
 
-namespace openstrike
+namespace panorama
 {
 PanoramaCascadeStats& panorama_cascade_stats()
 {
@@ -36,10 +36,10 @@ PanoramaCascadeStats panorama_cascade_stats_take()
 
 namespace
 {
-using panorama_strings::is_space;
-using panorama_strings::starts_with;
-using panorama_strings::to_lower;
-using panorama_strings::trim;
+using strings::is_space;
+using strings::starts_with;
+using strings::to_lower;
+using strings::trim;
 
 bool is_custom_property_name(std::string_view property)
 {

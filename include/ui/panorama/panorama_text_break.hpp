@@ -12,7 +12,7 @@
 // outside printable ASCII to ICU; this engine has no ICU, so non-ASCII bytes
 // are simply not break opportunities (no CJK breaking — acceptable for the
 // CS:GO Latin UI corpus).
-namespace openstrike
+namespace panorama
 {
 // WebCore isBreakableSpace (NonBreakingSpaceBehavior::IgnoreNonBreakingSpace —
 // the white-space:normal default; NBSP is U+00A0, outside ASCII here anyway).

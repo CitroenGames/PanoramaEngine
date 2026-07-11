@@ -20,7 +20,7 @@
 //   - Text containing `{{ ... }}` data-binding expressions keeps `<` inside the
 //     brackets as data instead of treating it as markup.
 //   - Parsing stops once the root element closes; trailing content is ignored.
-namespace openstrike
+namespace panorama
 {
 // Attribute list preserving document order.
 class PanoramaXmlAttributes

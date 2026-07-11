@@ -4,7 +4,7 @@
 #include <cstring>
 #include <utility>
 
-namespace openstrike
+namespace panorama
 {
 namespace
 {

@@ -3,7 +3,7 @@
 #include <cstdio>
 #include <utility>
 
-namespace openstrike
+namespace panorama
 {
 namespace
 {

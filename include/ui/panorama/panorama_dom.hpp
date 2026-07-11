@@ -14,7 +14,7 @@
 // Panorama DOM: a lightweight node tree built directly from layout XML by a
 // self-contained parser. This is the tree the cascade, layout solver, and QuickJS
 // `Panel` binding operate on.
-namespace openstrike
+namespace panorama
 {
 // Opaque, host-assigned texture identifier. 0 means "no texture" (solid fill).
 // Pointer-sized so 64-bit handles

@@ -9,7 +9,7 @@
 #include <string>
 #include <system_error>
 
-namespace openstrike
+namespace panorama
 {
 namespace
 {

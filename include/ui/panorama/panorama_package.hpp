@@ -15,7 +15,7 @@
 // archive into memory once on open() and serves entries from there; there is
 // no streaming or lazy per-entry I/O. Feed an opened package into
 // PanoramaPackageResourceProvider to use it with a PanoramaResourceManager.
-namespace openstrike
+namespace panorama
 {
 class PanoramaPackage
 {

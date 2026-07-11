@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace openstrike
+namespace panorama
 {
 namespace
 {

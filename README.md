@@ -87,7 +87,7 @@ More build details are in [docs/building.md](docs/building.md).
 #include "ui/panorama/panorama_resource_provider.hpp"
 #include "ui/panorama/panorama_runtime.hpp"
 
-using namespace openstrike;
+using namespace panorama;
 
 PanoramaDocumentSession session;
 session.resources().add_provider(
@@ -196,7 +196,7 @@ in [docs/integration.md](docs/integration.md).
 
 ## Notes For Hosts
 
-- The public namespace is `openstrike`, matching the original host integration.
+- The public namespace is `panorama`, matching the original host integration.
 - `PanoramaDrawList` colors are straight, non-premultiplied RGBA. Premultiply in
   the renderer only if the backend blend state requires it.
 - Use `PanoramaFontAtlas` when you want the built-in FreeType text path. Custom

@@ -21,7 +21,7 @@
 #include <utility>
 #include <vector>
 
-namespace openstrike
+namespace panorama
 {
 namespace
 {

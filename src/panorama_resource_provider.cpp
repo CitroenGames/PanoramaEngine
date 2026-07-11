@@ -6,7 +6,7 @@
 #include <system_error>
 #include <utility>
 
-namespace openstrike
+namespace panorama
 {
 namespace
 {

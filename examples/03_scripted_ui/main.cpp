@@ -102,17 +102,17 @@ $.RegisterEventHandler('AppToggled', $.GetContextPanel(), function () {
 $.Msg('app.js loaded');
 )js";
 
-void recompute(openstrike::PanoramaDocumentSession& session, openstrike::PanoramaNode& root)
+void recompute(panorama::PanoramaDocumentSession& session, panorama::PanoramaNode& root)
 {
     session.style_sheet().compute(root);
-    openstrike::panorama_apply_visibility_overrides(root);
-    openstrike::panorama_apply_control_presentation(root);
-    openstrike::layout_panorama_tree(root, 1280.0F, 720.0F);
+    panorama::panorama_apply_visibility_overrides(root);
+    panorama::panorama_apply_control_presentation(root);
+    panorama::layout_panorama_tree(root, 1280.0F, 720.0F);
 }
 
-void print_status(openstrike::PanoramaNode& root)
+void print_status(panorama::PanoramaNode& root)
 {
-    const openstrike::PanoramaNode* status = root.find_by_id("Status");
+    const panorama::PanoramaNode* status = root.find_by_id("Status");
     if (status == nullptr)
     {
         std::printf("#Status not found\n");
@@ -127,7 +127,7 @@ void print_status(openstrike::PanoramaNode& root)
 
 int main()
 {
-    using namespace openstrike;
+    using namespace panorama;
 
     // Load the document (example-01 pipeline) ...
     PanoramaDocumentSession session;

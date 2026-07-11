@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-namespace openstrike
+namespace panorama
 {
 struct PanoramaRuntimeScript
 {

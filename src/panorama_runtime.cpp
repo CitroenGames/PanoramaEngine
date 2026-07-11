@@ -21,7 +21,7 @@
 #include <utility>
 #include <vector>
 
-namespace openstrike
+namespace panorama
 {
 namespace
 {
@@ -73,8 +73,8 @@ std::string node_attribute(const PanoramaNode* node, const std::string& key, con
     return it != node->attributes.end() ? it->second : fallback;
 }
 
-using panorama_strings::to_lower;
-using panorama_strings::trim;
+using strings::to_lower;
+using strings::trim;
 
 bool set_node_attribute(PanoramaNode& node, const std::string& key, std::string value)
 {

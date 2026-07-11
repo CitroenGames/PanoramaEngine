@@ -85,19 +85,19 @@ struct CpuTexture
 // release are pure virtual on PanoramaRenderBackend but never actually used
 // -- this example walks PanoramaDrawList itself instead of going through
 // PanoramaGeometryCache, so they're no-ops.
-class CpuTextureStore final : public openstrike::PanoramaRenderBackend
+class CpuTextureStore final : public panorama::PanoramaRenderBackend
 {
 public:
-    openstrike::PanoramaTextureId generate_texture(std::span<const unsigned char> rgba, int width, int height) override
+    panorama::PanoramaTextureId generate_texture(std::span<const unsigned char> rgba, int width, int height) override
     {
-        const openstrike::PanoramaTextureId id = next_texture_id_++;
+        const panorama::PanoramaTextureId id = next_texture_id_++;
         textures_[id] = CpuTexture{width, height, std::vector<std::uint8_t>(rgba.begin(), rgba.end())};
         return id;
     }
 
-    void release_texture(openstrike::PanoramaTextureId texture) override { textures_.erase(texture); }
+    void release_texture(panorama::PanoramaTextureId texture) override { textures_.erase(texture); }
 
-    bool update_texture(openstrike::PanoramaTextureId texture, std::span<const unsigned char> rgba, int width, int height) override
+    bool update_texture(panorama::PanoramaTextureId texture, std::span<const unsigned char> rgba, int width, int height) override
     {
         const auto it = textures_.find(texture);
         if (it == textures_.end() || it->second.width != width || it->second.height != height)
@@ -108,24 +108,24 @@ public:
         return true;
     }
 
-    openstrike::PanoramaCompiledGeometryHandle compile_geometry(
-        std::span<const openstrike::PanoramaPaintVertex>, std::span<const int>, float) override
+    panorama::PanoramaCompiledGeometryHandle compile_geometry(
+        std::span<const panorama::PanoramaPaintVertex>, std::span<const int>, float) override
     {
         return ++next_geometry_id_;
     }
-    void render_geometry(openstrike::PanoramaCompiledGeometryHandle, openstrike::PanoramaTextureId) override {}
-    void release_geometry(openstrike::PanoramaCompiledGeometryHandle) override {}
+    void render_geometry(panorama::PanoramaCompiledGeometryHandle, panorama::PanoramaTextureId) override {}
+    void release_geometry(panorama::PanoramaCompiledGeometryHandle) override {}
 
-    [[nodiscard]] const CpuTexture* find(openstrike::PanoramaTextureId id) const
+    [[nodiscard]] const CpuTexture* find(panorama::PanoramaTextureId id) const
     {
         const auto it = textures_.find(id);
         return it == textures_.end() ? nullptr : &it->second;
     }
 
 private:
-    std::unordered_map<openstrike::PanoramaTextureId, CpuTexture> textures_;
-    openstrike::PanoramaTextureId next_texture_id_ = 1;
-    openstrike::PanoramaCompiledGeometryHandle next_geometry_id_ = 0;
+    std::unordered_map<panorama::PanoramaTextureId, CpuTexture> textures_;
+    panorama::PanoramaTextureId next_texture_id_ = 1;
+    panorama::PanoramaCompiledGeometryHandle next_geometry_id_ = 0;
 };
 
 // Fills one triangle with per-vertex colour interpolation (barycentric). When
@@ -135,9 +135,9 @@ private:
 // turn into coloured, anti-aliased text.
 inline void rasterize_triangle(
     Framebuffer& fb,
-    const openstrike::PanoramaPaintVertex& v0,
-    const openstrike::PanoramaPaintVertex& v1,
-    const openstrike::PanoramaPaintVertex& v2,
+    const panorama::PanoramaPaintVertex& v0,
+    const panorama::PanoramaPaintVertex& v1,
+    const panorama::PanoramaPaintVertex& v2,
     const CpuTexture* texture = nullptr)
 {
     const float min_x = std::min({v0.x, v1.x, v2.x});
@@ -201,9 +201,9 @@ inline void rasterize_triangle(
 // it ever emits). A texture id with no matching entry in `textures` (nothing
 // generate_texture()'d it, e.g. no font was loaded) rasterizes as untextured,
 // same as examples/02_software_raster's fully-untextured path.
-inline void rasterize_draw_list(Framebuffer& fb, const openstrike::PanoramaDrawList& draw_list, const CpuTextureStore& textures)
+inline void rasterize_draw_list(Framebuffer& fb, const panorama::PanoramaDrawList& draw_list, const CpuTextureStore& textures)
 {
-    for (const openstrike::PanoramaDrawCommand& command : draw_list.commands)
+    for (const panorama::PanoramaDrawCommand& command : draw_list.commands)
     {
         const CpuTexture* texture = command.texture != 0 ? textures.find(command.texture) : nullptr;
         for (std::size_t i = 0; i + 2 < command.indices.size(); i += 3)
@@ -243,9 +243,9 @@ public:
         }
 
         const std::filesystem::path resource_root = absolute.parent_path();
-        openstrike::PanoramaDocumentSessionOptions options;
+        panorama::PanoramaDocumentSessionOptions options;
         options.resource_root = resource_root;
-        session_.resources().add_provider(std::make_unique<openstrike::PanoramaDirectoryResourceProvider>(resource_root));
+        session_.resources().add_provider(std::make_unique<panorama::PanoramaDirectoryResourceProvider>(resource_root));
 
         if (!session_.load(absolute.filename().string(), options))
         {
@@ -264,7 +264,7 @@ public:
         // glyph_source()/text_measure() below then degrade to the same
         // "panels paint, text is skipped" behaviour as
         // examples/02_software_raster.
-        openstrike::set_panorama_render_backend(&textures_);
+        panorama::set_panorama_render_backend(&textures_);
         if (!font_atlas_.load(resource_root))
         {
             std::fprintf(
@@ -273,7 +273,7 @@ public:
                 (resource_root / "resource/ui/fonts").string().c_str());
         }
 
-        openstrike::PanoramaNode& root = *session_.document().root;
+        panorama::PanoramaNode& root = *session_.document().root;
         session_.style_sheet().compute(root);
         panorama_apply_visibility_overrides(root);
         panorama_apply_control_presentation(root);
@@ -289,12 +289,12 @@ public:
         width = std::max(width, 1);
         height = std::max(height, 1);
 
-        openstrike::PanoramaNode& root = *session_.document().root;
+        panorama::PanoramaNode& root = *session_.document().root;
         layout_panorama_tree(root, static_cast<float>(width), static_cast<float>(height), font_atlas_.text_measure());
 
         font_atlas_.ensure_tree_text(root);
         font_atlas_.upload_if_dirty();
-        const openstrike::PanoramaDrawList draw_list = build_panorama_draw_list(root, font_atlas_.glyph_source());
+        const panorama::PanoramaDrawList draw_list = build_panorama_draw_list(root, font_atlas_.glyph_source());
 
         framebuffer_.resize(width, height);
         framebuffer_.clear(24, 27, 32);
@@ -304,8 +304,8 @@ public:
     [[nodiscard]] const Framebuffer& framebuffer() const noexcept { return framebuffer_; }
 
 private:
-    openstrike::PanoramaDocumentSession session_;
-    openstrike::PanoramaFontAtlas font_atlas_;
+    panorama::PanoramaDocumentSession session_;
+    panorama::PanoramaFontAtlas font_atlas_;
     CpuTextureStore textures_;
     Framebuffer framebuffer_;
 };

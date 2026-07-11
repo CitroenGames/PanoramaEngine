@@ -1,6 +1,6 @@
 #include "ui/panorama/panorama_render_backend.hpp"
 
-namespace openstrike
+namespace panorama
 {
 namespace
 {

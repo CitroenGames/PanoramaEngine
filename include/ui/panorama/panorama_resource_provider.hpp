@@ -18,7 +18,7 @@
 // usually, several of them layered in a PanoramaResourceManager) so a host can
 // back Panorama paths with loose files, an in-memory map, or a .pbin package
 // without the engine caring which.
-namespace openstrike
+namespace panorama
 {
 // `bytes` is the raw file content; `source` is a human-readable origin (e.g. a
 // package path or "memory") used only for logging/diagnostics, never parsed.

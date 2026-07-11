@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cmath>
 
-namespace openstrike
+namespace panorama
 {
 namespace
 {

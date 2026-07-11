@@ -8,11 +8,11 @@
 #include <optional>
 #include <utility>
 
-namespace openstrike
+namespace panorama
 {
 namespace
 {
-using panorama_strings::starts_with;
+using strings::starts_with;
 }
 
 std::unique_ptr<PanoramaNode> clone_panorama_node(const PanoramaNode& source, PanoramaNode* parent)

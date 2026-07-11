@@ -7,7 +7,7 @@
 // Panorama layout solver. Implements Panorama's box model on a styled
 // PanoramaNode tree: a bottom-up intrinsic (min-content) pass followed by a
 // top-down resolve pass that assigns every node an absolute PanoramaLayoutBox.
-namespace openstrike
+namespace panorama
 {
 // Measures the on-screen size of a run of text at a given font size. The layout
 // solver needs this for fit-children labels. The default is a metrics-free

@@ -13,7 +13,7 @@
 // DropDown open/select/dismiss emulation. The host only supplies pointer samples
 // in design-space coordinates; how they are obtained (SDL, Win32, a test) is the
 // host's business.
-namespace openstrike
+namespace panorama
 {
 class PanoramaRuntime;
 

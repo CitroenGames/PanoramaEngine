@@ -11,7 +11,7 @@
 // the host feeds them through this interface (compile once, render per frame).
 // Every hook except texture/geometry management has a safe no-op default, so a
 // minimal backend only needs textures + geometry to get pixels on screen.
-namespace openstrike
+namespace panorama
 {
 using PanoramaCompiledGeometryHandle = std::uintptr_t;
 

@@ -12,7 +12,7 @@
 //   panorama_advance_anim(root, dt);   // writes interpolated values into computed
 // Call panorama_capture_anim_targets once on the base (pre-script) style so the
 // initial displayed value is the "from" of the first transition.
-namespace openstrike
+namespace panorama
 {
 // A CSS transition that finished during an advance: the displayed value reached
 // the cascade target (WebCore DeclarativeAnimation::invalidateDOMEvents fires

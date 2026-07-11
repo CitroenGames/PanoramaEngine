@@ -155,9 +155,9 @@ struct Framebuffer
 // Fills one triangle with per-vertex colour interpolation (barycentric).
 void rasterize_triangle(
     Framebuffer& fb,
-    const openstrike::PanoramaPaintVertex& v0,
-    const openstrike::PanoramaPaintVertex& v1,
-    const openstrike::PanoramaPaintVertex& v2)
+    const panorama::PanoramaPaintVertex& v0,
+    const panorama::PanoramaPaintVertex& v1,
+    const panorama::PanoramaPaintVertex& v2)
 {
     const float min_x = std::min({v0.x, v1.x, v2.x});
     const float max_x = std::max({v0.x, v1.x, v2.x});
@@ -251,7 +251,7 @@ bool write_bmp(const Framebuffer& fb, const char* path)
 
 int main()
 {
-    using namespace openstrike;
+    using namespace panorama;
 
     constexpr int kWidth = 960;
     constexpr int kHeight = 540;

@@ -10,7 +10,7 @@
 // thirdparty library and must not depend on the host application's logger, so it
 // emits through a sink the host can install. Without a sink, messages go to
 // stderr. This keeps the dependency direction host -> engine only.
-namespace openstrike
+namespace panorama
 {
 enum class PanoramaLogLevel
 {

@@ -10,7 +10,7 @@
 #include <sstream>
 #include <utility>
 
-namespace openstrike
+namespace panorama
 {
 namespace
 {
@@ -93,10 +93,10 @@ const TreeGuardDestroyedRecord* tree_guard_find_destroyed(const void* ptr)
     return best;
 }
 
-using panorama_strings::is_space;
-using panorama_strings::starts_with;
-using panorama_strings::to_lower;
-using panorama_strings::trim;
+using strings::is_space;
+using strings::starts_with;
+using strings::to_lower;
+using strings::trim;
 
 template <std::size_t Count>
 bool tag_in(std::string_view tag, const std::array<std::string_view, Count>& tags)

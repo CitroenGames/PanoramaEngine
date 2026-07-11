@@ -101,9 +101,9 @@ constexpr std::string_view kStyleCss = R"css(
 }
 )css";
 
-void print_tree(const openstrike::PanoramaNode& node, int depth)
+void print_tree(const panorama::PanoramaNode& node, int depth)
 {
-    const openstrike::PanoramaLayoutBox& box = node.layout;
+    const panorama::PanoramaLayoutBox& box = node.layout;
     std::printf(
         "%*s<%s>%s%s  box=(%.0f, %.0f  %.0fx%.0f)%s\n",
         depth * 2,
@@ -125,7 +125,7 @@ void print_tree(const openstrike::PanoramaNode& node, int depth)
 
 int main()
 {
-    using namespace openstrike;
+    using namespace panorama;
 
     // 1. Register the document + stylesheet with an in-memory resource provider.
     //    Real hosts add a PanoramaPackageResourceProvider (.pbin zip) and/or a

@@ -6,7 +6,7 @@
 #include <filesystem>
 #include <memory>
 
-namespace openstrike
+namespace panorama
 {
 // FreeType-backed text provider for the native Panorama renderer. It keeps glyph
 // metrics in Panorama design units and uploads a premultiplied glyph atlas through

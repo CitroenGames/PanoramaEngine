@@ -21,7 +21,7 @@
 // found by walking up from a resource root, falling back to a small built-in
 // English default set so common menu strings resolve even without a real game
 // resource tree. Only English is loaded — there is no runtime language switch.
-namespace openstrike
+namespace panorama
 {
 class PanoramaLocalization
 {

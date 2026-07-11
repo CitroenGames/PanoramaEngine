@@ -13,7 +13,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace openstrike
+namespace panorama
 {
 struct PanoramaDocumentSessionOptions
 {
