@@ -42,7 +42,7 @@ sequencing a host is expected to drive.
 
 | Header | Owns |
 | --- | --- |
-| `panorama_xml.hpp` | SAX-style XML parser (`PanoramaXmlSaxParser`) shared by the DOM loader and (historically) the RML converter |
+| `panorama_xml.hpp` | SAX-style XML parser (`PanoramaXmlSaxParser`) shared by the DOM loader and the RML converter |
 | `panorama_dom.hpp` | `PanoramaNode`, the document tree, node lifetime observers |
 | `panorama_style.hpp` | `PanoramaComputedStyle`, `PanoramaStyleSheet` (parse + cascade + `@define` + `@keyframes` registry) |
 | `panorama_layout.hpp` | `layout_panorama_tree()`, `PanoramaTextMeasure` |
@@ -57,6 +57,7 @@ sequencing a host is expected to drive.
 | `panorama_document_session.hpp` | `PanoramaDocumentSession` — owns resources + localization + DOM + stylesheet together, handles `<Frame>`/`<styles>` expansion and layout-scoped cascade |
 | `panorama_package.hpp` | `.pbin` (Valve-style stored zip) package reader |
 | `panorama_localization.hpp` | Dialog-variable token replacement / localization table |
+| `panorama_converter.hpp` | `convert_panorama_document()`/`convert_panorama_css()` — best-effort, lossy Panorama-to-RmlUi (RML/RCSS) source converter; an alternate integration path outside the native layout/paint pipeline, see [panorama-support.md](panorama-support.md#rml-conversion-alternate-path) |
 | `panorama_text_break.hpp` | WebCore-style ASCII line-break opportunity finder used by wrapping |
 | `panorama_text_edit.hpp` | Text-entry caret/selection editing model |
 | `panorama_log.hpp` | The engine's own sink-based logger (deliberately does not depend on any host logging header) |

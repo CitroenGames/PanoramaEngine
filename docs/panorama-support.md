@@ -95,6 +95,28 @@ incremental-submission implementation; a host does not have to use it, but
 writing a correct alternative from scratch is nontrivial (see that header's
 own documentation for why).
 
+## RML Conversion (Alternate Path)
+
+`panorama_converter.hpp` (`convert_panorama_document()`, `convert_panorama_css()`)
+is a separate, best-effort source-to-source converter from Panorama XML/CSS to
+RmlUi's RML/RCSS markup, for hosts that want to render Panorama-authored UI
+through RmlUi's own layout and renderer instead of this engine's native
+pipeline (everything else on this page). It does not sit in the pipeline
+described above and nothing else in the engine depends on it.
+
+The conversion is lossy by design: because RmlUi's box model and CSS dialect
+differ from Panorama's, declarations the converter cannot faithfully map are
+dropped rather than emitted as markup RmlUi would reject. This includes
+Panorama-only sizing primitives (`fit-children`, `fill-parent-flow`,
+`width-percentage`/`height-percentage`), gradients, `blur`, transforms,
+unresolved `@define`/theme-variable values, and `@keyframes`/`@media` blocks.
+`<scripts>` includes are collected in the result but never translated —
+Panorama JavaScript has no RmlUi equivalent, so a host decides separately
+whether to run them (e.g. against this engine's own `PanoramaRuntime`
+alongside the RmlUi-rendered visuals). Expect a reasonable RmlUi rendering of
+the document's structure and styling, not pixel parity with the native
+pipeline.
+
 ## Known limits
 
 - `.pbin` package reading expects Valve-style stored (uncompressed) zip

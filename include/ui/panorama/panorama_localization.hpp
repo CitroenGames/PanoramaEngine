@@ -15,11 +15,22 @@
 #include <unordered_set>
 #include <vector>
 
+// Dialog-variable token replacement: resolves Valve `#SFUI_...`-style tokens
+// (from Source's Steamworks localization file format, `"tokens" { "#Key"
+// "Value" }`) against `resource/valve_english.txt`/`resource/csgo_english.txt`
+// found by walking up from a resource root, falling back to a small built-in
+// English default set so common menu strings resolve even without a real game
+// resource tree. Only English is loaded — there is no runtime language switch.
 namespace openstrike
 {
 class PanoramaLocalization
 {
 public:
+    // Clears all previously loaded tokens (built-in defaults are reloaded),
+    // then searches `resource_root` and its two parent directories for
+    // `resource/valve_english.txt` and `resource/csgo_english.txt`, loading
+    // whichever exist. Safe to call again with a different root; each call
+    // fully replaces the previous token set rather than merging into it.
     void load(const std::filesystem::path& resource_root)
     {
         tokens_.clear();
@@ -63,6 +74,12 @@ public:
         }
     }
 
+    // Resolves a `#Token` (or bare `Token`) against the loaded table, case-
+    // insensitively. An `@`-suffixed gender/plural marker is stripped before
+    // lookup. If the token isn't found: returns the token text unchanged when
+    // `text` started with `#` (so an unresolved token stays visibly a token
+    // rather than silently vanishing), or returns `text` verbatim when it
+    // didn't (plain text passed through localize() is not a lookup failure).
     [[nodiscard]] std::string localize(std::string_view text) const
     {
         const std::string token = normalize_token(text);
@@ -79,6 +96,10 @@ public:
         return has_token_marker(text) ? token : std::string(text);
     }
 
+    // Recursively localizes every node's `text` in place, but only touches
+    // strings that already look like a token (leading `#`) — plain authored
+    // text is left untouched, so this is safe to run over a whole tree
+    // without double-localizing.
     void localize_tree(PanoramaNode& node) const
     {
         if (!node.text.empty() && has_token_marker(node.text))

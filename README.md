@@ -35,6 +35,11 @@ optional FreeType-backed font atlas is backed by the vendored
 - `PanoramaGeometryCache`, an incremental GPU-geometry submitter: replays an
   unchanged frame with zero diffing, and otherwise reuses/recompiles only the
   draw commands that actually changed since the previous frame.
+- A best-effort Panorama-to-RmlUi (RML/RCSS) source converter
+  (`panorama_converter.hpp`) for hosts that want to render Panorama-authored
+  UI through RmlUi instead of this engine's native pipeline — a separate,
+  lossy alternate path; see
+  [docs/panorama-support.md](docs/panorama-support.md#rml-conversion-alternate-path).
 
 ## Repository Layout
 

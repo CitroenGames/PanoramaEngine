@@ -16,9 +16,12 @@ and register it on a `PanoramaResourceManager` (owned by a
 - `PanoramaDirectoryResourceProvider` — reads from a real directory.
 - `PanoramaPackageResourceProvider` — reads from a parsed `.pbin` package.
 
-Providers are checked in priority order (`add_provider(provider, priority,
-identifier)`), so a host can, for example, register an in-memory override
-layer at high priority in front of the real package. Only `read()` is
+Providers are checked in ascending `priority` order — the lowest value goes
+first and `read()` returns on the first provider that has the path, so a
+host registers an override layer at a *lower* priority than what it should
+take precedence over (e.g. an in-memory override at priority `-1` in front
+of the real package at the default priority `0`). Ties break by insertion
+order (`add_provider(provider, priority, identifier)`). Only `read()` is
 required; `resolve_file()` (default: unsupported) lets a provider expose a
 real filesystem path when a consumer needs one (e.g. handing a path to a
 system font loader).
