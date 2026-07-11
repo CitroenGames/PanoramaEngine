@@ -12,6 +12,12 @@
 
 namespace panorama
 {
+// A "prelude": a snippet of JavaScript the host injects into the runtime before a
+// document's own scripts run. `origin` names it in diagnostics; `source` is the
+// code. The engine ships one built-in prelude (the DOM-agnostic core prelude);
+// every other prelude is host-provided and registered through
+// PanoramaRuntime::add_bootstrap_script / set_bootstrap_scripts, so any embedder
+// can install its own native-API shims the way CS:GO's menus expect.
 struct PanoramaRuntimeScript
 {
     std::string origin;
@@ -36,8 +42,6 @@ public:
     [[nodiscard]] virtual std::vector<PanoramaRuntimeScript> bootstrap_scripts() { return {}; }
     virtual void on_host_action(const std::string&, const std::string&) {}
 };
-
-[[nodiscard]] PanoramaRuntimeScript make_panorama_csgo_bootstrap_script();
 
 // PanoramaRuntime hosts a QuickJS interpreter and exposes a Panorama-compatible
 // JavaScript surface (`$`, Panel objects, an event bus) backed by live
@@ -128,7 +132,15 @@ public:
     void set_focus_request_handler(FocusRequestHandler handler);
 
     void set_client(PanoramaRuntimeClient* client);
+
+    // Host preludes: JavaScript run after the core prelude and before the
+    // document's scripts, in registration order. This is how an embedder installs
+    // the native-API shims its content expects (e.g. the game's CS:GO prelude).
+    // set_bootstrap_scripts() replaces the whole list; add_bootstrap_script()
+    // appends one, so independent subsystems can each contribute a prelude without
+    // clobbering the others. Both must be called before initialize().
     void set_bootstrap_scripts(std::vector<PanoramaRuntimeScript> scripts);
+    void add_bootstrap_script(PanoramaRuntimeScript script);
 
     // Evaluates `source` with `context` as the active context panel (so a loaded
     // sublayout's scripts see GetContextPanel() == the panel they were loaded into).
