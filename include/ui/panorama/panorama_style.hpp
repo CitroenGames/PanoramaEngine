@@ -12,8 +12,7 @@
 // stylesheet/cascade machinery used to assign a ComputedStyle to every node in a
 // PanoramaNode tree.
 //
-// Unlike the transitional XML->RML converter, nothing here is "dropped" to fit a
-// foreign engine: we own the property set, so Panorama's own units (fit-children,
+// We own the property set, so Panorama's own units (fit-children,
 // fill-parent-flow, width/height-percentage) and box model are first-class.
 namespace openstrike
 {
@@ -98,8 +97,8 @@ enum class PanoramaBlendMode
 };
 
 // How text that does not fit its constrained box is handled. Ellipsis truncates
-// before paint, Shrink uses the host-computed reduced font size, Clip installs a
-// content scissor, and NoClip renders overflow.
+// before paint, Shrink uses the text-provider-computed reduced font size, Clip
+// installs a content scissor, and NoClip renders overflow.
 enum class PanoramaTextOverflow
 {
     Clip,
@@ -207,10 +206,12 @@ struct PanoramaTransformOrigin
 // How a background image is scaled into its box (CSS background-size / object-fit).
 enum class PanoramaBackgroundSizeType
 {
-    // Fill the box on both axes (`100% 100%`). Used as our default; real
-    // Panorama's documented default is `auto auto` (natural image size),
-    // which we cannot honor yet — only the texture's aspect is plumbed to
-    // the painter, not its pixel size.
+    // Natural image size on both axes (`auto auto`). This is CSS/Panorama's
+    // documented default: the painter draws the texture at its intrinsic pixel
+    // size (background_texture_natural_width/height), falling back to box-fill
+    // when that size is not yet known.
+    Auto,
+    // Fill the box on both axes (`100% 100%`).
     Stretch,
     Contain, // scale to fit inside the box, preserving aspect (letterboxed)
     Cover,   // scale to cover the box, preserving aspect (cropped)
@@ -219,7 +220,7 @@ enum class PanoramaBackgroundSizeType
 
 struct PanoramaBackgroundSize
 {
-    PanoramaBackgroundSizeType type = PanoramaBackgroundSizeType::Stretch;
+    PanoramaBackgroundSizeType type = PanoramaBackgroundSizeType::Auto;
     PanoramaLength width;  // used when type == Fixed
     PanoramaLength height; // used when type == Fixed
 };
@@ -412,6 +413,15 @@ public:
     // Stable identity of the underlying storage, for hashing.
     [[nodiscard]] const void* storage_key() const noexcept { return empty() ? nullptr : map_.get(); }
 
+    // CPUMT-49: read-only content access (as opposed to storage_key()'s identity),
+    // for equivalence tests that must compare two independently-computed styles'
+    // custom-property VALUES rather than whether they happen to share storage.
+    [[nodiscard]] const Map& entries() const noexcept
+    {
+        static const Map kEmpty;
+        return map_ != nullptr ? *map_ : kEmpty;
+    }
+
 private:
     [[nodiscard]] Map& detach()
     {
@@ -486,7 +496,8 @@ struct PanoramaComputedStyle
     PanoramaColor border_color;
     // Image/icon tint (multiplies the texture), inherited; `none` -> white = as-is.
     PanoramaColor wash_color{0xFF, 0xFF, 0xFF, 0xFF};
-    float brightness = 1.0F; // inherited scalar multiplier on the wash/icon colour
+    float brightness = 1.0F;  // inherited per-element RGB multiplier (fills/gradient/border/text/wash)
+    float saturation = 1.0F;  // inherited per-element HSV saturation scale (1=identity, 0=grey, <0 invert)
     PanoramaBoxShadow box_shadow; // not inherited
     PanoramaBlur blur;            // backdrop blur (parsed; GPU pass pending), not inherited
     PanoramaClip clip;            // render-time clip region (rect/radial wipes), not inherited
@@ -586,6 +597,13 @@ struct PanoramaComputedStyle
     // before `transform` (hover-zoom). 1 = none. Not inherited.
     float pre_scale_x = 1.0F;
     float pre_scale_y = 1.0F;
+    // Panorama ui-scale / ui-scale-x / ui-scale-y: a scale about the transform-
+    // origin, composed innermost like pre-transform-scale2d. 1 = none. Not inherited.
+    float ui_scale_x = 1.0F;
+    float ui_scale_y = 1.0F;
+    // Panorama pre-transform-rotate2d: a rotation (degrees) about the transform-
+    // origin applied before `transform`. 0 = none. Not inherited.
+    float pre_rotate = 0.0F;
 
     // Parsed `transition-*` longhands as parallel lists (CSS repeats shorter lists).
     std::vector<std::string> transition_properties;
@@ -599,7 +617,9 @@ struct PanoramaComputedStyle
     float animation_duration = 0.0F;
     float animation_delay = 0.0F;
     float animation_iteration_count = 1.0F;
-    PanoramaEasing animation_easing{};
+    // CSS initial animation-timing-function is `ease` (cubic-bezier(.25,.1,.25,1)),
+    // not linear (WebCore Animation::initialTimingFunction).
+    PanoramaEasing animation_easing{0.25F, 0.1F, 0.25F, 1.0F, false};
     PanoramaAnimDirection animation_direction = PanoramaAnimDirection::Normal;
     PanoramaAnimFillMode animation_fill_mode = PanoramaAnimFillMode::None;
 
@@ -805,8 +825,42 @@ public:
     // scratch path, and the OPENSTRIKE_PANORAMA_NOSHARE env var disables it too.
     void set_style_sharing_enabled(bool enabled) { style_sharing_enabled_ = enabled; }
 
+    // CPUMT-49: split entry points for forking a full compute() across worker
+    // threads. HOST THREAD ONLY, and must complete (including seed_sharing_flags,
+    // which these two call between them) BEFORE any worker starts — sharing_active_/
+    // sharing_focus_within_active_ are mutable, non-thread_local members; a worker
+    // calling compute()/compute_invalidated()/seed_sharing_flags() concurrently with
+    // another thread would race on them. Workers must call ONLY
+    // compute_forked_subtree() below.
+    //
+    // compute_root_style computes ONLY `root`'s own style (seeding the ancestor
+    // filter + sharing flags exactly like compute(), but skipping the recursion
+    // into children) so the caller can then fork compute_forked_subtree() over
+    // root's own children.
+    void compute_root_style(PanoramaNode& root) const;
+
+    // CPUMT-49: computes `node`'s entire subtree (itself + every descendant),
+    // safe to call concurrently for DISJOINT subtrees from worker threads once
+    // compute_root_style has already run on the host thread. Primes THIS
+    // THREAD's (thread_local) ancestor filter by walking node's real parent
+    // chain, so concurrent calls never share filter state. Always passes
+    // prev_sibling=nullptr for `node` itself: style sharing across the fork
+    // boundary (i.e. between the root's own children, which may be computed by
+    // different workers, or in an order the serial pass would not produce) is
+    // intentionally not attempted — output-identical either way, since sharing
+    // is only ever a shortcut for output full computation would produce
+    // identically, never required for correctness. Sharing WITHIN `node`'s own
+    // subtree (between its children, grandchildren, ...) is unaffected and
+    // still applies normally.
+    void compute_forked_subtree(PanoramaNode& node) const;
+
 private:
     void compute_node(PanoramaNode& node, const PanoramaNode* prev_sibling = nullptr) const;
+    // CPUMT-49: compute_node's actual body, parameterized on whether to recurse
+    // into children. compute_node(node, prev) == compute_node_impl(node, prev,
+    // true) — behavior-identical to the pre-CPUMT-49 compute_node for every
+    // existing caller. compute_root_style calls this with recurse=false.
+    void compute_node_impl(PanoramaNode& node, const PanoramaNode* prev_sibling, bool recurse) const;
     // True when `node` can reuse `candidate`'s (a preceding sibling, already
     // computed this pass) computed style. Conservative: any uncertainty returns
     // false and the node is matched normally.
@@ -871,6 +925,12 @@ private:
 // inline-style application and unit tests.
 PanoramaLength parse_panorama_length(std::string_view value);
 PanoramaColor parse_panorama_color(std::string_view value);
+
+// Canonical property metadata for animation and transition matching. Aliases
+// such as `background-image-opacity`, `wash-color-fast`, and `x`/`y`/`z` funnel
+// into the same names used by transition capture and transition-end reporting.
+[[nodiscard]] std::string panorama_canonical_transition_property_name(std::string_view property);
+[[nodiscard]] std::uint32_t panorama_anim_channel_for_property(std::string_view property);
 
 // Applies a `text-transform` to UTF-8 text (ASCII case mapping; non-ASCII bytes are
 // left unchanged). Used by both the layout measure and the paint text path so the
@@ -938,5 +998,12 @@ struct PanoramaCascadeStats
     std::uint64_t filter_rejects = 0;      // selectors skipped by the ancestor bloom filter
     std::uint64_t shared_nodes = 0;        // nodes that reused a previous sibling's computed style
 };
+// CPUMT-49: panorama_cascade_stats() is thread_local (a plain non-thread_local
+// static would race under a forked compute) — every existing increment call
+// site works unchanged, since thread_local makes them transparently per-thread.
+// A worker calls this right before returning to snapshot-and-reset ITS OWN
+// instance; the host sums every worker's snapshot (plus its own instance) into
+// the one cumulative figure callers expect.
 [[nodiscard]] PanoramaCascadeStats& panorama_cascade_stats();
+[[nodiscard]] PanoramaCascadeStats panorama_cascade_stats_take();
 }

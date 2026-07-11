@@ -11,8 +11,8 @@ namespace openstrike
 {
 // Measures the on-screen size of a run of text at a given font size. The layout
 // solver needs this for fit-children labels. The default is a metrics-free
-// approximation; the paint layer can install a FreeType-backed measurer for
-// pixel-accurate sizing without the layout solver depending on FreeType.
+// approximation; PanoramaFontAtlas provides a FreeType-backed measurer for
+// pixel-accurate sizing without coupling the layout solver to a font library.
 struct PanoramaTextMeasure
 {
     // Returns {width, height} in pixels for `text` at `font_size` / `font_weight`,

@@ -18,13 +18,39 @@ PanoramaColor scale_alpha(PanoramaColor color, float opacity)
     return color;
 }
 
+// Panorama `brightness` is a per-element colour multiplier applied to the
+// element's OWN rendered output. The image path already multiplies it into the
+// wash (texture_tint); this helper lets solid fills, gradient stops, borders and
+// text apply the same factor so non-textured panels respond to brightness (the
+// hover/active feedback Valve's content relies on). RGB only — alpha is left to
+// scale_alpha. The identity case is fast-pathed.
+PanoramaColor apply_color_filter(PanoramaColor c, const PanoramaComputedStyle& s)
+{
+    if (s.brightness == 1.0F && s.saturation == 1.0F)
+    {
+        return c;
+    }
+    float r = static_cast<float>(c.r);
+    float g = static_cast<float>(c.g);
+    float b = static_cast<float>(c.b);
+    if (s.saturation != 1.0F)
+    {
+        // WebCore FEColorMatrix `saturate`: lerp each channel toward Rec.709 luma
+        // by the factor (1 identity, 0 grey, >1 oversaturate, <0 invert).
+        const float luma = 0.2126F * r + 0.7152F * g + 0.0722F * b;
+        r = luma + (r - luma) * s.saturation;
+        g = luma + (g - luma) * s.saturation;
+        b = luma + (b - luma) * s.saturation;
+    }
+    const auto ch = [&](float v) {
+        return static_cast<std::uint8_t>(std::clamp(v * s.brightness, 0.0F, 255.0F) + 0.5F);
+    };
+    return {ch(r), ch(g), ch(b), c.a};
+}
+
 PanoramaColor texture_tint(const PanoramaComputedStyle& style, float opacity)
 {
-    const auto bright = [&](std::uint8_t c) {
-        return static_cast<std::uint8_t>(std::clamp(static_cast<float>(c) * style.brightness, 0.0F, 255.0F) + 0.5F);
-    };
-    return scale_alpha({bright(style.wash_color.r), bright(style.wash_color.g), bright(style.wash_color.b), style.wash_color.a},
-        opacity);
+    return scale_alpha(apply_color_filter(style.wash_color, style), opacity);
 }
 
 std::uint8_t lerp_channel(std::uint8_t a, std::uint8_t b, float t)
@@ -250,8 +276,9 @@ bool is_identity(const Matrix2D& m)
 Matrix2D node_transform_matrix(const PanoramaNode& node, const Matrix2D& parent)
 {
     const PanoramaComputedStyle& s = node.computed;
-    const bool has_pre_scale = s.pre_scale_x != 1.0F || s.pre_scale_y != 1.0F;
-    if (s.transform.empty() && !has_pre_scale)
+    const bool has_pre = s.pre_scale_x != 1.0F || s.pre_scale_y != 1.0F || s.ui_scale_x != 1.0F ||
+        s.ui_scale_y != 1.0F || s.pre_rotate != 0.0F;
+    if (s.transform.empty() && !has_pre)
     {
         return parent;
     }
@@ -280,10 +307,22 @@ Matrix2D node_transform_matrix(const PanoramaNode& node, const Matrix2D& parent)
         }
         local = multiply(local, op_matrix);
     }
-    if (has_pre_scale)
+    if (has_pre)
     {
-        // Applied before `transform` (innermost), about the same origin.
-        local = multiply(local, scale(s.pre_scale_x, s.pre_scale_y));
+        // Applied before `transform` (innermost), about the same origin:
+        // pre-transform-scale2d, then ui-scale, then pre-transform-rotate2d.
+        if (s.pre_scale_x != 1.0F || s.pre_scale_y != 1.0F)
+        {
+            local = multiply(local, scale(s.pre_scale_x, s.pre_scale_y));
+        }
+        if (s.ui_scale_x != 1.0F || s.ui_scale_y != 1.0F)
+        {
+            local = multiply(local, scale(s.ui_scale_x, s.ui_scale_y));
+        }
+        if (s.pre_rotate != 0.0F)
+        {
+            local = multiply(local, rotation(s.pre_rotate));
+        }
     }
     local = multiply(local, translation(-origin_x, -origin_y));
     return multiply(parent, local);
@@ -295,8 +334,8 @@ Matrix2D node_transform_matrix(const PanoramaNode& node, const Matrix2D& parent)
 // `fixed` (image smaller) draws a positioned sub-rect with uv 0..1.
 // Resolves CSS background-size into the drawn size of ONE tile (WebCore
 // BackgroundPainter::calculateFillTileSize equivalent).
-void compute_background_tile_size(float box_w, float box_h, float aspect, const PanoramaBackgroundSize& size,
-    float& drawn_w, float& drawn_h)
+void compute_background_tile_size(float box_w, float box_h, float aspect, float nat_w, float nat_h,
+    const PanoramaBackgroundSize& size, float& drawn_w, float& drawn_h)
 {
     drawn_w = box_w;
     drawn_h = box_h;
@@ -308,6 +347,16 @@ void compute_background_tile_size(float box_w, float box_h, float aspect, const 
     const float box_aspect = box_w / box_h;
     switch (size.type)
     {
+    case PanoramaBackgroundSizeType::Auto:
+        // CSS default `auto auto`: draw at the texture's intrinsic pixel size
+        // (WebCore calculateFillTileSize -> imageIntrinsicSize). Fall back to
+        // filling the box when the natural size has not resolved yet.
+        if (nat_w > 0.0F && nat_h > 0.0F)
+        {
+            drawn_w = nat_w;
+            drawn_h = nat_h;
+        }
+        break;
     case PanoramaBackgroundSizeType::Stretch:
         break;
     case PanoramaBackgroundSizeType::Contain:
@@ -932,7 +981,8 @@ public:
         const PanoramaComputedStyle& s = node.computed;
         float tile_w = bw;
         float tile_h = bh;
-        compute_background_tile_size(bw, bh, node.background_texture_aspect, s.background_size, tile_w, tile_h);
+        compute_background_tile_size(bw, bh, node.background_texture_aspect, node.background_texture_natural_width,
+            node.background_texture_natural_height, s.background_size, tile_w, tile_h);
         if (tile_w <= 0.01F || tile_h <= 0.01F)
         {
             return;
@@ -1208,11 +1258,24 @@ public:
         }
         if (style.background_gradient.present())
         {
-            if (emit_background_gradient(style.background_gradient, x, y, w, h, radii, opacity, matrix))
+            // Brighten the gradient ramp by folding the element's brightness into
+            // each stop colour (only when non-identity, to avoid copying stops).
+            PanoramaGradient adjusted_grad;
+            const PanoramaGradient* grad = &style.background_gradient;
+            if (style.brightness != 1.0F || style.saturation != 1.0F)
+            {
+                adjusted_grad = style.background_gradient;
+                for (PanoramaGradientStop& stop : adjusted_grad.stops)
+                {
+                    stop.color = apply_color_filter(stop.color, style);
+                }
+                grad = &adjusted_grad;
+            }
+            if (emit_background_gradient(*grad, x, y, w, h, radii, opacity, matrix))
             {
                 return;
             }
-            const PanoramaColor fallback = gradient_color_at(style.background_gradient, 0.5F, opacity);
+            const PanoramaColor fallback = gradient_color_at(*grad, 0.5F, opacity);
             if (fallback.a > 0)
             {
                 add_rounded_rect(x, y, w, h, radii, fallback, 0, matrix);
@@ -1221,7 +1284,8 @@ public:
         }
         if (style.background_color.visible())
         {
-            add_rounded_rect(x, y, w, h, radii, scale_alpha(style.background_color, opacity), 0, matrix);
+            add_rounded_rect(x, y, w, h, radii, scale_alpha(apply_color_filter(style.background_color, style), opacity), 0,
+                matrix);
         }
     }
 
@@ -1529,7 +1593,16 @@ public:
         if (node.background_texture != 0)
         {
             const PanoramaColor tint = texture_tint(s, node_opacity * s.background_image_opacity);
-            emit_background_image(node, box.x, box.y, box.width, box.height, radii, tint, transform);
+            // WebCore default background-origin: padding-box — the image is sized
+            // and positioned within the padding box (border-box minus borders), not
+            // the border box, so a border does not shift a centered icon. (Clip stays
+            // padding-box here; a cover/repeat overflow into the border region is the
+            // one case this approximation drops, which shipped sheets do not use.)
+            const float pad_x = box.x + s.border_left();
+            const float pad_y = box.y + s.border_top();
+            const float pad_w = box.width - s.border_left() - s.border_right();
+            const float pad_h = box.height - s.border_top() - s.border_bottom();
+            emit_background_image(node, pad_x, pad_y, pad_w, pad_h, radii, tint, transform);
         }
 
         if (has_border && rounded)
@@ -1545,7 +1618,7 @@ public:
                 bc = s.border_bottom_color().visible() ? s.border_bottom_color()
                     : s.border_left_color().visible() ? s.border_left_color() : s.border_right_color();
             }
-            bc = scale_alpha(bc, node_opacity);
+            bc = scale_alpha(apply_color_filter(bc, s), node_opacity);
             const float inner_w = box.width - 2.0F * bw;
             const float inner_h = box.height - 2.0F * bw;
             if (inner_w <= 0.0F || inner_h <= 0.0F)
@@ -1568,7 +1641,7 @@ public:
             const auto side = [&](float x, float y, float w, float h, PanoramaColor color) {
                 if (w > 0.0F && h > 0.0F && color.visible())
                 {
-                    add_rect(x, y, w, h, scale_alpha(color, node_opacity), 0, transform);
+                    add_rect(x, y, w, h, scale_alpha(apply_color_filter(color, s), node_opacity), 0, transform);
                 }
             };
             side(box.x, box.y, box.width, bw_top, s.border_top_color());
@@ -1679,7 +1752,9 @@ public:
             add_rect(img_x, img_y, img_w, img_h, tint, node.paint_texture, transform);
         }
 
-        if (!node.text.empty() && panorama_node_paints_own_text(node))
+        // A focused TextEntry paints even when empty so its caret still shows.
+        const bool focused_text_entry = node.focused && node.tag_lower == "textentry";
+        if ((!node.text.empty() || focused_text_entry) && panorama_node_paints_own_text(node))
         {
             // Toggle/radio buttons render their text via the internal control
             // label child (ensure_panorama_selection_control_internals).
@@ -2066,7 +2141,7 @@ private:
             return;
         }
         const PanoramaComputedStyle& s = node.computed;
-        const PanoramaColor color = scale_alpha(s.color, opacity);
+        const PanoramaColor color = scale_alpha(apply_color_filter(s.color, s), opacity);
         if (color.a == 0)
         {
             return;
@@ -2337,7 +2412,79 @@ private:
                 draw_run(s.text_shadow.offset_x, s.text_shadow.offset_y, shadow);
             }
         }
+        // Text-entry caret + selection (WebCore RenderText selection rects + caret).
+        // Single-line only; offsets are byte positions into node.text (the field
+        // value), measured with the same advances as the glyph run so the caret
+        // lands between characters. The selection band paints behind the text, the
+        // caret over it.
+        const bool editing_caret = node.focused && node.tag_lower == "textentry" && !multiline && !html;
+        const float caret_top = baseline_y - ascent;
+        const float caret_height = font;
+        const auto prefix_width = [&](int offset) {
+            const int clamped = std::clamp(offset, 0, static_cast<int>(node.text.size()));
+            return measure_run(std::string_view(node.text).substr(0, static_cast<std::size_t>(clamped)), font, s.font_weight);
+        };
+        // The selection wash paints for a focused TextEntry (editing) OR for any
+        // text node the host flagged selection_active (the console's cross-label
+        // drag selection). Single-line uses one rect; wrapped labels wash each
+        // visual line's selected glyph extent.
+        const int sel_n = static_cast<int>(node.text.size());
+        const int sel_start = std::clamp(std::min(node.text_caret, node.text_selection_anchor), 0, sel_n);
+        const int sel_end = std::clamp(std::max(node.text_caret, node.text_selection_anchor), 0, sel_n);
+        if ((editing_caret || node.selection_active) && sel_end > sel_start)
+        {
+            // Translucent highlight (WebKit's default selection wash) under the glyphs.
+            const PanoramaColor sel = scale_alpha(PanoramaColor{0x4D, 0x90, 0xFE, 0x99}, opacity);
+            if (!multiline)
+            {
+                const float x0 = pen_x + prefix_width(sel_start);
+                const float x1 = pen_x + prefix_width(sel_end);
+                add_rect(x0, caret_top, x1 - x0, caret_height, sel, 0, transform);
+            }
+            else
+            {
+                for (std::size_t li = 0; li < node.text_lines.size(); ++li)
+                {
+                    const PanoramaTextWrapLine& line = node.text_lines[li];
+                    if (line.segments.empty())
+                    {
+                        continue;
+                    }
+                    // Plain labels are a single run; the line's byte span runs from
+                    // its first segment's begin to its last segment's end (offsets
+                    // into `display`, which the selection offsets also index).
+                    const std::size_t line_begin = line.segments.front().begin;
+                    const std::size_t line_end = line.segments.back().end;
+                    const int a = std::max<int>(sel_start, static_cast<int>(line_begin));
+                    const int b = std::min<int>(sel_end, static_cast<int>(line_end));
+                    if (b <= a || line_end > display.size())
+                    {
+                        continue;
+                    }
+                    float line_start = node.layout.content_x;
+                    if (s.text_align != PanoramaHAlign::Left && available > line.width)
+                    {
+                        const float slack = available - line.width;
+                        line_start += s.text_align == PanoramaHAlign::Center ? slack * 0.5F : slack;
+                    }
+                    const float x0 = line_start +
+                        measure_run(display.substr(line_begin, static_cast<std::size_t>(a) - line_begin), font, s.font_weight);
+                    const float x1 = line_start +
+                        measure_run(display.substr(line_begin, static_cast<std::size_t>(b) - line_begin), font, s.font_weight);
+                    const float baseline = baseline_y + static_cast<float>(li) * node.text_line_advance;
+                    add_rect(x0, baseline - ascent, x1 - x0, caret_height, sel, 0, transform);
+                }
+            }
+        }
+
         draw_run(0.0F, 0.0F, color);
+
+        if (editing_caret)
+        {
+            const float caret_x = pen_x + prefix_width(node.text_caret);
+            const float caret_width = std::max(1.0F, font / 16.0F);
+            add_rect(caret_x, caret_top, caret_width, caret_height, color, 0, transform);
+        }
     }
 
     PanoramaDrawList& list_;

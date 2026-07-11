@@ -2,6 +2,10 @@
 
 #include "ui/panorama/panorama_dom.hpp"
 
+#include <cstdint>
+#include <string_view>
+#include <vector>
+
 // Panorama pointer interaction over a laid-out PanoramaNode tree. The engine owns
 // the full input semantics — hit-testing (including open dropdown popups painted
 // out of normal flow), hover/active/focus pseudo-class flags, event bubbling
@@ -36,6 +40,40 @@ void panorama_apply_visibility_overrides(PanoramaNode& node);
 // (matching WebCore's select-popup anchor behavior). Call after the cascade +
 // visibility overrides, before layout.
 void panorama_apply_control_presentation(PanoramaNode& node);
+
+// Engine-native key identity for the keys the input controller acts on. The host
+// translates its platform keycodes (SDL_Keycode, VK_*) into these; printable
+// character entry comes in separately through handle_text_input (the platform's
+// composed-text event), mirroring WebCore's split between keydown and textInput.
+enum class PanoramaKey : std::uint16_t
+{
+    Unknown = 0,
+    ArrowLeft,
+    ArrowRight,
+    ArrowUp,
+    ArrowDown,
+    Home,
+    End,
+    Backspace,
+    Delete,
+    Enter,
+    Tab,
+    Escape,
+    A, // for Ctrl+A (Select All); other letters arrive via handle_text_input
+};
+
+struct PanoramaKeyEvent
+{
+    PanoramaKey key = PanoramaKey::Unknown;
+    bool shift = false;
+    bool ctrl = false;
+    bool alt = false;
+};
+
+// Document-order tab sequence (WebCore FocusController): positive tabindex first
+// (ascending), then tabindex 0 / focusable controls without an explicit index, in
+// document order; negative tabindex and hidden/disabled controls are excluded.
+[[nodiscard]] std::vector<PanoramaNode*> panorama_collect_tab_order(PanoramaNode& root);
 
 // Tracks pointer state across frames and drives the interaction flags + event
 // handlers. Typical host loop:
@@ -73,6 +111,30 @@ public:
     // default. Returns true when a scroll offset changed; the host must relayout
     // (the layout pass applies the offset to the children).
     bool update_wheel(PanoramaNode& root, float design_x, float design_y, float wheel_ticks_y, PanoramaRuntime* runtime);
+
+    // Feeds one non-character key press (WebCore EventHandler::keyEvent ->
+    // defaultKeyboardEventHandler + Editor command bindings). Drives caret motion /
+    // deletion / select-all on the focused TextEntry, Tab/Shift+Tab focus
+    // navigation, and Enter activation/submit. Printable characters do NOT come
+    // through here — they arrive via handle_text_input. Returns true when the tree
+    // changed and the host should recompute/relayout. `runtime` may be null (state
+    // still updates; JS handlers are skipped).
+    bool handle_key_down(PanoramaNode& root, const PanoramaKeyEvent& event, PanoramaRuntime* runtime);
+
+    // Feeds composed printable text (the platform's textInput/IME event) into the
+    // focused TextEntry, inserting it at the caret (replacing any selection). Fires
+    // ontextentrychanged. Returns true when a field changed.
+    bool handle_text_input(PanoramaNode& root, std::string_view utf8, PanoramaRuntime* runtime);
+
+    // Moves keyboard focus to `node` (null clears focus): blurs the old focus
+    // (onblur), focuses the new (onfocus), updates :focus / :focus-within, and seeds
+    // a TextEntry's caret at its value end (WebCore setFocusedElement order). Safe to
+    // call with a node outside `root`'s tree (no-op-ish; focus still set).
+    void set_focus(PanoramaNode& root, PanoramaNode* node, PanoramaRuntime* runtime);
+
+    // Tab/Shift+Tab focus advance (FocusController::advanceFocusInDocumentOrder),
+    // wrapping at the ends. Returns true when focus moved.
+    bool advance_focus(PanoramaNode& root, bool forward, PanoramaRuntime* runtime);
 
     // Forgets cached node pointers and pointer state. Call on tree rebuild/unload.
     void reset();

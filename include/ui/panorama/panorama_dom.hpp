@@ -12,13 +12,12 @@
 #include <vector>
 
 // Panorama DOM: a lightweight node tree built directly from layout XML by a
-// self-contained parser (no RmlUi). This is the tree the cascade and the layout
-// solver operate on, and the tree the QuickJS `Panel` binding will eventually be
-// rebound onto (replacing Rml::Element*).
+// self-contained parser. This is the tree the cascade, layout solver, and QuickJS
+// `Panel` binding operate on.
 namespace openstrike
 {
-// Opaque, host-assigned texture identifier (e.g. an Rml::TextureHandle cast to an
-// integer). 0 means "no texture" (solid fill). Pointer-sized so 64-bit handles
+// Opaque, host-assigned texture identifier. 0 means "no texture" (solid fill).
+// Pointer-sized so 64-bit handles
 // are not truncated.
 using PanoramaTextureId = std::uintptr_t;
 
@@ -202,8 +201,16 @@ struct PanoramaNode;
 //
 // Observers must treat the node as identity only (compare/erase the pointer);
 // the object is mid-destruction. The registry is process-global and unlocked:
-// the DOM is single-threaded by design (see README), and observers are expected
-// to be few and long-lived (a runtime, an input controller, a host view).
+// DOM MUTATION (construction/destruction/reparenting, this registry, JS/input/
+// host writes) is single-threaded by design (see README) and MUST stay that
+// way -- this class's own unlocked registry depends on it. CPUMT-49 forks
+// PanoramaStyleSheet::compute() (a READ-mostly pass that only ever writes each
+// node's OWN `computed`/style_dirty/style_fresh/descendant_style_dirty fields,
+// never touching this registry, never adding/removing/reparenting nodes)
+// across worker threads for the duration of one cascade; that fork's own
+// thread-safety invariants live on PanoramaStyleSheet::compute_forked_subtree's
+// doc comment, not here. Observers are expected to be few and long-lived (a
+// runtime, an input controller, a host view).
 class PanoramaNodeLifetimeObserver
 {
 public:
@@ -213,6 +220,19 @@ public:
 
 void panorama_add_node_lifetime_observer(PanoramaNodeLifetimeObserver& observer);
 void panorama_remove_node_lifetime_observer(PanoramaNodeLifetimeObserver& observer);
+
+// Tree guard (diagnostic, OPENSTRIKE_PANORAMA_TREEGUARD=1) --------------------
+//
+// Hunts use-after-free tree corruption: every node carries a liveness canary
+// that ~PanoramaNode flips, and scan_dead_links walks a document's children
+// vectors looking for a child whose canary is no longer alive (or whose parent
+// backlink no longer points at the node that owns it) — i.e. a node that was
+// destroyed (or replaced) while still linked. The mutation context is a
+// breadcrumb the runtime/input layers update before running script or
+// structural ops, so a detection can name the mutation that caused it.
+bool panorama_debug_tree_guard_enabled();
+void panorama_debug_set_mutation_context(std::string context);
+[[nodiscard]] const PanoramaNode* panorama_debug_scan_dead_links(const PanoramaNode& root, std::string& report);
 
 // Scoped watch over a worklist of node pointers held across script execution
 // (e.g. the onmouseout/onmouseover chains): entries whose node is destroyed
@@ -236,6 +256,12 @@ private:
 
 struct PanoramaNode
 {
+    // Tree-guard liveness canary (see panorama_debug_scan_dead_links): alive on
+    // construction, flipped by ~PanoramaNode after observers ran. Freed-then-
+    // zeroed or freed-then-reused memory fails the check either way.
+    static constexpr std::uint32_t kLivenessAlive = 0x50414E4Fu; // 'PANO'
+    static constexpr std::uint32_t kLivenessDead = 0xDEADDEADu;
+
     PanoramaNode() = default;
     ~PanoramaNode(); // notifies lifetime observers (see above)
     PanoramaNode(const PanoramaNode&) = delete;
@@ -257,6 +283,8 @@ struct PanoramaNode
     PanoramaNode* parent = nullptr;
     std::vector<std::unique_ptr<PanoramaNode>> children;
 
+    std::uint32_t debug_liveness = kLivenessAlive; // tree-guard canary (see above)
+
     PanoramaComputedStyle computed; // filled by PanoramaStyleSheet::compute
     PanoramaLayoutBox layout;       // filled by the layout solver
     PanoramaLayoutBox popup_layout; // optional top-level popup geometry (dropdown menus)
@@ -269,6 +297,11 @@ struct PanoramaNode
     // Natural aspect (width / height) of background_texture, set by the host when the
     // image resolves; used for background-size contain/cover. 0 = unknown (stretch).
     float background_texture_aspect = 0.0F;
+    // Natural pixel size (design units) of background_texture, set by the host when the
+    // image resolves; used for background-size: auto (CSS default = intrinsic size).
+    // 0 = unknown (paint falls back to stretching the box).
+    float background_texture_natural_width = 0.0F;
+    float background_texture_natural_height = 0.0F;
     // paint_texture's `scaling=` mode + natural size in design units (host-set;
     // natural size 0 = unknown, paint falls back to stretch).
     PanoramaImageScaling paint_texture_scaling = PanoramaImageScaling::Stretch;
@@ -282,8 +315,9 @@ struct PanoramaNode
     std::uint16_t style_scope_mark = 0;
 
     // text-overflow: shrink — the reduced font size that makes the text fit the box.
-    // Computed + stored by the host (which also pre-rasterizes glyphs at this size)
-    // and read by paint, so both use one identical value (no measure drift). 0 = none.
+    // Computed + stored by the font atlas/text provider (which also pre-rasterizes
+    // glyphs at this size) and read by paint, so both use one identical value
+    // (no measure drift). 0 = none.
     float shrink_font_size = 0.0F;
 
     // JS-set visibility override (Panel.visible). Applied on top of the cascade so
@@ -296,6 +330,23 @@ struct PanoramaNode
     bool active = false;
     bool focused = false;
     bool selected = false;
+
+    // Text-entry editing state (WebCore HTMLTextFormControlElement selection
+    // model). Meaningful only on a focused <TextEntry>; both are byte offsets into
+    // `text` (always on a UTF-8 codepoint boundary). The caret is `text_caret`;
+    // the selection is the closed range [min, max] of caret and anchor, empty
+    // (a bare caret) when they coincide. selectionStart = min, selectionEnd = max;
+    // selectionDirection is forward when caret >= anchor. Clamped to text length
+    // whenever the value changes (panorama_text_entry_set_value).
+    int text_caret = 0;
+    int text_selection_anchor = 0;
+
+    // When true, paint draws the translucent selection wash over the byte range
+    // [min,max] of text_caret/anchor on ANY node that has text — not just a
+    // focused <TextEntry>. The host console sets it on its output labels to
+    // render a drag-selection that spans multiple labels. Honours wrapped
+    // (multi-line) labels. No caret is drawn (that stays TextEntry-only).
+    bool selection_active = false;
 
     // Style invalidation (WebCore Style::Validity + descendant dirty bits):
     // `style_dirty` marks this node's whole subtree for recompute (a state/class/
@@ -453,6 +504,17 @@ void ensure_panorama_slider_internals(PanoramaNode& node);
 // `TextEntry#Value` readout), idempotently, matching settings_slider.xml. The
 // host then binds the inner slider's `value` + the readout text to a convar.
 void ensure_panorama_settings_slider_internals(PanoramaNode& node);
+// True for the settings-row key-rebind control (Valve `CSGOSettingsKeyBinder`): a
+// labelled key-binding button + a clear button, bound to an engine `bind` command.
+// Recognized so the host can find rows and the presentation pass builds internals.
+[[nodiscard]] bool panorama_node_is_settings_keybinder(const PanoramaNode& node);
+// Materializes a `CSGOSettingsKeyBinder`'s internal chrome (a `#<id>__title` label,
+// `#LabelFXContainer` > `#BindingLabelContainer` > the `#<id>__bind` value label,
+// and the `#<id>__clear` clear button), idempotently, matching settings_keybinder.xml.
+// The clickable leaves carry row-unique ids so the host can resolve a polled click
+// back to the row (settings_keybinder.css is not included by the tab pages, so its few
+// layout rules are baked as inline styles, mirroring ensure_panorama_settings_slider).
+void ensure_panorama_settings_keybinder_internals(PanoramaNode& node);
 // The slider's current position as a 0..1 fraction, derived from its `value`,
 // `min`, and `max` attributes (clamped; degenerate range -> 0). Pure.
 [[nodiscard]] float panorama_slider_fraction(const PanoramaNode& node);

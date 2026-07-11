@@ -1,184 +1,125 @@
-# Panorama Support
+# Panorama Support Surface
 
-This page summarizes the supported Panorama feature set and the known gaps. It
-is not a full CSS reference; it is a practical map for hosts and contributors.
+What PanoramaEngine implements of Valve's Panorama UI system, and where it
+deliberately stops. This is a companion to the README's
+[What It Provides](../README.md#what-it-provides) bullet list — read that
+first for the high-level summary; this file is the more detailed reference.
 
-## Documents And Resources
+## Document / DOM
 
-Supported:
+- XML documents with `<styles>` (recursive includes), `<scripts>`, `<Frame
+  src>` (recursively resolved into one styled tree), and `<snippets>`
+  (name -> subtree, instantiated later via `BLoadLayoutSnippet`/
+  `BCreateChildren` or the host's own `instantiate_snippet`).
+- Comments, CDATA, processing instructions, entities, self-closing tags.
+- Node lifetime observers so long-lived state elsewhere (script contexts,
+  input hover/focus, scoped watches over a set of nodes across a handler that
+  may delete some of them) doesn't dangle.
 
-- Panorama XML documents parsed into `PanoramaNode`.
-- `<styles>` and `<scripts>` includes.
-- `<Frame>` expansion with bounded recursion.
-- `<snippets>` collection and instantiation.
-- Initial document load and runtime sublayout load helpers.
-- Memory, directory, and `.pbin` package resource providers.
-- `#token` localization through `PanoramaLocalization`.
+## CSS
 
-Package limits:
-
-- `.pbin` package entries must be stored zip entries.
-- Compressed entries and zip data descriptors are rejected.
-
-## CSS Cascade And Selectors
-
-Supported selector features include:
-
-- Type, universal, id, class, and attribute selectors.
-- Descendant, child, adjacent sibling, and general sibling combinators.
-- `:not(...)` selector groups.
-- Specificity and source-order cascade.
-- Inline styles.
-- Layout-scoped stylesheets for sublayouts.
-
-Supported pseudo-classes:
-
-- `:hover`
-- `:active`
-- `:selected`
-- `:enabled`
-- `:disabled`
-- `:focus`
-- `:focus-within`
-- `:root`
-
-Unsupported pseudo-classes do not match.
-
-Supported stylesheet features include:
-
-- `@define` variable substitution.
-- CSS custom properties (`--name`) and `var(--name, fallback)`.
-- `@keyframes`.
-- Transition and animation longhands used by the runtime.
+- Full selector cascade: descendant combinators, specificity + source order,
+  inline-style override, class/id/attribute/pseudo-class selectors
+  (`:hover`/`:active`/`:selected`/`:enabled`/`:disabled`/`:focus`), `:not()`
+  and sibling combinators, layout-file cascade scoping.
+- `@define` theme variables (recursive substitution) and CSS custom
+  properties.
+- `@keyframes` (per-stop resolved style + channel bitmask; `from`/`to`/`N%`
+  selectors; per-segment `animation-timing-function`) and CSS transitions,
+  both driving real interpolation (not just parsed-and-ignored) for opacity,
+  position (`x`/`y`/`z` longhands), color/background-color, wash-color,
+  brightness, transform, border, box-shadow, blur, and clip channels.
+- Panorama sizing primitives: `fit-children`, `fill-parent-flow(ratio)`,
+  `width-percentage`/`height-percentage`, coordinate `position` (px and `%`,
+  additive), `flow-children` (none/right/down), align, min/max, margin/
+  padding/border (border-box).
+- Text: `text-align`, `text-transform` (uppercase/lowercase/none),
+  `letter-spacing`, `line-height`, `text-overflow` (`ellipsis`/`clip`/
+  `shrink` — auto-fit font size — /`noclip`), `text-shadow`, inline
+  `<b>`/`<i>` styled runs, WebCore-style ASCII line-break/word-wrap.
+- Paint: `border-radius` (px and `%`, per-corner, tessellated arcs),
+  `box-shadow` (outset soft falloff + inset, color-first or
+  fill/inset-prefixed syntax), linear/radial gradients (including oblique and
+  rounded variants), `background-size`/`background-position`
+  (stretch/contain/cover/fixed), `-mix-blend-mode` (normal/additive/screen/
+  multiply/opaque, canonical premultiplied blend states), `z-index`
+  (direct-sibling stacking, not full CSS stacking contexts), `overflow`
+  (squish/scroll/clip/noclip, 2-axis scissor clipping with real clip-stack
+  intersection).
+- `blur: gaussian/fastgaussian/fastanimgaussian(...)` parses fully (std
+  deviations + pass count) and a reusable separable-gaussian kernel builder
+  is provided; the GPU backdrop-blur *pass* itself (capture-behind + blur +
+  composite) is a backend-specific rendering feature, not something the
+  engine can implement generically — see `PanoramaRenderBackend::blur_region`.
 
 ## Layout
 
-Supported layout primitives include:
+`layout_panorama_tree()` is a two-pass solver (bottom-up intrinsic sizing,
+top-down resolve) supporting the box model above plus scrollable overflow,
+dropdown popup geometry, and the common control internals (radio groups,
+sliders, scrollbars) input needs to hit-test against.
 
-- `flow-children: none`, `right`, `left`, `down`, `up`, `right-wrap`, and
-  `down-wrap`.
-- `width`, `height`, `min-*`, `max-*`.
-- `fit-children`, `fill-parent-flow(N)`, percent lengths,
-  `width-percentage(N%)`, and `height-percentage(N%)`.
-- `margin`, `padding`, borders, and per-side borders.
-- `horizontal-align`, `vertical-align`, and `align`.
-- Panorama `position: x y z` plus `x`, `y`, and `z` longhands.
-- `overflow` values for clipping, squish, scroll, and visible behavior.
-- Overlay scrollbar geometry and scroll offsets.
-- Closed dropdown presentation and open dropdown popup geometry.
+## Scripting
 
-Text layout:
-
-- `font-size`, `font-weight`, `font-style`, `letter-spacing`, `line-height`,
-  `text-align`, `text-transform`, `white-space`, and `text-overflow`.
-- Labels wrap to resolved content width by default.
-- `white-space: nowrap` opts out of wrapping.
-- `text-overflow: ellipsis`, `shrink`, `clip`, and `noclip` are represented.
-- Inline label markup supports the common `<b>` and `<i>` tags when
-  `html="true"`.
-
-Text wrapping follows the in-repo WebCore-style break helper: breakable spaces,
-selected ASCII punctuation opportunities, and `\n` forced breaks. There is no
-ICU, hyphenation, CJK line breaking, or break-anywhere fallback.
-
-## Styling And Paint
-
-Supported paint/style features include:
-
-- Solid backgrounds and Panorama/CSS-style gradients.
-- Background images, opacity, size, position, repeat, and wash/brightness.
-- Border color, width, per-side borders, and border radius.
-- Text shadows, image shadows, and box shadows.
-- `opacity`.
-- `z-index` ordering within the painter.
-- `transform`, `transform-origin`, and `pre-transform-scale2d`.
-- `-mix-blend-mode` mapped to `PanoramaBlendMode`.
-- `blur: gaussian(...)` and `fastgaussian(...)` as backdrop blur commands.
-- `clip: rect(...)` and `clip: radial(...)` as render-time clips.
-
-Draw-list notes:
-
-- Paint output is `PanoramaDrawList`, not immediate GPU calls.
-- Text requires a host `PanoramaGlyphSource`; without it, text is skipped and
-  boxes still paint.
-- Colors are straight RGBA.
-- Backdrop blur commands contain no geometry and must be handled by the host
-  renderer.
-
-## Animation
-
-Supported CSS transitions and keyframes cover:
-
-- `opacity`
-- `position`, `x`, `y`, `z`
-- Colors, including background, foreground, and wash color
-- Brightness
-- `transform`
-- `width` and `height`
-- Borders
-- `box-shadow`
-- `blur`
-- `clip`
-- `pre-transform-scale2d`
-
-`border-radius` is supported for painting but is not currently animated.
-
-Transition completion is reported through
-`PanoramaAnimationAdvanceResult::transition_ends`. Hosts should forward each
-entry to `PanoramaRuntime::dispatch_property_transition_end`.
-
-Smooth scroll animations are advanced separately with
-`panorama_advance_scroll_animations`.
-
-## Runtime And Scripting
-
-Implemented runtime surface includes:
-
-- `$` selector lookup.
-- `$.Msg`, `$.Warning`, and `$.Localize`.
-- `$.GetContextPanel`.
-- `$.CreatePanel`.
-- `$.RegisterEventHandler` and `$.RegisterForUnhandledEvent`.
-- `$.DispatchEvent`, `$.DispatchEventAsync`, `$.Schedule`, and
-  `$.CancelScheduled`.
-- Panel class helpers such as `AddClass`, `RemoveClass`, `ToggleClass`,
-  `SetHasClass`, `BHasClass`, and `SwitchClass`.
-- Panel traversal and mutation helpers such as `FindChild`, `GetChild`,
-  `Children`, `SetParent`, `MoveChildBefore`, `MoveChildAfter`,
-  `RemoveAndDeleteChildren`, and `DeleteAsync`.
-- Panel attributes, text, visibility, enabled, selected, checked, group,
-  tooltip, style setters, and `Data()`.
-- Dropdown, radio, slider, scroll, image, movie, sound, and panel-event helper
-  methods used by shipped layouts.
-- `BLoadLayout`, `LoadLayout`, `LoadLayoutAsync`, `BLoadLayoutSnippet`, and
-  `BCreateChildren` through host loaders.
-
-Game-backed CS:GO API namespaces are intentionally partial. The bootstrap
-installs graceful stubs for most namespaces so shipped scripts can continue
-running without throwing. Selected actions from `GameInterfaceAPI`,
-`LobbyAPI`, and `GameTypesAPI` can be bridged to the host through
-`set_host_action_handler`.
+`PanoramaRuntime` embeds QuickJS and exposes a Panorama-shaped surface: `$` as
+a callable selector function, a `Panel` class bound to live `PanoramaNode`
+pointers, an event bus (`RegisterEventHandler`/`DispatchEvent`/
+`RegisterForUnhandledEvent`), `$.Schedule`, dialog-variable token
+replacement, and `TriggerClass`/`SetHasClass`/style and visibility mutation
+through the same `Panel` API real Panorama scripts use. Most CS:GO-specific
+game API namespaces (`GameInterfaceAPI`, `LobbyAPI`, `GameTypesAPI`,
+inventory/friends/matchmaking/persona models) are graceful no-op or
+falsy-by-default stubs — real scripts run to completion without throwing, but
+without a live game backend behind those specific calls. Self-authored,
+non-game-backed Panorama-style UI is fully interactive with no stubs
+involved.
 
 ## Input
 
-`PanoramaInputController` supports:
+`PanoramaInputController` hit-tests the laid-out tree (front-to-back,
+ancestor-bubbled `onactivate`/hover) and drives hover/active/focus state,
+radio-group exclusivity, dropdown open/select/dismiss, slider drag, and
+scrollbar thumb interaction. Keyboard focus navigation (Tab), text-entry
+caret/selection editing (`panorama_text_edit.hpp`), and IME composed-text
+insertion are supported; the engine does not poll a platform input API
+itself — a host translates its own SDL/Win32/etc. events into calls on the
+controller.
 
-- Front-to-back hit testing.
-- Open dropdown popup hit testing above normal page content.
-- `:hover`, `:active`, `:focus`, and related dirty marking.
-- `onmouseover`, `onmouseout`, and bubbled `onactivate` handlers.
-- Radio-group exclusivity.
-- Dropdown open, select, and dismiss behavior.
-- Wheel propagation to the innermost scrollable ancestor that can move.
-- Scrollbar thumb dragging.
-- Slider dragging.
+## Rendering
 
-Hosts pass design-space pointer coordinates and button state. The controller
-observes node destruction and clears stale pointers automatically; call
-`reset()` when replacing the whole tree.
+See [integration.md](integration.md#renderer-responsibilities-recap) for the
+`PanoramaRenderBackend` contract and [architecture.md](architecture.md) for
+where paint and geometry submission sit in the pipeline.
+`PanoramaGeometryCache` (`panorama_geometry_cache.hpp`) is the reference
+incremental-submission implementation; a host does not have to use it, but
+writing a correct alternative from scratch is nontrivial (see that header's
+own documentation for why).
 
-## Threading
+## Known limits
 
-DOM, runtime, input, style mutation, and lifetime observer state are
-single-threaded. Build resources or decode images on other threads only if the
-resulting DOM/runtime calls are marshaled back to the UI thread.
+- `.pbin` package reading expects Valve-style stored (uncompressed) zip
+  entries with no zip data descriptors — real CS:GO packages satisfy this;
+  an arbitrarily-produced zip might not.
+- Text wrapping uses the in-repo WebCore-style ASCII break-opportunity
+  finder. There is no ICU, CJK line breaking, hyphenation, or
+  break-anywhere fallback.
+- `box-shadow` falloff is linear, not Gaussian, and ignores `border-radius`
+  (always a rectangular shadow shape).
+- `z-index` reorders direct siblings only — there are no full CSS stacking
+  contexts.
+- `overflow` clipping intersects on both axes only; a node clipping on a
+  single axis is treated as not clipping (rare in practice — most real
+  Panorama uses set both).
+- Backdrop blur (`blur: gaussian(...)`) parses and the kernel math is
+  implemented and unit-tested, but the actual GPU capture-blur-composite pass
+  is backend-specific and is not implemented for every backend out of the
+  box — check what your `PanoramaRenderBackend` implementation actually does
+  in `blur_region`.
+- DOM, runtime, input controller, and node lifetime observer state are
+  single-threaded. Cascade computation itself can be forked across worker
+  threads by a host (see `PanoramaStyleSheet::compute_root_style`/
+  `compute_forked_subtree`, the split points used by OpenStrike's own
+  `compute_full_cascade_forked`), but that forking is host-owned — the
+  engine has no thread pool dependency of its own.
+- Unit tests currently live in the host repository's test runner
+  (`OpenStrikeTests.exe --panorama`), not inside this directory.

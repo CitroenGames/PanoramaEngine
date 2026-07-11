@@ -153,8 +153,8 @@ int main()
     panorama_apply_control_presentation(root);
 
     // 4. Solve layout for a 1280x720 viewport. The default text measurer is a
-    //    metrics-free approximation; hosts install a real (e.g. FreeType-backed)
-    //    PanoramaTextMeasure for pixel-accurate label sizing.
+    //    metrics-free approximation; PanoramaFontAtlas provides the built-in
+    //    FreeType-backed path for pixel-accurate label sizing.
     layout_panorama_tree(root, 1280.0F, 720.0F);
 
     std::printf("Laid out %zu rule(s) at 1280x720:\n\n", session.style_sheet().rules().size());

@@ -76,7 +76,21 @@ float vertical_padding(const PanoramaComputedStyle& s)
 // over the fit-sized sections wrapper).
 void apply_panorama_size_defaults(PanoramaNode& node)
 {
-    const bool content_sized = panorama_node_defaults_to_content_size(node);
+    // Lazily computed and cached: panorama_node_defaults_to_content_size() walks
+    // up to ~23 string_view tag comparisons, but its result is only read inside
+    // the Auto-guarded branches below. Once a node's width/height are already
+    // resolved (the common case on repeat layout passes), the value is dead and
+    // must not be computed at all.
+    bool content_sized_value = false;
+    bool content_sized_known = false;
+    const auto content_sized = [&node, &content_sized_value, &content_sized_known]() {
+        if (!content_sized_known)
+        {
+            content_sized_value = panorama_node_defaults_to_content_size(node);
+            content_sized_known = true;
+        }
+        return content_sized_value;
+    };
     const auto fit_degenerate = [&node](auto&& axis_length) {
         bool any_intrinsic = false;
         for (const auto& child : node.children)
@@ -93,9 +107,21 @@ void apply_panorama_size_defaults(PanoramaNode& node)
         // centre/right only has room to act when the box is wider than the text, so
         // a width-less text node with a non-left alignment fills its parent's flow
         // width instead — matching how width-less centred labels render in Panorama.
-        const bool aligned_text =
-            !node.text.empty() && node.computed.text_align != PanoramaHAlign::Left;
-        const bool fit_width = content_sized ||
+        //
+        // That only applies when width is the CROSS axis (vertical-flow or
+        // flow:none parents): the label has no sibling contending for it, so
+        // filling the parent's width is harmless and lets alignment act. When
+        // width is instead the parent's MAIN (packing) axis — a horizontal-flow
+        // parent — FillParentFlow would consume the row's entire leftover flow
+        // space instead of hugging the glyph width, shoving every subsequent
+        // sibling toward the row's far edge (e.g. `.weapon-row-number` inside
+        // `.weapon-row-horiz-container`). Such labels fall through to the
+        // normal fit-children sizing below.
+        const bool parent_is_horizontal_flow =
+            node.parent != nullptr && is_horizontal(node.parent->computed.flow);
+        const bool aligned_text = !node.text.empty() &&
+            node.computed.text_align != PanoramaHAlign::Left && !parent_is_horizontal_flow;
+        const bool fit_width = content_sized() ||
             !fit_degenerate([](const PanoramaComputedStyle& s) { return s.width; });
         node.computed.width = (fit_width && !aligned_text)
             ? PanoramaLength{PanoramaLengthType::FitChildren, 0.0F}
@@ -103,7 +129,7 @@ void apply_panorama_size_defaults(PanoramaNode& node)
     }
     if (node.computed.height.type == PanoramaLengthType::Auto)
     {
-        const bool fit_height = content_sized ||
+        const bool fit_height = content_sized() ||
             !fit_degenerate([](const PanoramaComputedStyle& s) { return s.height; });
         node.computed.height = fit_height
             ? PanoramaLength{PanoramaLengthType::FitChildren, 0.0F}
@@ -370,6 +396,42 @@ float halign_offset(PanoramaHAlign align, float available)
     }
 }
 
+// Offset of a child's leading edge from the container's content origin along one
+// axis, combining alignment with the child's margins. Panorama treats alignment
+// and margin as INDEPENDENT: the child's border box is aligned within the full
+// container extent, then its leading margin translates it. A negative leading
+// margin on a centered element therefore shifts it by the FULL margin (this is how
+// CS:GO's .team-logo, `vertical-align: center; margin-top: -150px`, pulls itself up
+// into the buy-wheel hub). Folding the margins into the centering space instead
+// (container - m_lead - m_trail - size) would only apply half of a negative margin,
+// leaving such icons off-centre. Top/Left and Bottom/Right are unchanged from that
+// older model; only the centered case differs, and only when a margin is non-zero.
+float aligned_leading_offset(int align_center, int align_end, float container_extent, float size, float m_lead,
+    float m_trail)
+{
+    if (align_center)
+    {
+        return (container_extent - size) * 0.5F + m_lead;
+    }
+    if (align_end)
+    {
+        return container_extent - size - m_trail;
+    }
+    return m_lead;
+}
+
+float aligned_offset_h(PanoramaHAlign align, float container_extent, float size, float m_lead, float m_trail)
+{
+    return aligned_leading_offset(align == PanoramaHAlign::Center, align == PanoramaHAlign::Right, container_extent,
+        size, m_lead, m_trail);
+}
+
+float aligned_offset_v(PanoramaVAlign align, float container_extent, float size, float m_lead, float m_trail)
+{
+    return aligned_leading_offset(align == PanoramaVAlign::Middle, align == PanoramaVAlign::Bottom, container_extent,
+        size, m_lead, m_trail);
+}
+
 float valign_offset(PanoramaVAlign align, float available)
 {
     switch (align)
@@ -579,9 +641,8 @@ void position_right_wrap_line(
         const PanoramaComputedStyle& cs = child->computed;
         const float w = child->layout.width;
         const float h = child->layout.height;
-        const float avail_v = line_height - cs.margin.top - cs.margin.bottom - h;
         child->layout.x = x + cs.margin.left;
-        child->layout.y = line_y + cs.margin.top + valign_offset(cs.valign, avail_v);
+        child->layout.y = line_y + aligned_offset_v(cs.valign, line_height, h, cs.margin.top, cs.margin.bottom);
         resolve_positioned_child(*child, parent_width, parent_height, tm, /*in_parent_flow=*/true);
         x += margin_box_width(*child);
     }
@@ -602,8 +663,7 @@ void position_down_wrap_column(
         const PanoramaComputedStyle& cs = child->computed;
         const float w = child->layout.width;
         const float h = child->layout.height;
-        const float avail_h = column_width - cs.margin.left - cs.margin.right - w;
-        child->layout.x = column_x + cs.margin.left + halign_offset(cs.halign, avail_h);
+        child->layout.x = column_x + aligned_offset_h(cs.halign, column_width, w, cs.margin.left, cs.margin.right);
         child->layout.y = y + cs.margin.top;
         resolve_positioned_child(*child, parent_width, parent_height, tm, /*in_parent_flow=*/true);
         y += margin_box_height(*child);
@@ -1301,8 +1361,7 @@ void resolve_node(PanoramaNode& node, const PanoramaTextMeasure& tm)
                 pen_x = x + w + cs.margin.right;
                 x += main_align_offset(cs.halign == PanoramaHAlign::Center, cs.halign == PanoramaHAlign::Right);
             }
-            const float avail_v = ch - cs.margin.top - cs.margin.bottom - h;
-            y = box.content_y + cs.margin.top + valign_offset(cs.valign, avail_v);
+            y = box.content_y + aligned_offset_v(cs.valign, ch, h, cs.margin.top, cs.margin.bottom);
         }
         else if (vertical)
         {
@@ -1316,15 +1375,12 @@ void resolve_node(PanoramaNode& node, const PanoramaTextMeasure& tm)
                 y = pen_y + cs.margin.top;
                 pen_y = y + h + cs.margin.bottom;
             }
-            const float avail_h = cw - cs.margin.left - cs.margin.right - w;
-            x = box.content_x + cs.margin.left + halign_offset(cs.halign, avail_h);
+            x = box.content_x + aligned_offset_h(cs.halign, cw, w, cs.margin.left, cs.margin.right);
         }
         else // flow: none — align within the content box on both axes
         {
-            const float avail_h = cw - cs.margin.left - cs.margin.right - w;
-            const float avail_v = ch - cs.margin.top - cs.margin.bottom - h;
-            x = box.content_x + cs.margin.left + halign_offset(cs.halign, avail_h);
-            y = box.content_y + cs.margin.top + valign_offset(cs.valign, avail_v);
+            x = box.content_x + aligned_offset_h(cs.halign, cw, w, cs.margin.left, cs.margin.right);
+            y = box.content_y + aligned_offset_v(cs.valign, ch, h, cs.margin.top, cs.margin.bottom);
         }
 
         child->layout.x = x;
@@ -1415,7 +1471,7 @@ PanoramaTextMeasure default_text_measure()
     PanoramaTextMeasure measure;
     measure.measure = [](std::string_view text, float font_size, int, float letter_spacing) {
         // Metrics-free approximation: ~0.5em advance, 1.2em line height. Good
-        // enough for deterministic layout; the paint layer can install a real
+        // enough for deterministic layout; PanoramaFontAtlas provides a real
         // FreeType-backed measurer for pixel accuracy.
         const float width = static_cast<float>(text.size()) * (font_size * 0.5F + letter_spacing);
         const float height = font_size * 1.2F;

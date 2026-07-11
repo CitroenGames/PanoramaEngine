@@ -36,8 +36,8 @@ std::string strip_whitespace_copy(std::string_view text)
 }
 
 // Tracks `{{ ... }}` data-binding expressions while scanning text data so a `<`
-// inside an expression is treated as data, not markup (port of RmlUi's
-// XMLParseTools::ParseDataBrackets). Returns an error message or nullptr.
+// inside an expression is treated as data, not markup. Returns an error message
+// or nullptr.
 const char* parse_data_brackets(bool& inside_brackets, bool& inside_string, char c, char previous)
 {
     if (inside_brackets)

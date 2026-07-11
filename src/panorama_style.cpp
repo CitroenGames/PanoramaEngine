@@ -16,8 +16,22 @@ namespace openstrike
 {
 PanoramaCascadeStats& panorama_cascade_stats()
 {
-    static PanoramaCascadeStats stats;
+    // CPUMT-49: thread_local so a forked compute's workers each accumulate into
+    // their own instance instead of racing on one shared counter set. Every
+    // existing increment call site (`++panorama_cascade_stats().nodes`, etc.)
+    // needed zero changes for this — thread_local made them transparently
+    // per-thread. Single-threaded callers (every pre-CPUMT-49 caller, and any
+    // caller that never forks) are unaffected: one thread == one instance ==
+    // the exact previous behavior.
+    static thread_local PanoramaCascadeStats stats;
     return stats;
+}
+
+PanoramaCascadeStats panorama_cascade_stats_take()
+{
+    PanoramaCascadeStats snapshot = panorama_cascade_stats();
+    panorama_cascade_stats() = PanoramaCascadeStats{};
+    return snapshot;
 }
 
 namespace
@@ -182,6 +196,21 @@ int parse_font_weight(std::string_view value, int inherited_weight)
     if (t == "black" || t == "heavy")
     {
         return 900;
+    }
+    // Light weights: absolute values matching the medium/semibold/black scale
+    // above. Without these, `font-weight: light` fell through to the numeric
+    // parser (parse_number("light")==0) and returned the inherited weight.
+    if (t == "thin")
+    {
+        return 100;
+    }
+    if (t == "extralight" || t == "extra-light" || t == "ultralight" || t == "ultra-light")
+    {
+        return 200;
+    }
+    if (t == "light")
+    {
+        return 300;
     }
     if (t == "bolder")
     {
@@ -1596,6 +1625,70 @@ PanoramaColor parse_hex_color(std::string_view hex)
     }
     return color;
 }
+
+// Panorama `hsv-transform(<color>, hueDeg, satMul, valMul)`: rotate the base
+// colour's hue by hueDeg and scale its saturation/value, in HSV space. Used by
+// the HUD to dim unselected weapon-select icons and to pulse the bomb/defuse
+// highlight from a single base colour. Alpha is preserved.
+PanoramaColor apply_hsv_transform(PanoramaColor base, float hue_deg, float sat_mul, float val_mul)
+{
+    const float r = static_cast<float>(base.r) / 255.0F;
+    const float g = static_cast<float>(base.g) / 255.0F;
+    const float b = static_cast<float>(base.b) / 255.0F;
+    const float mx = std::max({r, g, b});
+    const float mn = std::min({r, g, b});
+    const float d = mx - mn;
+
+    float h = 0.0F;
+    if (d > 0.0F)
+    {
+        if (mx == r)
+        {
+            h = std::fmod((g - b) / d, 6.0F);
+        }
+        else if (mx == g)
+        {
+            h = (b - r) / d + 2.0F;
+        }
+        else
+        {
+            h = (r - g) / d + 4.0F;
+        }
+        h *= 60.0F;
+        if (h < 0.0F)
+        {
+            h += 360.0F;
+        }
+    }
+    float s = (mx <= 0.0F) ? 0.0F : d / mx;
+    float v = mx;
+
+    h = std::fmod(std::fmod(h + hue_deg, 360.0F) + 360.0F, 360.0F);
+    s = std::clamp(s * sat_mul, 0.0F, 1.0F);
+    v = std::clamp(v * val_mul, 0.0F, 1.0F);
+
+    const float c = v * s;
+    const float x = c * (1.0F - std::fabs(std::fmod(h / 60.0F, 2.0F) - 1.0F));
+    const float m = v - c;
+    float rr = 0.0F;
+    float gg = 0.0F;
+    float bb = 0.0F;
+    switch (static_cast<int>(h / 60.0F) % 6)
+    {
+        case 0: rr = c; gg = x; break;
+        case 1: rr = x; gg = c; break;
+        case 2: gg = c; bb = x; break;
+        case 3: gg = x; bb = c; break;
+        case 4: rr = x; bb = c; break;
+        default: rr = c; bb = x; break;
+    }
+    PanoramaColor out;
+    out.r = static_cast<std::uint8_t>(std::lround(std::clamp(rr + m, 0.0F, 1.0F) * 255.0F));
+    out.g = static_cast<std::uint8_t>(std::lround(std::clamp(gg + m, 0.0F, 1.0F) * 255.0F));
+    out.b = static_cast<std::uint8_t>(std::lround(std::clamp(bb + m, 0.0F, 1.0F) * 255.0F));
+    out.a = base.a;
+    return out;
+}
 }
 
 PanoramaColor parse_panorama_color(std::string_view value)
@@ -1787,12 +1880,28 @@ PanoramaColor parse_panorama_color(std::string_view value)
         }
         if (parts.size() >= 4)
         {
-            // Alpha may be 0-1 (CSS) or 0-255 (Panorama); disambiguate by the dot.
-            const float alpha = parse_number(parts[3]);
-            const float scaled = contains(parts[3], ".") ? alpha * 255.0F : alpha;
-            color.a = static_cast<std::uint8_t>(std::clamp(static_cast<int>(scaled + 0.5F), 0, 255));
+            // CSS/Panorama rgba() alpha is a 0..1 number: a bare `1` means fully
+            // opaque. Clamp to [0,1] and scale to a byte, matching WebCore's
+            // consumeOptionalAlphaRaw + convertFloatAlphaTo<uint8_t>. (The old
+            // decimal-point heuristic mapped an integer `1` to a=1/255, so every
+            // shipped `rgba(...,1)` rendered ~invisible.)
+            const float alpha = std::clamp(parse_number(parts[3]), 0.0F, 1.0F);
+            color.a = static_cast<std::uint8_t>(std::lround(alpha * 255.0F));
         }
         return color;
+    }
+
+    if (starts_with(lowered, "hsv-transform("))
+    {
+        const std::vector<std::string> parts = split_top_level(paren_arg(lowered), ',');
+        if (parts.size() >= 4)
+        {
+            // The first arg resolves recursively (it is usually a @define that
+            // expanded to a #hex / rgb() / keyword); the remaining three are the
+            // hue rotation (deg), saturation multiplier and value multiplier.
+            const PanoramaColor base = parse_panorama_color(trim(parts[0]));
+            return apply_hsv_transform(base, parse_number(parts[1]), parse_number(parts[2]), parse_number(parts[3]));
+        }
     }
 
     // Functional colors that are not parsed by a property-specific path still get
@@ -2714,6 +2823,70 @@ bool parse_background_position(std::string_view value, PanoramaBackgroundPositio
     assign_background_position(out, x, y);
     return true;
 }
+
+struct PanoramaAnimatableStyleProperty
+{
+    std::string_view name;
+    std::string_view transition_name;
+    std::uint32_t keyframe_channel = 0;
+};
+
+constexpr std::array<PanoramaAnimatableStyleProperty, 22> kAnimatableStyleProperties{{
+    {"opacity", "opacity", PanoramaAnimOpacity},
+    {"brightness", "brightness", PanoramaAnimBrightness},
+    {"background-color", "background-color", PanoramaAnimBackgroundColor},
+    {"background-img-opacity", "background-img-opacity", PanoramaAnimBackgroundImageOpacity},
+    {"background-image-opacity", "background-img-opacity", PanoramaAnimBackgroundImageOpacity},
+    {"color", "color", PanoramaAnimColor},
+    {"wash-color", "wash-color", PanoramaAnimWashColor},
+    {"wash-color-fast", "wash-color", PanoramaAnimWashColor},
+    {"transform", "transform", PanoramaAnimTransform},
+    {"position", "position", PanoramaAnimPosition},
+    {"x", "position", PanoramaAnimPosition},
+    {"y", "position", PanoramaAnimPosition},
+    {"z", "position", PanoramaAnimPosition},
+    {"width", "width", 0},
+    {"height", "height", 0},
+    {"border", "border", 0},
+    {"border-width", "border", 0},
+    {"border-color", "border", 0},
+    {"box-shadow", "box-shadow", PanoramaAnimBoxShadow},
+    {"blur", "blur", PanoramaAnimBlur},
+    {"clip", "clip", PanoramaAnimClip},
+    {"pre-transform-scale2d", "pre-transform-scale2d", 0},
+}};
+
+const PanoramaAnimatableStyleProperty* find_animatable_style_property(std::string_view normalized)
+{
+    for (const PanoramaAnimatableStyleProperty& property : kAnimatableStyleProperties)
+    {
+        if (property.name == normalized)
+        {
+            return &property;
+        }
+    }
+    return nullptr;
+}
+}
+
+std::string panorama_canonical_transition_property_name(std::string_view property)
+{
+    std::string normalized = to_lower(trim(property));
+    if (const PanoramaAnimatableStyleProperty* known = find_animatable_style_property(normalized))
+    {
+        return std::string(known->transition_name);
+    }
+    return normalized;
+}
+
+std::uint32_t panorama_anim_channel_for_property(std::string_view property)
+{
+    const std::string normalized = to_lower(trim(property));
+    if (const PanoramaAnimatableStyleProperty* known = find_animatable_style_property(normalized))
+    {
+        return known->keyframe_channel;
+    }
+    return 0;
 }
 
 void apply_panorama_declaration(PanoramaComputedStyle& style, std::string_view property, std::string_view value_in)
@@ -2953,7 +3126,8 @@ void apply_panorama_declaration(PanoramaComputedStyle& style, std::string_view p
             const std::vector<std::string> parts = split_css_whitespace_values(t);
             if (parts.empty())
             {
-                style.background_size = {PanoramaBackgroundSizeType::Stretch, {}, {}};
+                // `auto` / empty = CSS default: natural image size.
+                style.background_size = {PanoramaBackgroundSizeType::Auto, {}, {}};
             }
             else
             {
@@ -2962,15 +3136,17 @@ void apply_panorama_declaration(PanoramaComputedStyle& style, std::string_view p
                     parts.size() > 1 && parts[1] != "auto" ? parse_panorama_length(parts[1]) : PanoramaLength{};
                 if (w.type == PanoramaLengthType::Auto && h.type == PanoramaLengthType::Auto)
                 {
-                    style.background_size = {PanoramaBackgroundSizeType::Stretch, {}, {}};
+                    // `auto auto` (or lone `auto`): intrinsic image size.
+                    style.background_size = {PanoramaBackgroundSizeType::Auto, {}, {}};
                     return;
                 }
-                // `100% 100%` is just our default stretch; a lone `100%` remains
-                // CSS/WebCore's `100% auto`.
+                // `100% 100%` fills the box (Stretch); a lone `100%` remains
+                // CSS/WebCore's `100% auto` (an auto axis is aspect-derived via Fixed).
                 const bool full = w.type == PanoramaLengthType::Percent && std::abs(w.value - 100.0F) < 0.01F &&
                     parts.size() > 1 && h.type == PanoramaLengthType::Percent && std::abs(h.value - 100.0F) < 0.01F;
-                style.background_size =
-                    full ? PanoramaBackgroundSize{} : PanoramaBackgroundSize{PanoramaBackgroundSizeType::Fixed, w, h};
+                style.background_size = full
+                    ? PanoramaBackgroundSize{PanoramaBackgroundSizeType::Stretch, {}, {}}
+                    : PanoramaBackgroundSize{PanoramaBackgroundSizeType::Fixed, w, h};
             }
         }
     }
@@ -3070,7 +3246,19 @@ void apply_panorama_declaration(PanoramaComputedStyle& style, std::string_view p
     }
     else if (prop == "color")
     {
-        style.color = parse_panorama_color(value);
+        // Panorama accepts gradient() as a <color> for text (a Valve extension).
+        // We don't yet fill glyphs with the gradient ramp, but resolve it to the
+        // first-stop colour so rgb-stop gradient text stays visible — without this
+        // it fell through to the default transparent colour and rendered invisible.
+        PanoramaGradient gradient;
+        if (parse_panorama_gradient(value, gradient))
+        {
+            style.color = gradient_fallback_color(gradient);
+        }
+        else
+        {
+            style.color = parse_panorama_color(value);
+        }
     }
     else if (prop == "wash-color" || prop == "wash-color-fast")
     {
@@ -3082,6 +3270,12 @@ void apply_panorama_declaration(PanoramaComputedStyle& style, std::string_view p
     else if (prop == "brightness")
     {
         style.brightness = std::max(0.0F, parse_number(value));
+    }
+    else if (prop == "saturation")
+    {
+        // HSV saturation scale: 1 identity, 0 greyscale, >1 oversaturate, <0 invert.
+        // No lower clamp — shipped content uses `saturation: -1` to invert.
+        style.saturation = parse_number(value);
     }
     else if (prop == "border-color")
     {
@@ -3333,11 +3527,15 @@ void apply_panorama_declaration(PanoramaComputedStyle& style, std::string_view p
             style.line_height = parse_number(t);
         }
     }
-    else if (prop == "text-shadow")
+    else if (prop == "text-shadow" || prop == "text-shadow-fast")
     {
+        // The `-fast` variant is the non-animating equivalent; it computes the
+        // same value (we don't model the transition on this property). Shipped
+        // HUD content uses text-shadow-fast in 40+ places (e.g. weapon select,
+        // team counter, reticle); it was previously dropped on the floor.
         style.text_shadow = parse_panorama_text_shadow(value);
     }
-    else if (prop == "img-shadow")
+    else if (prop == "img-shadow" || prop == "img-shadow-fast")
     {
         // Same value shape as text-shadow (`h v [blur] color`), applied to an
         // Image panel's texture as an offset silhouette.
@@ -3349,7 +3547,7 @@ void apply_panorama_declaration(PanoramaComputedStyle& style, std::string_view p
         const std::string t = to_lower(value);
         style.font_italic = t == "italic" || t == "italics" || t == "oblique";
     }
-    else if (prop == "box-shadow")
+    else if (prop == "box-shadow" || prop == "box-shadow-fast")
     {
         style.box_shadow = parse_panorama_box_shadow(value);
     }
@@ -3477,12 +3675,49 @@ void apply_panorama_declaration(PanoramaComputedStyle& style, std::string_view p
             style.pre_scale_y = parts.size() > 1 ? parse_number(trim(parts[1])) : style.pre_scale_x;
         }
     }
+    else if (prop == "ui-scale" || prop == "ui-scale-x" || prop == "ui-scale-y")
+    {
+        // `<n>` uniform, or `<x> <y> [z]` multi-axis. A `%` token divides by 100;
+        // a bare number is used as-is. ui-scale-x/-y set a single axis.
+        const auto axis = [](std::string_view tok) {
+            const std::string t = trim(tok);
+            const float n = parse_number(t);
+            return t.find('%') != std::string::npos ? n / 100.0F : n;
+        };
+        std::vector<std::string> parts;
+        std::istringstream stream(trim(value));
+        std::string token;
+        while (stream >> token)
+        {
+            parts.push_back(token);
+        }
+        if (!parts.empty())
+        {
+            if (prop == "ui-scale-x")
+            {
+                style.ui_scale_x = axis(parts[0]);
+            }
+            else if (prop == "ui-scale-y")
+            {
+                style.ui_scale_y = axis(parts[0]);
+            }
+            else
+            {
+                style.ui_scale_x = axis(parts[0]);
+                style.ui_scale_y = parts.size() > 1 ? axis(parts[1]) : style.ui_scale_x;
+            }
+        }
+    }
+    else if (prop == "pre-transform-rotate2d")
+    {
+        style.pre_rotate = parse_rotation_degrees(value);
+    }
     else if (prop == "transition-property")
     {
         style.transition_properties.clear();
         for (const std::string& part : split_top_level(value, ','))
         {
-            style.transition_properties.push_back(to_lower(trim(part)));
+            style.transition_properties.push_back(panorama_canonical_transition_property_name(part));
         }
     }
     else if (prop == "transition-duration" || prop == "transition-delay")
@@ -3674,10 +3909,11 @@ bool PanoramaComputedStyle::find_transition(std::string_view property, PanoramaT
     {
         return false;
     }
+    const std::string requested_property = panorama_canonical_transition_property_name(property);
     for (std::size_t i = 0; i < transition_properties.size(); ++i)
     {
-        const std::string& name = transition_properties[i];
-        if (name != property && name != "all")
+        const std::string name = panorama_canonical_transition_property_name(transition_properties[i]);
+        if (name != requested_property && name != "all")
         {
             continue;
         }
@@ -3685,7 +3921,9 @@ bool PanoramaComputedStyle::find_transition(std::string_view property, PanoramaT
         out.property = name;
         out.duration = transition_durations[i % transition_durations.size()];
         out.delay = transition_delays.empty() ? 0.0F : transition_delays[i % transition_delays.size()];
-        out.easing = transition_easings.empty() ? PanoramaEasing{}
+        // A transition with no transition-timing-function eases (CSS initial
+        // value), it does not move linearly.
+        out.easing = transition_easings.empty() ? PanoramaEasing{0.25F, 0.1F, 0.25F, 1.0F, false}
                                                 : transition_easings[i % transition_easings.size()];
         return out.duration > 0.0F;
     }
@@ -3694,58 +3932,6 @@ bool PanoramaComputedStyle::find_transition(std::string_view property, PanoramaT
 
 namespace
 {
-// Maps a keyframe-stop property name to the animatable channel it drives, or 0 if
-// the property is not interpolated by the keyframe runtime.
-std::uint32_t channel_for_property(std::string_view property)
-{
-    const std::string p = to_lower(trim(property));
-    if (p == "opacity")
-    {
-        return PanoramaAnimOpacity;
-    }
-    if (p == "brightness")
-    {
-        return PanoramaAnimBrightness;
-    }
-    if (p == "background-color")
-    {
-        return PanoramaAnimBackgroundColor;
-    }
-    if (p == "background-img-opacity" || p == "background-image-opacity")
-    {
-        return PanoramaAnimBackgroundImageOpacity;
-    }
-    if (p == "color")
-    {
-        return PanoramaAnimColor;
-    }
-    if (p == "wash-color" || p == "wash-color-fast")
-    {
-        return PanoramaAnimWashColor;
-    }
-    if (p == "transform")
-    {
-        return PanoramaAnimTransform;
-    }
-    if (p == "x" || p == "y" || p == "z" || p == "position")
-    {
-        return PanoramaAnimPosition;
-    }
-    if (p == "box-shadow")
-    {
-        return PanoramaAnimBoxShadow;
-    }
-    if (p == "blur")
-    {
-        return PanoramaAnimBlur;
-    }
-    if (p == "clip")
-    {
-        return PanoramaAnimClip;
-    }
-    return 0;
-}
-
 bool strip_important_suffix(std::string& value)
 {
     std::string text = trim(value);
@@ -4238,7 +4424,7 @@ void PanoramaStyleSheet::resolve_all_values()
             {
                 decl.resolved_value = resolve_value(decl.value);
                 apply_panorama_declaration(stop.resolved, decl.property, decl.resolved_value);
-                stop.channels |= channel_for_property(decl.property);
+                stop.channels |= panorama_anim_channel_for_property(decl.property);
             }
             keyframes.channels |= stop.channels;
         }
@@ -4272,6 +4458,7 @@ struct MatchedStyleParentSnapshot
     PanoramaTextShadow text_shadow;
     PanoramaColor wash_color;
     float brightness = 0.0F;
+    float saturation = 0.0F;
     PanoramaCustomProperties custom_properties;
 };
 
@@ -4295,6 +4482,7 @@ bool parent_snapshot_matches(const MatchedStyleParentSnapshot& snapshot, const P
            snapshot.letter_spacing == parent.letter_spacing && snapshot.line_height == parent.line_height &&
            text_shadows_equal(snapshot.text_shadow, parent.text_shadow) &&
            colors_equal(snapshot.wash_color, parent.wash_color) && snapshot.brightness == parent.brightness &&
+           snapshot.saturation == parent.saturation &&
            snapshot.custom_properties.shares_storage(parent.custom_properties);
 }
 
@@ -4389,6 +4577,18 @@ bool PanoramaStyleSheet::can_share_style(const PanoramaNode& node, const Panoram
 
 void PanoramaStyleSheet::compute_node(PanoramaNode& node, const PanoramaNode* prev_sibling) const
 {
+    compute_node_impl(node, prev_sibling, /*recurse=*/true);
+}
+
+// CPUMT-49: `recurse` splits compute_node's original always-recurse body so
+// compute_root_style can compute just one node's own style. compute_node(node,
+// prev) above is exactly compute_node_impl(node, prev, true) -- byte-identical
+// to the pre-CPUMT-49 compute_node for every existing caller (recurse_children
+// below still always recurses through compute_node, never compute_node_impl
+// directly, so descendants are always fully computed regardless of how their
+// ancestor was reached).
+void PanoramaStyleSheet::compute_node_impl(PanoramaNode& node, const PanoramaNode* prev_sibling, bool recurse) const
+{
     ++panorama_cascade_stats().nodes;
     // This subtree is being (re)computed in full; its dirty marks are consumed.
     node.style_dirty = false;
@@ -4417,7 +4617,10 @@ void PanoramaStyleSheet::compute_node(PanoramaNode& node, const PanoramaNode* pr
     {
         node.computed = prev_sibling->computed;
         ++panorama_cascade_stats().shared_nodes;
-        recurse_children(node);
+        if (recurse)
+        {
+            recurse_children(node);
+        }
         return;
     }
 
@@ -4633,6 +4836,7 @@ void PanoramaStyleSheet::compute_node(PanoramaNode& node, const PanoramaNode* pr
         hash_mix(key_hash, parent_style->text_shadow.color);
         hash_mix(key_hash, parent_style->wash_color);
         hash_mix(key_hash, parent_style->brightness);
+        hash_mix(key_hash, parent_style->saturation);
         hash_mix(key_hash, parent_style->custom_properties.storage_key());
     }
 
@@ -4659,7 +4863,10 @@ void PanoramaStyleSheet::compute_node(PanoramaNode& node, const PanoramaNode* pr
                 continue;
             }
             node.computed = entry.style;
-            recurse_children(node);
+            if (recurse)
+            {
+                recurse_children(node);
+            }
             return;
         }
     }
@@ -4682,6 +4889,7 @@ void PanoramaStyleSheet::compute_node(PanoramaNode& node, const PanoramaNode* pr
         style.text_shadow = parent_style->text_shadow;
         style.wash_color = parent_style->wash_color;
         style.brightness = parent_style->brightness;
+        style.saturation = parent_style->saturation;
         style.custom_properties = parent_style->custom_properties;
     }
     if (ua_bold)
@@ -4826,6 +5034,7 @@ void PanoramaStyleSheet::compute_node(PanoramaNode& node, const PanoramaNode* pr
         entry.parent.text_shadow = parent_style->text_shadow;
         entry.parent.wash_color = parent_style->wash_color;
         entry.parent.brightness = parent_style->brightness;
+        entry.parent.saturation = parent_style->saturation;
         entry.parent.custom_properties = parent_style->custom_properties;
     }
     entry.style = style;
@@ -4833,7 +5042,10 @@ void PanoramaStyleSheet::compute_node(PanoramaNode& node, const PanoramaNode* pr
     ++style_cache.entry_count;
 
     node.computed = std::move(style);
-    recurse_children(node);
+    if (recurse)
+    {
+        recurse_children(node);
+    }
 }
 
 void PanoramaStyleSheet::seed_sharing_flags(const PanoramaNode& root) const
@@ -4859,6 +5071,38 @@ void PanoramaStyleSheet::compute(PanoramaNode& root) const
     }
     seed_sharing_flags(root);
     compute_node(root);
+}
+
+// CPUMT-49: host-thread-only. Identical prep to compute() (ancestor filter +
+// seed_sharing_flags), but computes ONLY root's own style (recurse=false) so
+// the caller can then fork compute_forked_subtree() over root's own children.
+void PanoramaStyleSheet::compute_root_style(PanoramaNode& root) const
+{
+    SelectorAncestorFilter& filter = selector_ancestor_filter();
+    filter.clear();
+    for (const PanoramaNode* ancestor = root.parent; ancestor != nullptr; ancestor = ancestor->parent)
+    {
+        filter.push_element(*ancestor);
+    }
+    seed_sharing_flags(root);
+    compute_node_impl(root, nullptr, /*recurse=*/false);
+}
+
+// CPUMT-49: worker-safe. Primes THIS THREAD's thread_local ancestor filter by
+// walking node's real parent chain (root's own style must already be computed
+// by compute_root_style, and sharing_active_/sharing_focus_within_active_
+// already seeded, BEFORE any worker calls this), then computes node's whole
+// subtree with no previous-sibling (style sharing across the fork boundary is
+// deliberately not attempted -- see the header comment).
+void PanoramaStyleSheet::compute_forked_subtree(PanoramaNode& node) const
+{
+    SelectorAncestorFilter& filter = selector_ancestor_filter();
+    filter.clear();
+    for (const PanoramaNode* ancestor = node.parent; ancestor != nullptr; ancestor = ancestor->parent)
+    {
+        filter.push_element(*ancestor);
+    }
+    compute_node(node, nullptr);
 }
 
 void PanoramaStyleSheet::compute_invalidated(PanoramaNode& root) const

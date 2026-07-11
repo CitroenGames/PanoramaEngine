@@ -120,6 +120,13 @@ public:
     // though the matchmaking APIs are otherwise stubbed. Set before initialize().
     using HostActionHandler = std::function<void(const std::string& action, const std::string& arg)>;
     void set_host_action_handler(HostActionHandler handler);
+
+    // Host bridge for script-driven focus: Panel.SetFocus()/Focus() calls this with
+    // the target panel (null = clear focus). The host moves keyboard focus through
+    // its PanoramaInputController (the focus authority). Set before initialize().
+    using FocusRequestHandler = std::function<void(PanoramaNode* panel)>;
+    void set_focus_request_handler(FocusRequestHandler handler);
+
     void set_client(PanoramaRuntimeClient* client);
     void set_bootstrap_scripts(std::vector<PanoramaRuntimeScript> scripts);
 
@@ -145,6 +152,7 @@ private:
     LayoutLoader snippet_loader_;
     SnippetExists snippet_exists_;
     HostActionHandler host_action_;
+    FocusRequestHandler focus_request_;
     PanoramaRuntimeClient* client_ = nullptr;
     std::vector<PanoramaRuntimeScript> bootstrap_scripts_;
     std::unique_ptr<Impl> impl_;

@@ -3,6 +3,7 @@
 #include "panorama_string_util.hpp"
 #include "ui/panorama/panorama_localization.hpp"
 #include "ui/panorama/panorama_log.hpp"
+#include "ui/panorama/panorama_text_edit.hpp"
 
 #include <quickjs.h>
 
@@ -221,8 +222,8 @@ constexpr const char* kPanoramaCorePrelude = R"JS(
     if (!$.HTMLEscape) $.HTMLEscape = function (s) { return String(s); };
     if (!$.UrlEncode) $.UrlEncode = function (s) { return encodeURIComponent(String(s)); };
     if (!$.AsyncWebRequest) $.AsyncWebRequest = function () {};
-    if (!$.UnregisterForUnhandledEvent) $.UnregisterForUnhandledEvent = function () {};
-    if (!$.UnregisterEventHandler) $.UnregisterEventHandler = function () {};
+    // $.UnregisterEventHandler / $.UnregisterForUnhandledEvent are real native
+    // bindings (installed on `$` before this prelude runs).
     // Real Panorama: true while a script file is being hot-reloaded in dev mode. Scripts call this
     // at bootstrap (e.g. playercard.js) — leaving it undefined kills their whole init IIFE.
     if (!$.DbgIsReloadingScript) $.DbgIsReloadingScript = function () { return false; };
@@ -393,6 +394,13 @@ constexpr const char* kPanoramaCsgoHostPreludePart1 = R"JS(
         },
         SetSettingString: function (k, v) { settingsStore[k] = String(v); },
         GetEngineSoundSystemsRunning: function () { return true; }
+    });
+    // The settings "Restore Defaults" button calls this (via settingsmenu_shared.js
+    // ResetKeybdMouseDefaults). CS:GO's native control resets the binds; here we
+    // route to the engine command and the host-managed keybinder rows update on the
+    // next frame. Everything else on OptionsMenuAPI stays a stub.
+    g.OptionsMenuAPI = hostBacked('OptionsMenuAPI', {
+        RestoreKeybdMouseBindingDefaults: function () { $.__host('cmd', 'host_restore_keybindings'); }
     });
     // Launch the session's selected map AND game mode. The play menu keeps the
     // selection in the lobby session settings (mainmenu_play.js _ApplySessionSettings
@@ -834,6 +842,9 @@ struct PanoramaRuntime::Impl final : PanoramaNodeLifetimeObserver
     std::function<void(PanoramaNode&, const std::string&)> load_layout_snippet;
     std::function<bool(const std::string&)> has_layout_snippet;
     std::function<void(const std::string&, const std::string&)> host_action;
+    // Routes a script SetFocus()/Focus() to the host, which owns the input
+    // controller (the focus authority). Null = headless fallback (set the flag).
+    std::function<void(PanoramaNode*)> focus_request;
     PanoramaRuntimeClient* client = nullptr;
     PanoramaLocalization localization;
     std::vector<PanoramaRuntimeScript> bootstrap_scripts;
@@ -876,8 +887,13 @@ struct PanoramaRuntime::Impl final : PanoramaNodeLifetimeObserver
         // relies on this — its PropertyTransitionEnd handler doesn't compare
         // panelName). Null = unscoped (RegisterForUnhandledEvent / 2-arg form).
         PanoramaNode* target = nullptr;
+        // Stable handle returned by RegisterEventHandler and accepted by
+        // UnregisterEventHandler (real Panorama returns an opaque handle, not an
+        // index — indices shift as handlers are removed).
+        int id = 0;
     };
     std::unordered_map<std::string, std::vector<EventHandler>> event_handlers;
+    int next_event_handler_id = 1;
 
     // One stable JS wrapper per node (script-side identity: wrapping the same
     // panel twice yields `===` objects). The map holds its own reference; node
@@ -1713,6 +1729,24 @@ JSValue panel_noop(JSContext* /*ctx*/, JSValueConst /*this_val*/, int /*argc*/, 
     return JS_UNDEFINED;
 }
 
+// Panel.SetFocus() / Panel.Focus(): route to the host, which moves keyboard focus
+// through the input controller (blur old / focus new / seed a field's caret). With
+// no host bridge wired (headless), fall back to setting the flag directly.
+JSValue panel_set_focus(JSContext* ctx, JSValueConst this_val, int /*argc*/, JSValueConst* /*argv*/)
+{
+    PanoramaNode* node = node_arg(ctx, this_val);
+    PanoramaRuntime::Impl* impl = impl_of(ctx);
+    if (impl->focus_request)
+    {
+        impl->focus_request(node);
+    }
+    else if (node != nullptr)
+    {
+        node->focused = true;
+    }
+    return JS_UNDEFINED;
+}
+
 // BLoadLayout / LoadLayout / LoadLayoutAsync: load a layout XML file into this
 // panel via the host loader (parses, merges styles, runs the sublayout's scripts).
 JSValue panel_load_layout(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv)
@@ -1917,6 +1951,12 @@ JSValue panel_set_text(JSContext* ctx, JSValueConst this_val, int argc, JSValueC
         if (text_changed)
         {
             node->text = text;
+            // Keep the caret/selection inside the new value (a focused field being
+            // reassigned from script).
+            if (panorama_node_is_text_entry(*node))
+            {
+                panorama_text_entry_clamp_selection(*node);
+            }
         }
         const bool input_class_before = node_has_class(node, "TextEntryHasInput");
         sync_panorama_text_entry_input_class(*node);
@@ -2196,9 +2236,42 @@ JSValue dollar_register_event_handler(JSContext* ctx, JSValueConst /*this_val*/,
     // that panel — source-targeted fires (PropertyTransitionEnd) skip it for
     // other panels' events.
     PanoramaNode* target = argc >= 3 ? impl->panel_node(argv[1]) : nullptr;
+    const int id = impl->next_event_handler_id++;
     impl->event_handlers[name].push_back(
-        PanoramaRuntime::Impl::EventHandler{JS_DupValue(ctx, fn), impl->innermost_context(), target});
-    return JS_NewInt32(ctx, static_cast<int>(impl->event_handlers[name].size()));
+        PanoramaRuntime::Impl::EventHandler{JS_DupValue(ctx, fn), impl->innermost_context(), target, id});
+    return JS_NewInt32(ctx, id);
+}
+
+JSValue dollar_unregister_event_handler(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv)
+{
+    // UnregisterEventHandler(event, handle) / UnregisterForUnhandledEvent(event,
+    // handle): remove the handler registered under `event` with the returned
+    // handle. A handler removed mid-dispatch still completes the in-flight fire()
+    // (which iterates a copy); the removal takes effect on the next dispatch.
+    if (argc < 2)
+    {
+        return JS_UNDEFINED;
+    }
+    PanoramaRuntime::Impl* impl = impl_of(ctx);
+    const std::string name = to_std_string(ctx, argv[0]);
+    int id = 0;
+    JS_ToInt32(ctx, &id, argv[1]);
+    const auto it = impl->event_handlers.find(name);
+    if (it == impl->event_handlers.end())
+    {
+        return JS_UNDEFINED;
+    }
+    auto& handlers = it->second;
+    for (auto h = handlers.begin(); h != handlers.end(); ++h)
+    {
+        if (h->id == id)
+        {
+            JS_FreeValue(ctx, h->fn);
+            handlers.erase(h);
+            break;
+        }
+    }
+    return JS_UNDEFINED;
 }
 
 JSValue dollar_dispatch_event(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv)
@@ -2607,6 +2680,7 @@ bool PanoramaRuntime::initialize_with_script_contexts(
     impl->load_layout_snippet = snippet_loader_;
     impl->has_layout_snippet = snippet_exists_;
     impl->host_action = host_action_;
+    impl->focus_request = focus_request_;
     impl->client = client_;
     impl->bootstrap_scripts = bootstrap_scripts_;
     impl->localization.load(resource_root);
@@ -2678,8 +2752,8 @@ bool PanoramaRuntime::initialize_with_script_contexts(
     define_method(ctx, proto, "SetSelectedIndex", panel_set_selected_index, 1);
     define_method(ctx, proto, "AccessDropDownMenu", panel_access_dropdown_menu, 0);
     define_method(ctx, proto, "BIsTransparent", panel_b_is_transparent, 0);
-    define_method(ctx, proto, "SetFocus", panel_noop, 0);
-    define_method(ctx, proto, "Focus", panel_noop, 0);
+    define_method(ctx, proto, "SetFocus", panel_set_focus, 0);
+    define_method(ctx, proto, "Focus", panel_set_focus, 0);
     define_method(ctx, proto, "ScrollToTop", panel_scroll_to_top, 0);
     define_method(ctx, proto, "ScrollToBottom", panel_scroll_to_bottom, 0);
     define_method(ctx, proto, "ScrollParentToMakePanelFit", panel_scroll_parent_to_make_panel_fit, 2);
@@ -2729,6 +2803,8 @@ bool PanoramaRuntime::initialize_with_script_contexts(
     define_method(ctx, dollar, "CreatePanel", dollar_create_panel, 3);
     define_method(ctx, dollar, "RegisterEventHandler", dollar_register_event_handler, 3);
     define_method(ctx, dollar, "RegisterForUnhandledEvent", dollar_register_event_handler, 2);
+    define_method(ctx, dollar, "UnregisterEventHandler", dollar_unregister_event_handler, 2);
+    define_method(ctx, dollar, "UnregisterForUnhandledEvent", dollar_unregister_event_handler, 2);
     define_method(ctx, dollar, "DispatchEvent", dollar_dispatch_event, 1);
     define_method(ctx, dollar, "Schedule", dollar_schedule, 2);
     define_method(ctx, dollar, "CancelScheduled", dollar_cancel_scheduled, 1);
@@ -2803,6 +2879,15 @@ void PanoramaRuntime::set_client(PanoramaRuntimeClient* client)
     }
 }
 
+void PanoramaRuntime::set_focus_request_handler(FocusRequestHandler handler)
+{
+    focus_request_ = std::move(handler);
+    if (impl_)
+    {
+        impl_->focus_request = focus_request_;
+    }
+}
+
 void PanoramaRuntime::set_bootstrap_scripts(std::vector<PanoramaRuntimeScript> scripts)
 {
     bootstrap_scripts_ = std::move(scripts);
@@ -2831,6 +2916,10 @@ void PanoramaRuntime::run_source_in_context(const std::string& source, const std
     {
         return;
     }
+    if (panorama_debug_tree_guard_enabled())
+    {
+        panorama_debug_set_mutation_context("run_source_in_context " + origin);
+    }
     impl_->run_code(&context, source, origin.c_str());
     JSContext* job_ctx = nullptr;
     while (JS_ExecutePendingJob(impl_->rt, &job_ctx) > 0)
@@ -2843,6 +2932,11 @@ void PanoramaRuntime::run_node_handler(PanoramaNode& node, const std::string& ev
     if (!active())
     {
         return;
+    }
+    if (panorama_debug_tree_guard_enabled())
+    {
+        std::string context = "run_node_handler " + event_attr + " on <" + node.tag + "#" + node.id + ">";
+        panorama_debug_set_mutation_context(std::move(context));
     }
     const auto it = node.attributes.find(event_attr);
     if (it != node.attributes.end() && !it->second.empty() && it->second != kPanelEventMarker)
@@ -2925,6 +3019,10 @@ void PanoramaRuntime::update(double dt_seconds)
     impl_->firing_scheduled = &due;
     for (const Impl::Scheduled& entry : due)
     {
+        if (panorama_debug_tree_guard_enabled())
+        {
+            panorama_debug_set_mutation_context("scheduled callback id=" + std::to_string(entry.id));
+        }
         // The callback sees its registering script's context panel.
         Impl::ContextScope scope(*impl_, entry.context);
         JSValue result = JS_Call(ctx, entry.fn, JS_UNDEFINED, 0, nullptr);
@@ -2947,6 +3045,10 @@ void PanoramaRuntime::dispatch_event(const std::string& event_name)
 {
     if (active())
     {
+        if (panorama_debug_tree_guard_enabled())
+        {
+            panorama_debug_set_mutation_context("dispatch_event " + event_name);
+        }
         impl_->fire(event_name, 0, nullptr);
     }
 }
@@ -2960,6 +3062,11 @@ void PanoramaRuntime::dispatch_property_transition_end(PanoramaNode& panel, cons
     // Panorama signature: handler(panelName, propertyName) — panelName is the
     // panel's id string (mainmenu.js compares `newPanel.id === panelName`).
     // Delivery is scoped to handlers registered for `panel` (plus unscoped ones).
+    if (panorama_debug_tree_guard_enabled())
+    {
+        panorama_debug_set_mutation_context(
+            "PropertyTransitionEnd " + std::string(property) + " on #" + panel.id);
+    }
     JSContext* ctx = impl_->ctx;
     JSValue argv[2] = {
         JS_NewStringLen(ctx, panel.id.data(), panel.id.size()),

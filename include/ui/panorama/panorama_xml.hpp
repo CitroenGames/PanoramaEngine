@@ -9,24 +9,20 @@
 
 // Self-contained SAX-style XML parser for Panorama .xml layout files.
 //
-// This is a faithful port of the subset of RmlUi's BaseXMLParser semantics the
-// Panorama converter historically relied on, so the engine no longer links
-// RmlUi (PanoramaEngine is a standalone thirdparty library):
+// This parser preserves the XML behavior Panorama layouts rely on:
 //   - `<?...>` header skipped, `<!--...-->` comments skipped (without splitting
 //     surrounding text data), `<![CDATA[...]]>` sections passed through as data.
 //   - Registered CDATA tags (e.g. <style>, <script>) capture their raw body —
 //     including markup — until the matching case-insensitive close tag.
 //   - Attribute values may be double-quoted, single-quoted, or bare words, and
-//     have their XML/RML character entities decoded; text data is delivered
+//     have their XML character entities decoded; text data is delivered
 //     verbatim (the consumer re-escapes it).
 //   - Text containing `{{ ... }}` data-binding expressions keeps `<` inside the
 //     brackets as data instead of treating it as markup.
 //   - Parsing stops once the root element closes; trailing content is ignored.
 namespace openstrike
 {
-// Attribute list preserving document order (RmlUi's XMLAttributes is an
-// insertion-ordered small map; the converter iterates it to pass attributes
-// through, so order is part of the contract).
+// Attribute list preserving document order.
 class PanoramaXmlAttributes
 {
 public:
@@ -93,7 +89,7 @@ private:
     std::string data_;
 };
 
-// Decodes the XML/RML character entities `&lt;` `&gt;` `&amp;` `&quot;` and
+// Decodes the XML character entities `&lt;` `&gt;` `&amp;` `&quot;` and
 // numeric `&#...;` / `&#x...;` references (code points emitted as UTF-8).
 // Unrecognized sequences pass through unchanged.
 [[nodiscard]] std::string decode_xml_entities(std::string_view text);

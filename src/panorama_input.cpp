@@ -2,8 +2,10 @@
 
 #include "ui/panorama/panorama_log.hpp"
 #include "ui/panorama/panorama_runtime.hpp"
+#include "ui/panorama/panorama_text_edit.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -125,6 +127,50 @@ PanoramaNode* ancestor_focusable(PanoramaNode* node)
         }
     }
     return nullptr;
+}
+
+// Disabled state, mirroring panorama_style.cpp's node_disabled (a `.disabled`
+// class or enabled="false"): such a control is skipped by the tab sequence.
+bool node_enabled(const PanoramaNode& node)
+{
+    if (std::find(node.classes.begin(), node.classes.end(), "disabled") != node.classes.end())
+    {
+        return false;
+    }
+    const auto it = node.attributes.find("enabled");
+    return it == node.attributes.end() || it->second != "false";
+}
+
+// FocusController shadowAdjustedTabIndex: explicit tabindex, else 0 for a
+// focusable control. A control absent from the tab sequence (tabindex < 0) returns
+// -1 and is filtered out by the collector.
+int node_tab_index(const PanoramaNode& node)
+{
+    const auto it = node.attributes.find("tabindex");
+    if (it != node.attributes.end())
+    {
+        return std::atoi(it->second.c_str());
+    }
+    return 0;
+}
+
+// Document-order walk collecting candidates, pruning subtrees that are not visible
+// (an invisible ancestor removes its whole subtree from the tab sequence, like a
+// display:none render-tree gap in WebCore).
+void collect_focus_candidates(PanoramaNode& node, std::vector<PanoramaNode*>& out)
+{
+    if (!node.computed.visible)
+    {
+        return;
+    }
+    if (node_focusable(node) && node_enabled(node) && node_tab_index(node) >= 0)
+    {
+        out.push_back(&node);
+    }
+    for (const auto& child : node.children)
+    {
+        collect_focus_candidates(*child, out);
+    }
 }
 
 // Nearest node (self or ancestor) that is a radio button in a group.
@@ -379,6 +425,10 @@ void panorama_apply_control_presentation(PanoramaNode& node)
     ensure_panorama_settings_slider_internals(node);
     ensure_panorama_slider_internals(node);
 
+    // Settings key-rebind rows (CSGOSettingsKeyBinder) own a labelled bind button +
+    // a clear button; materialize them so the host can show the bound key + capture.
+    ensure_panorama_settings_keybinder_internals(node);
+
     // A dropdown collapses to its selected option when closed. While open,
     // layout keeps the control anchored and positions the option rows as a
     // popup below it, matching WebCore's select-popup anchor behavior.
@@ -469,22 +519,11 @@ bool PanoramaInputController::update_pointer(
         }
         if (down)
         {
-            PanoramaNode* next_focus = hover_node_ != nullptr ? ancestor_focusable(hover_node_) : nullptr;
-            if (next_focus != focus_node_)
-            {
-                if (focus_node_ != nullptr)
-                {
-                    focus_node_->focused = false;
-                }
-                focus_node_ = next_focus;
-                if (focus_node_ != nullptr)
-                {
-                    focus_node_->focused = true;
-                }
-                // :focus-within lets a descendant's focus alter ancestor matches,
-                // which subtree marking cannot express — invalidate everything.
-                root.mark_style_dirty();
-            }
+            // A press focuses the nearest focusable ancestor (WebCore
+            // EventHandler::handleMousePressEvent -> setFocusedElement); clicking
+            // empty space clears focus. set_focus fires onblur/onfocus and seeds a
+            // text field's caret.
+            set_focus(root, hover_node_ != nullptr ? ancestor_focusable(hover_node_) : nullptr, runtime);
         }
 
         if (down && hover_node_ != nullptr)
@@ -559,16 +598,24 @@ void PanoramaInputController::handle_dropdown_click(PanoramaNode& dropdown, Pano
 
     // Open: a click on an option commits it as the new selection; either way the
     // menu closes. CS:GO settings dropdowns react to selection via onuserinputsubmit.
+    // The submit handler may delete the dropdown (or the whole menu it lives in),
+    // so everything after it goes through a lifetime watch.
+    PanoramaScopedNodeWatch watch({&dropdown});
     if (PanoramaNode* option = dropdown_option_for_hit(dropdown, hit))
     {
+        const std::string dropdown_id = dropdown.id;
+        const std::string option_id = option->id;
         panorama_select_dropdown_option(dropdown, *option);
         if (runtime != nullptr)
         {
             runtime->run_node_handler(dropdown, "onuserinputsubmit");
         }
-        pano_log_info("Panorama dropdown #{} selected #{}", dropdown.id, option->id);
+        pano_log_info("Panorama dropdown #{} selected #{}", dropdown_id, option_id);
     }
-    panorama_set_dropdown_open(dropdown, false);
+    if (PanoramaNode* live_dropdown = watch.nodes()[0])
+    {
+        panorama_set_dropdown_open(*live_dropdown, false);
+    }
 }
 
 bool PanoramaInputController::update_wheel(
@@ -741,6 +788,236 @@ bool PanoramaInputController::update_slider_drag(float design_x, float /*design_
     // thumb CENTRE, clamped to the rail, then to a 0..1 fraction of the travel.
     const float position = std::clamp(design_x - track_x - thumb_width * 0.5F, 0.0F, travel);
     return panorama_set_slider_fraction(*slider, position / travel);
+}
+
+std::vector<PanoramaNode*> panorama_collect_tab_order(PanoramaNode& root)
+{
+    std::vector<PanoramaNode*> candidates;
+    collect_focus_candidates(root, candidates);
+
+    // FocusController::advanceFocusInDocumentOrder: positive tabindex values are
+    // visited first in ascending order (stable for equal values -> document
+    // order), then the run of tabindex 0 / default-focusable controls in document
+    // order. (Negative tabindex was already filtered by the collector.)
+    std::vector<PanoramaNode*> positive;
+    std::vector<PanoramaNode*> zero;
+    for (PanoramaNode* node : candidates)
+    {
+        if (node_tab_index(*node) > 0)
+        {
+            positive.push_back(node);
+        }
+        else
+        {
+            zero.push_back(node);
+        }
+    }
+    std::stable_sort(positive.begin(), positive.end(),
+        [](PanoramaNode* a, PanoramaNode* b) { return node_tab_index(*a) < node_tab_index(*b); });
+    positive.insert(positive.end(), zero.begin(), zero.end());
+    return positive;
+}
+
+void PanoramaInputController::set_focus(PanoramaNode& root, PanoramaNode* node, PanoramaRuntime* runtime)
+{
+    if (node == focus_node_)
+    {
+        return;
+    }
+    PanoramaNode* old = focus_node_;
+    if (old != nullptr)
+    {
+        old->focused = false;
+    }
+    focus_node_ = node;
+    if (node != nullptr)
+    {
+        node->focused = true;
+        // A freshly focused field places a collapsed caret at the end of its value
+        // (its selection is clamped onto codepoint boundaries first).
+        if (panorama_node_is_text_entry(*node))
+        {
+            panorama_text_entry_clamp_selection(*node);
+            panorama_text_entry_collapse_to_end(*node);
+        }
+    }
+    // :focus / :focus-within can alter matches anywhere in the tree; full invalidate.
+    root.mark_style_dirty();
+
+    // WebCore setFocusedElement order: blur the previously focused element, then
+    // focus the new one. Guard against a handler deleting the new node mid-call
+    // (node destruction nulls focus_node_, so re-check identity before onfocus).
+    if (runtime != nullptr)
+    {
+        if (old != nullptr)
+        {
+            runtime->run_node_handler(*old, "onblur");
+        }
+        if (node != nullptr && focus_node_ == node)
+        {
+            runtime->run_node_handler(*node, "onfocus");
+        }
+    }
+}
+
+bool PanoramaInputController::advance_focus(PanoramaNode& root, bool forward, PanoramaRuntime* runtime)
+{
+    std::vector<PanoramaNode*> order = panorama_collect_tab_order(root);
+    if (order.empty())
+    {
+        return false;
+    }
+    int current = -1;
+    for (int i = 0; i < static_cast<int>(order.size()); ++i)
+    {
+        if (order[static_cast<std::size_t>(i)] == focus_node_)
+        {
+            current = i;
+            break;
+        }
+    }
+    const int count = static_cast<int>(order.size());
+    int next = 0;
+    if (current < 0)
+    {
+        next = forward ? 0 : count - 1;
+    }
+    else
+    {
+        next = current + (forward ? 1 : -1);
+        if (next < 0)
+        {
+            next = count - 1; // wrap to the end
+        }
+        else if (next >= count)
+        {
+            next = 0; // wrap to the start
+        }
+    }
+    PanoramaNode* target = order[static_cast<std::size_t>(next)];
+    if (target == focus_node_)
+    {
+        return false; // only one candidate, already focused
+    }
+    set_focus(root, target, runtime);
+    // Windows convention (and CS:GO's): tabbing into a text field selects all of
+    // its current contents so the next keystroke replaces them.
+    if (focus_node_ == target && panorama_node_is_text_entry(*target))
+    {
+        panorama_text_entry_select_all(*target);
+    }
+    return true;
+}
+
+bool PanoramaInputController::handle_text_input(PanoramaNode& root, std::string_view utf8, PanoramaRuntime* runtime)
+{
+    (void)root;
+    if (focus_node_ == nullptr || !panorama_node_is_text_entry(*focus_node_) || utf8.empty())
+    {
+        return false;
+    }
+    PanoramaNode* field = focus_node_;
+    if (!panorama_text_entry_insert(*field, utf8))
+    {
+        return false;
+    }
+    sync_panorama_text_entry_input_class(*field);
+    field->mark_style_dirty();
+    if (runtime != nullptr)
+    {
+        runtime->run_node_handler(*field, "ontextentrychanged");
+    }
+    return true;
+}
+
+bool PanoramaInputController::handle_key_down(PanoramaNode& root, const PanoramaKeyEvent& event, PanoramaRuntime* runtime)
+{
+    // Tab advances focus (EventHandler::defaultTabEventHandler — ignored when a
+    // Ctrl/Alt modifier is held, which is a different shortcut).
+    if (event.key == PanoramaKey::Tab && !event.ctrl && !event.alt)
+    {
+        return advance_focus(root, !event.shift, runtime);
+    }
+
+    PanoramaNode* field = focus_node_;
+    if (field == nullptr)
+    {
+        return false;
+    }
+
+    if (panorama_node_is_text_entry(*field))
+    {
+        // Ctrl turns the arrow/delete keys into their word-granularity variants
+        // (MoveWordLeft, DeleteWordForward, ...).
+        const PanoramaTextGranularity granularity =
+            event.ctrl ? PanoramaTextGranularity::Word : PanoramaTextGranularity::Character;
+        bool selection_changed = false; // caret/selection moved -> repaint only
+        bool value_changed = false;     // text edited -> relayout + ontextentrychanged
+        switch (event.key)
+        {
+        case PanoramaKey::ArrowLeft:
+            selection_changed = panorama_text_entry_move(*field, PanoramaTextDirection::Backward, granularity, event.shift);
+            break;
+        case PanoramaKey::ArrowRight:
+            selection_changed = panorama_text_entry_move(*field, PanoramaTextDirection::Forward, granularity, event.shift);
+            break;
+        case PanoramaKey::Home:
+            selection_changed =
+                panorama_text_entry_move(*field, PanoramaTextDirection::Backward, PanoramaTextGranularity::LineBoundary, event.shift);
+            break;
+        case PanoramaKey::End:
+            selection_changed =
+                panorama_text_entry_move(*field, PanoramaTextDirection::Forward, PanoramaTextGranularity::LineBoundary, event.shift);
+            break;
+        case PanoramaKey::Backspace:
+            value_changed = panorama_text_entry_delete(*field, PanoramaTextDirection::Backward, granularity);
+            break;
+        case PanoramaKey::Delete:
+            value_changed = panorama_text_entry_delete(*field, PanoramaTextDirection::Forward, granularity);
+            break;
+        case PanoramaKey::A:
+            if (!event.ctrl)
+            {
+                return false; // a plain 'a' is text — delivered via handle_text_input
+            }
+            selection_changed = panorama_text_entry_select_all(*field);
+            break;
+        case PanoramaKey::Enter:
+            // Single-line: Enter never inserts a newline; it submits the field.
+            if (runtime != nullptr)
+            {
+                runtime->run_node_handler(*field, "oninputsubmit");
+            }
+            return true;
+        default:
+            return false; // unhandled key (e.g. Up/Down) falls through to the host
+        }
+
+        if (value_changed)
+        {
+            sync_panorama_text_entry_input_class(*field);
+            field->mark_style_dirty();
+            if (runtime != nullptr)
+            {
+                runtime->run_node_handler(*field, "ontextentrychanged");
+            }
+            return true;
+        }
+        if (selection_changed)
+        {
+            field->mark_style_dirty();
+        }
+        return true; // caret/selection keys are consumed by the focused field
+    }
+
+    // A focused non-text control activates on Enter (matching the press path's
+    // onactivate), so keyboard-only users can trigger buttons.
+    if (event.key == PanoramaKey::Enter && runtime != nullptr)
+    {
+        runtime->run_node_handler(*field, "onactivate");
+        return true;
+    }
+    return false;
 }
 
 void PanoramaInputController::reset()

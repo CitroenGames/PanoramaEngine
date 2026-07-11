@@ -1,0 +1,66 @@
+[project:freetype]
+type = lib
+c_standard = 11
+sources = {
+    src/base/ftsystem.c
+    src/base/ftinit.c
+    src/base/ftdebug.c
+    src/base/ftbase.c
+    src/base/ftbbox.c
+    src/base/ftbitmap.c
+    src/base/ftglyph.c
+    src/base/ftsynth.c
+    src/base/ftmm.c
+    src/sfnt/sfnt.c
+    src/truetype/truetype.c
+    src/type1/type1.c
+    src/cff/cff.c
+    src/cid/type1cid.c
+    src/hvf/hvf.c
+    src/pfr/pfr.c
+    src/type42/type42.c
+    src/winfonts/winfnt.c
+    src/pcf/pcf.c
+    src/bdf/bdf.c
+    src/autofit/autofit.c
+    src/smooth/smooth.c
+    src/psnames/psnames.c
+    src/psaux/psaux.c
+    src/pshinter/pshinter.c
+    src/gzip/ftgzip.c
+    src/lzw/ftlzw.c
+    src/sdf/sdf.c
+    src/raster/raster.c
+    src/svg/svg.c
+}
+headers = include/**/*.h
+includes = include
+public_includes = include
+defines = FT2_BUILD_LIBRARY
+multiprocessor = true
+
+[config:Debug|x64]
+runtime_library = MultiThreadedDebug
+optimization = Disabled
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../../bin/x64/Debug
+intdir = ../../build/obj/x64/Debug/freetype
+if(posix)
+{
+    outdir = ../../bin/posix/Debug
+    intdir = ../../build/obj/posix/Debug/freetype
+}
+
+[config:Release|x64]
+runtime_library = MultiThreaded
+optimization = MaxSpeed
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../../bin/x64/Release
+intdir = ../../build/obj/x64/Release/freetype
+if(posix)
+{
+    outdir = ../../bin/posix/Release
+    intdir = ../../build/obj/posix/Release/freetype
+}

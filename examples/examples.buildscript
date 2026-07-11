@@ -1,6 +1,6 @@
 # PanoramaEngine examples: small standalone console apps that embed the engine
-# with no host integration (no RmlUi, no GPU, no game filesystem). Each one is a
-# single main.cpp linking only PanoramaEngine (+ its vendored QuickJS).
+# with no host integration (no GPU, no game filesystem). Each one is a
+# single main.cpp linking only PanoramaEngine and its vendored dependencies.
 include = ../panorama_engine.buildscript
 
 [project:PanoramaExampleHelloLayout]
@@ -24,48 +24,48 @@ runtime_library = MultiThreadedDebug
 optimization = Disabled
 debug_info = ProgramDatabase
 generate_debug_info = true
-outdir = ../../../../bin/x64/Debug
-intdir = ../../../../build/obj/x64/Debug/PanoramaExampleHelloLayout
+outdir = ../bin/x64/Debug
+intdir = ../build/obj/x64/Debug/PanoramaExampleHelloLayout
 
 [config:Debug|macOS]
 runtime_library = MultiThreadedDebug
 optimization = Disabled
 debug_info = ProgramDatabase
 generate_debug_info = true
-outdir = ../../../../bin/posix/Debug
-intdir = ../../../../build/obj/posix/Debug/PanoramaExampleHelloLayout
+outdir = ../bin/posix/Debug
+intdir = ../build/obj/posix/Debug/PanoramaExampleHelloLayout
 
 [config:Debug|Linux]
 runtime_library = MultiThreadedDebug
 optimization = Disabled
 debug_info = ProgramDatabase
 generate_debug_info = true
-outdir = ../../../../bin/posix/Debug
-intdir = ../../../../build/obj/posix/Debug/PanoramaExampleHelloLayout
+outdir = ../bin/posix/Debug
+intdir = ../build/obj/posix/Debug/PanoramaExampleHelloLayout
 
 [config:Release|x64]
 runtime_library = MultiThreaded
 optimization = MaxSpeed
 debug_info = ProgramDatabase
 generate_debug_info = true
-outdir = ../../../../bin/x64/Release
-intdir = ../../../../build/obj/x64/Release/PanoramaExampleHelloLayout
+outdir = ../bin/x64/Release
+intdir = ../build/obj/x64/Release/PanoramaExampleHelloLayout
 
 [config:Release|macOS]
 runtime_library = MultiThreaded
 optimization = MaxSpeed
 debug_info = ProgramDatabase
 generate_debug_info = true
-outdir = ../../../../bin/posix/Release
-intdir = ../../../../build/obj/posix/Release/PanoramaExampleHelloLayout
+outdir = ../bin/posix/Release
+intdir = ../build/obj/posix/Release/PanoramaExampleHelloLayout
 
 [config:Release|Linux]
 runtime_library = MultiThreaded
 optimization = MaxSpeed
 debug_info = ProgramDatabase
 generate_debug_info = true
-outdir = ../../../../bin/posix/Release
-intdir = ../../../../build/obj/posix/Release/PanoramaExampleHelloLayout
+outdir = ../bin/posix/Release
+intdir = ../build/obj/posix/Release/PanoramaExampleHelloLayout
 
 [project:PanoramaExampleSoftwareRaster]
 type = exe
@@ -88,48 +88,48 @@ runtime_library = MultiThreadedDebug
 optimization = Disabled
 debug_info = ProgramDatabase
 generate_debug_info = true
-outdir = ../../../../bin/x64/Debug
-intdir = ../../../../build/obj/x64/Debug/PanoramaExampleSoftwareRaster
+outdir = ../bin/x64/Debug
+intdir = ../build/obj/x64/Debug/PanoramaExampleSoftwareRaster
 
 [config:Debug|macOS]
 runtime_library = MultiThreadedDebug
 optimization = Disabled
 debug_info = ProgramDatabase
 generate_debug_info = true
-outdir = ../../../../bin/posix/Debug
-intdir = ../../../../build/obj/posix/Debug/PanoramaExampleSoftwareRaster
+outdir = ../bin/posix/Debug
+intdir = ../build/obj/posix/Debug/PanoramaExampleSoftwareRaster
 
 [config:Debug|Linux]
 runtime_library = MultiThreadedDebug
 optimization = Disabled
 debug_info = ProgramDatabase
 generate_debug_info = true
-outdir = ../../../../bin/posix/Debug
-intdir = ../../../../build/obj/posix/Debug/PanoramaExampleSoftwareRaster
+outdir = ../bin/posix/Debug
+intdir = ../build/obj/posix/Debug/PanoramaExampleSoftwareRaster
 
 [config:Release|x64]
 runtime_library = MultiThreaded
 optimization = MaxSpeed
 debug_info = ProgramDatabase
 generate_debug_info = true
-outdir = ../../../../bin/x64/Release
-intdir = ../../../../build/obj/x64/Release/PanoramaExampleSoftwareRaster
+outdir = ../bin/x64/Release
+intdir = ../build/obj/x64/Release/PanoramaExampleSoftwareRaster
 
 [config:Release|macOS]
 runtime_library = MultiThreaded
 optimization = MaxSpeed
 debug_info = ProgramDatabase
 generate_debug_info = true
-outdir = ../../../../bin/posix/Release
-intdir = ../../../../build/obj/posix/Release/PanoramaExampleSoftwareRaster
+outdir = ../bin/posix/Release
+intdir = ../build/obj/posix/Release/PanoramaExampleSoftwareRaster
 
 [config:Release|Linux]
 runtime_library = MultiThreaded
 optimization = MaxSpeed
 debug_info = ProgramDatabase
 generate_debug_info = true
-outdir = ../../../../bin/posix/Release
-intdir = ../../../../build/obj/posix/Release/PanoramaExampleSoftwareRaster
+outdir = ../bin/posix/Release
+intdir = ../build/obj/posix/Release/PanoramaExampleSoftwareRaster
 
 [project:PanoramaExampleScriptedUi]
 type = exe
@@ -152,45 +152,45 @@ runtime_library = MultiThreadedDebug
 optimization = Disabled
 debug_info = ProgramDatabase
 generate_debug_info = true
-outdir = ../../../../bin/x64/Debug
-intdir = ../../../../build/obj/x64/Debug/PanoramaExampleScriptedUi
+outdir = ../bin/x64/Debug
+intdir = ../build/obj/x64/Debug/PanoramaExampleScriptedUi
 
 [config:Debug|macOS]
 runtime_library = MultiThreadedDebug
 optimization = Disabled
 debug_info = ProgramDatabase
 generate_debug_info = true
-outdir = ../../../../bin/posix/Debug
-intdir = ../../../../build/obj/posix/Debug/PanoramaExampleScriptedUi
+outdir = ../bin/posix/Debug
+intdir = ../build/obj/posix/Debug/PanoramaExampleScriptedUi
 
 [config:Debug|Linux]
 runtime_library = MultiThreadedDebug
 optimization = Disabled
 debug_info = ProgramDatabase
 generate_debug_info = true
-outdir = ../../../../bin/posix/Debug
-intdir = ../../../../build/obj/posix/Debug/PanoramaExampleScriptedUi
+outdir = ../bin/posix/Debug
+intdir = ../build/obj/posix/Debug/PanoramaExampleScriptedUi
 
 [config:Release|x64]
 runtime_library = MultiThreaded
 optimization = MaxSpeed
 debug_info = ProgramDatabase
 generate_debug_info = true
-outdir = ../../../../bin/x64/Release
-intdir = ../../../../build/obj/x64/Release/PanoramaExampleScriptedUi
+outdir = ../bin/x64/Release
+intdir = ../build/obj/x64/Release/PanoramaExampleScriptedUi
 
 [config:Release|macOS]
 runtime_library = MultiThreaded
 optimization = MaxSpeed
 debug_info = ProgramDatabase
 generate_debug_info = true
-outdir = ../../../../bin/posix/Release
-intdir = ../../../../build/obj/posix/Release/PanoramaExampleScriptedUi
+outdir = ../bin/posix/Release
+intdir = ../build/obj/posix/Release/PanoramaExampleScriptedUi
 
 [config:Release|Linux]
 runtime_library = MultiThreaded
 optimization = MaxSpeed
 debug_info = ProgramDatabase
 generate_debug_info = true
-outdir = ../../../../bin/posix/Release
-intdir = ../../../../build/obj/posix/Release/PanoramaExampleScriptedUi
+outdir = ../bin/posix/Release
+intdir = ../build/obj/posix/Release/PanoramaExampleScriptedUi

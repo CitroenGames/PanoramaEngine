@@ -29,6 +29,22 @@ public:
     }
     virtual void release_texture(PanoramaTextureId texture) = 0;
 
+    // Re-uploads `rgba` into an EXISTING texture returned by generate_texture,
+    // in place, instead of the caller doing release_texture+generate_texture.
+    // For a host that repeatedly recomposites a texture of unchanging size (the
+    // CS:GO radar disc), this avoids a GPU resource create/destroy every dirty
+    // frame. Returns false when the backend cannot service the request in place
+    // (unknown/stale id, size mismatch, no update support) — the caller must
+    // then fall back to release_texture + generate_texture. Default no-op
+    // backend always returns false, so hosts without in-place update support
+    // (the software rasterizer, examples) keep today's create/destroy behavior
+    // with no code change.
+    virtual bool update_texture(PanoramaTextureId /*texture*/, std::span<const unsigned char> /*rgba*/,
+        int /*width*/, int /*height*/)
+    {
+        return false;
+    }
+
     // Sets (or clears) the scissor rectangle applied to subsequent render_geometry
     // calls, in framebuffer pixels. Used for Panorama `overflow` clipping. Default
     // no-op so backends without scissor support simply do not clip.

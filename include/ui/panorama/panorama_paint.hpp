@@ -10,8 +10,7 @@
 
 // Panorama paint: turns a laid-out PanoramaNode tree into a renderer-agnostic
 // display list of textured/coloured quads. The host translates the display list
-// into its own backend calls (e.g. RmlDx12RenderInterface CompileGeometry /
-// RenderGeometry). Nothing here depends on RmlUi, FreeType, or a GPU — colours
+// into its own backend calls. Nothing here depends on FreeType or a GPU — colours
 // are straight (non-premultiplied) RGBA; the host premultiplies if it must.
 namespace openstrike
 {
@@ -83,10 +82,11 @@ struct PanoramaGlyph
     bool valid = false;     // false -> whitespace / no geometry, advance only
 };
 
-// Supplies glyph metrics + atlas placement for text painting. The host backs
-// this with FreeType; the layout layer's PanoramaTextMeasure should agree with
-// the same font so measured and painted text line up. If `glyph` is null, text
-// is skipped (panels still paint their backgrounds/borders).
+// Supplies glyph metrics + atlas placement for text painting. PanoramaFontAtlas
+// provides the built-in FreeType source; custom sources are also supported. The
+// layout layer's PanoramaTextMeasure should agree with the same font so measured
+// and painted text line up. If `glyph` is null, text is skipped (panels still
+// paint their backgrounds/borders).
 struct PanoramaGlyphSource
 {
     // Returns the glyph for `codepoint` at `font_size` / `font_weight`. Returning

@@ -22,6 +22,77 @@ std::vector<PanoramaNodeLifetimeObserver*>& node_lifetime_observers()
     return observers;
 }
 
+// Tree guard (see panorama_dom.hpp). Same single-threaded-DOM assumption as the
+// observer registry above.
+struct TreeGuardDestroyedRecord
+{
+    const void* ptr = nullptr;
+    std::string label;   // "tag#id" of the node at destruction time
+    std::string parent;  // "tag#id" of node->parent at destruction time
+    std::string context; // mutation context active when it died
+    std::uint64_t seq = 0;
+};
+
+struct TreeGuardState
+{
+    std::string mutation_context;
+    std::vector<TreeGuardDestroyedRecord> ring; // capped circular buffer
+    std::size_t ring_next = 0;
+    std::uint64_t destroy_seq = 0;
+    static constexpr std::size_t kRingCapacity = 512;
+};
+
+TreeGuardState& tree_guard_state()
+{
+    static TreeGuardState state;
+    return state;
+}
+
+std::string tree_guard_label(const PanoramaNode& node)
+{
+    std::string label = node.tag.empty() ? "<?>" : node.tag;
+    if (!node.id.empty())
+    {
+        label += "#" + node.id;
+    }
+    return label;
+}
+
+void tree_guard_record_destroyed(const PanoramaNode& node)
+{
+    TreeGuardState& state = tree_guard_state();
+    TreeGuardDestroyedRecord record;
+    record.ptr = &node;
+    record.label = tree_guard_label(node);
+    record.parent = node.parent != nullptr ? tree_guard_label(*node.parent) : "(no parent)";
+    record.context = state.mutation_context;
+    record.seq = ++state.destroy_seq;
+    if (state.ring.size() < TreeGuardState::kRingCapacity)
+    {
+        state.ring.push_back(std::move(record));
+    }
+    else
+    {
+        state.ring[state.ring_next] = std::move(record);
+        state.ring_next = (state.ring_next + 1) % TreeGuardState::kRingCapacity;
+    }
+}
+
+const TreeGuardDestroyedRecord* tree_guard_find_destroyed(const void* ptr)
+{
+    // Newest match wins: an address can be freed and reused several times.
+    const TreeGuardState& state = tree_guard_state();
+    const TreeGuardDestroyedRecord* best = nullptr;
+    for (const TreeGuardDestroyedRecord& record : state.ring)
+    {
+        if (record.ptr == ptr && (best == nullptr || record.seq > best->seq))
+        {
+            best = &record;
+        }
+    }
+    return best;
+}
+
 using panorama_strings::is_space;
 using panorama_strings::starts_with;
 using panorama_strings::to_lower;
@@ -632,15 +703,85 @@ void PanoramaScopedNodeWatch::on_panorama_node_destroyed(PanoramaNode& node)
     std::replace(nodes_.begin(), nodes_.end(), &node, static_cast<PanoramaNode*>(nullptr));
 }
 
+bool panorama_debug_tree_guard_enabled()
+{
+    static const bool enabled = []() {
+        const char* value = std::getenv("OPENSTRIKE_PANORAMA_TREEGUARD");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+void panorama_debug_set_mutation_context(std::string context)
+{
+    if (panorama_debug_tree_guard_enabled())
+    {
+        tree_guard_state().mutation_context = std::move(context);
+    }
+}
+
+const PanoramaNode* panorama_debug_scan_dead_links(const PanoramaNode& root, std::string& report)
+{
+    for (std::size_t i = 0; i < root.children.size(); ++i)
+    {
+        const PanoramaNode* child = root.children[i].get();
+        const char* defect = nullptr;
+        if (child == nullptr)
+        {
+            defect = "null child pointer";
+        }
+        else if (child->debug_liveness != PanoramaNode::kLivenessAlive)
+        {
+            defect = "child canary not alive (freed while linked)";
+        }
+        else if (child->parent != &root)
+        {
+            defect = "child parent backlink mismatch (replaced/reused while linked)";
+        }
+        if (defect != nullptr)
+        {
+            std::ostringstream out;
+            out << defect << ": parent " << tree_guard_label(root) << " (" << static_cast<const void*>(&root)
+                << ") child[" << i << "] = " << static_cast<const void*>(child);
+            if (child != nullptr)
+            {
+                out << " liveness=0x" << std::hex << child->debug_liveness << std::dec;
+            }
+            if (const TreeGuardDestroyedRecord* record = tree_guard_find_destroyed(child))
+            {
+                out << " | destroyed as " << record->label << " (parent " << record->parent << ") seq="
+                    << record->seq << " during context [" << record->context << "]";
+            }
+            else
+            {
+                out << " | no destruction record for this address (overwritten, or ring evicted)";
+            }
+            out << " | current context [" << tree_guard_state().mutation_context << "]";
+            report = out.str();
+            return child != nullptr ? child : &root;
+        }
+        if (const PanoramaNode* dead = panorama_debug_scan_dead_links(*child, report))
+        {
+            return dead;
+        }
+    }
+    return nullptr;
+}
+
 PanoramaNode::~PanoramaNode()
 {
     // Notify before members are destroyed: observers see a node whose identity
     // (and children) are still intact. Children notify afterwards, when their
     // own destructors run via the `children` vector.
+    if (panorama_debug_tree_guard_enabled())
+    {
+        tree_guard_record_destroyed(*this);
+    }
     for (PanoramaNodeLifetimeObserver* observer : node_lifetime_observers())
     {
         observer->on_panorama_node_destroyed(*this);
     }
+    debug_liveness = kLivenessDead;
 }
 
 bool PanoramaNode::has_class(std::string_view klass) const
@@ -1039,6 +1180,77 @@ void ensure_panorama_settings_slider_internals(PanoramaNode& node)
     }
 }
 
+bool panorama_node_is_settings_keybinder(const PanoramaNode& node)
+{
+    return node.tag_lower == "csgosettingskeybinder";
+}
+
+void ensure_panorama_settings_keybinder_internals(PanoramaNode& node)
+{
+    if (!panorama_node_is_settings_keybinder(node))
+    {
+        return;
+    }
+
+    // Build once. The tab pages author these rows childless
+    // (`<CSGOSettingsKeyBinder text=.. id=.. bind=../>`), so the whole DOM is
+    // materialized here, mirroring ensure_panorama_settings_slider_internals.
+    if (node.attributes.count("__kbinit") != 0)
+    {
+        return;
+    }
+    node.attributes["__kbinit"] = "1";
+
+    // settings_keybinder.css ships inside Valve's native control template and is
+    // NOT included by the settings tab pages, so the layout rules that file
+    // provides (BindingRow / BindingRowLabel / #LabelFXContainer /
+    // BindingRowButton / ClearKeybinding) are baked as inline styles below.
+    node.inline_style += "flow-children: right; width: 100%; height: 48px; vertical-align: middle;";
+
+    // The clickable leaves carry a row-unique id (the host resolves a polled click
+    // by climbing from the hit leaf to its CSGOSettingsKeyBinder ancestor, so the
+    // exact id only needs to be unique + suffix-tagged bind/clear).
+    const std::string base = node.id.empty() ? std::string("keybind") : node.id;
+
+    // #title — the row's `text=` token; the host localize pass resolves it. The
+    // control itself is excluded from panorama_node_paints_own_text so the token
+    // is not painted twice.
+    PanoramaNode& title = append_child_node(node, "Label", "label", nullptr);
+    title.inline_style =
+        "width: fill-parent-flow(0.8); font-size: 18px; horizontal-align: left; vertical-align: middle;";
+    title.text = node.text;
+
+    // #LabelFXContainer holds the value button + the clear button, right-aligned.
+    PanoramaNode& fx = append_child_node(node, "Panel", "panel", nullptr);
+    fx.inline_style =
+        "width: fill-parent-flow(0.3); height: 32px; horizontal-align: right; "
+        "vertical-align: middle; flow-children: right;";
+
+    PanoramaNode& label_container = append_child_node(fx, "Panel", "panel", nullptr);
+    label_container.inline_style =
+        "width: fill-parent-flow(1.0); height: 100%; horizontal-align: right; "
+        "vertical-align: middle; flow-children: right;";
+
+    // The value label (BindingRowButton) shows the currently bound key; clicking it
+    // starts capture. The host fills its text from the key bindings each frame.
+    const std::string value_id = base + "__bind";
+    PanoramaNode& value = append_child_node(label_container, "Label", "label", value_id.c_str());
+    value.inline_style =
+        "width: 100%; color: #8d9698; horizontal-align: right; text-align: center; "
+        "font-size: 18px; vertical-align: middle;";
+
+    // The clear button (ClearKeybinding): collapsed until the host sees a binding.
+    const std::string clear_id = base + "__clear";
+    PanoramaNode& clear = append_child_node(fx, "Label", "label", clear_id.c_str());
+    clear.inline_style =
+        "width: 24px; height: 24px; horizontal-align: right; vertical-align: middle; "
+        "text-align: center; font-size: 18px; color: #8d9698;";
+    clear.text = "\xE2\x9C\x95"; // U+2715 MULTIPLICATION X
+    clear.visibility_override = 0;
+
+    node.mark_style_dirty();
+}
+
 float panorama_slider_fraction(const PanoramaNode& node)
 {
     const float min = read_float_attr(node, "min", 0.0F);
@@ -1074,7 +1286,7 @@ bool panorama_node_paints_own_text(const PanoramaNode& node)
     // label (see above); the settings slider moves its `text=` into a #Title
     // child. Painting/measuring node.text on the control itself would double it.
     return node.tag_lower != "togglebutton" && node.tag_lower != "radiobutton"
-        && node.tag_lower != "csgosettingsslider";
+        && node.tag_lower != "csgosettingsslider" && node.tag_lower != "csgosettingskeybinder";
 }
 
 // ---- overflow:scroll ---------------------------------------------------------

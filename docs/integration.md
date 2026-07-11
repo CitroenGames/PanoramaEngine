@@ -1,233 +1,163 @@
 # Integration Guide
 
-This guide describes the host responsibilities around PanoramaEngine. The
-library owns Panorama parsing, styling, layout, scripting, input semantics, and
-paint-list generation; the host supplies the platform and game-specific pieces.
+This expands the README's [Minimal Host Loop](../README.md#minimal-host-loop)
+into the responsibilities a production host actually has, in the order they
+show up in a real per-frame loop.
 
-## Host Responsibilities
+## 1. Resources
 
-| Responsibility | API |
-| --- | --- |
-| Layout, CSS, JS, image bytes | `PanoramaResourceProvider` implementations |
-| Accurate text metrics | `PanoramaTextMeasure` passed to `layout_panorama_tree` |
-| Glyph atlas and glyph placement | `PanoramaGlyphSource` passed to `build_panorama_draw_list` |
-| Rendering triangles, textures, scissors, blend modes, blur | Consume `PanoramaDrawList` or implement `PanoramaRenderBackend` |
-| Native logging | `set_panorama_log_sink` |
-| JS-to-engine actions | `PanoramaRuntime::set_host_action_handler` |
-| Runtime sublayout/snippet loading | `PanoramaRuntime::set_layout_loaders` |
+Wrap whatever your engine uses for asset storage in a `PanoramaResourceProvider`
+and register it on a `PanoramaResourceManager` (owned by a
+`PanoramaDocumentSession`, or standalone). Three providers ship out of the box:
 
-All pointer input is passed in design-space coordinates. If the host renders
-the UI scaled to a framebuffer, convert OS mouse coordinates back to the same
-design space used for `layout_panorama_tree`.
+- `PanoramaMemoryResourceProvider` — in-memory `path -> bytes` map. Useful for
+  tests, for HUD overlays a host authors as C++ string literals instead of
+  loading from disk, or as a virtual-path override layer.
+- `PanoramaDirectoryResourceProvider` — reads from a real directory.
+- `PanoramaPackageResourceProvider` — reads from a parsed `.pbin` package.
 
-## Resource Setup
+Providers are checked in priority order (`add_provider(provider, priority,
+identifier)`), so a host can, for example, register an in-memory override
+layer at high priority in front of the real package. Only `read()` is
+required; `resolve_file()` (default: unsupported) lets a provider expose a
+real filesystem path when a consumer needs one (e.g. handing a path to a
+system font loader).
 
-`PanoramaDocumentSession` owns a `PanoramaResourceManager`. Add one or more
-providers before loading a document:
+## 2. Loading a document
 
-```cpp
-PanoramaDocumentSession session;
-session.resources().add_provider(
-    std::make_unique<PanoramaDirectoryResourceProvider>(resource_root),
-    0,
-    "loose-files");
-```
+`PanoramaDocumentSession::load()` (or `load_into()` for a sublayout) parses
+the XML, recursively resolves `<styles>` includes and `<Frame src>` children
+into one styled tree, and computes the initial cascade. It also tracks
+per-layout-file cascade scoping (a sublayout's own `<style>`/`<styles>` only
+style the subtree it created — real Panorama scoping, needed so a HUD
+module's stylesheet cannot restyle a sibling module) and collects `<snippet>`
+definitions for later instantiation.
 
-Available providers:
+## 3. Scripting (optional)
 
-| Provider | Use |
-| --- | --- |
-| `PanoramaMemoryResourceProvider` | Tests, generated documents, examples |
-| `PanoramaDirectoryResourceProvider` | Loose files under a resource root |
-| `PanoramaPackageResourceProvider` | `.pbin` package contents |
+If the document has `<scripts>`, boot a `PanoramaRuntime` against the loaded
+root (`initialize` / `initialize_with_script_contexts`, the latter needed when
+sublayouts each need their own `$.GetContextPanel()`). Before calling
+`initialize`, wire the hooks a real host needs:
 
-Providers are priority ordered. Use identifiers when you need to remove or
-replace a provider at runtime.
+- `set_host_action_handler` — routes JS-triggered engine actions (a real
+  Panorama script calling into `GameInterfaceAPI`/`LobbyAPI`-style stubs) back
+  into native code as `(action, arg)` pairs.
+- `set_layout_loaders` — backs `BLoadLayout`/`BLoadLayoutSnippet` so a script
+  can load a sublayout or instantiate a snippet at runtime.
+- `set_focus_request_handler` — lets `Panel.SetFocus()` move keyboard focus
+  through your `PanoramaInputController` (see below), since the runtime does
+  not own input.
 
-## Document Load
+A document with no scripts needs none of this — the DOM is still fully usable
+via direct `PanoramaNode` mutation (`mark_tree_dirty()` equivalent: just
+recompute the cascade after mutating).
 
-```cpp
-PanoramaDocumentSessionOptions options;
-options.resource_root = resource_root;
-options.localize_text = true;
+## 4. Per-frame loop
 
-if (!session.load("panorama/layout/mainmenu.xml", options))
-{
-    return false;
-}
+The shape below is the same one in the README, annotated with why each step
+exists and what marks the tree dirty for the next one. A production host
+tracks the dirty flags themselves (`style dirty`, `layout dirty`, `visual
+dirty`) rather than unconditionally recomputing every stage every frame —
+none of the engine's own state does this bookkeeping for you, because the
+right granularity is host-specific (how you detect "the pointer moved enough
+to matter", how you batch multiple mutations before recomputing, etc).
 
-PanoramaNode& root = *session.document().root;
-session.style_sheet().compute(root);
-panorama_apply_visibility_overrides(root);
-panorama_apply_control_presentation(root);
-panorama_capture_anim_targets(root);
-layout_panorama_tree(root, viewport_width, viewport_height, text_measure);
-```
+1. **Input.** `PanoramaInputController::update_pointer`/`update_wheel`
+   hit-test the *previous* frame's laid-out tree (one-frame latency, not
+   perceptible) and update hover/active/focus state, firing
+   `onmouseover`/`onmouseout`/`onactivate` and radio-group/dropdown/scrollbar
+   internals. A return of `true` means something changed — style-dirty the
+   tree.
+2. **Script pump.** `PanoramaRuntime::update(dt)` runs scheduled callbacks and
+   the JS microtask queue, then `consume_dirty()` reports whether a script
+   mutated the DOM since the last call — style-dirty the tree if so. Scripts
+   can mutate anything (classes, attributes, structure) without telling you
+   which nodes changed, so a script-dirty frame should recompute the whole
+   cascade, not just an invalidated subset.
+3. **Cascade.** `PanoramaStyleSheet::compute()` (full) — a partial
+   `compute_invalidated()` exists for hosts that track exactly which nodes
+   changed outside the cascade (see the CPUMT-35-style comments in
+   OpenStrike's own `PanoramaNativeView` for the invariant that makes it
+   safe: every touched-or-created node must have called
+   `PanoramaNode::mark_style_dirty()` itself, or the invalidated recompute
+   will silently miss it).
+4. **Animation advance.** `panorama_advance_anim` (transitions),
+   `panorama_advance_keyframes` (needs `sheet.keyframes()`), and
+   `panorama_advance_scroll_animations` each return a
+   `PanoramaAnimationAdvanceResult` with `visual_changed`/`layout_changed`/
+   `active` flags. Dispatch `transition_ends` through
+   `PanoramaRuntime::dispatch_property_transition_end` — real Panorama menus
+   key panel teardown off this event (a faded-out tab sets `visible = false`
+   only once its fade transition completes). `active` staying true (an
+   infinite `@keyframes` animation, common for ambient menu glow/pulse
+   effects) means visual-dirty every frame indefinitely; this is expected,
+   not a bug, and it is exactly what makes `PanoramaGeometryCache::replay()`
+   (step 7) legitimately unreachable while such an animation is running.
+5. **Layout.** `layout_panorama_tree(root, width, height, text_measure)` only
+   needs to re-run when something layout-dirtied the tree (a style recompute,
+   a layout-affecting transition/keyframe/scroll, or a viewport resize).
+6. **Text + paint.** If using `PanoramaFontAtlas`, call
+   `ensure_tree_text(root)` then `upload_if_dirty()` before painting so glyph
+   metrics used by layout match what paint rasterizes. Then
+   `build_panorama_draw_list(out, root, glyphs, scratch)` — pass a
+   `PanoramaPaintScratch` you keep across frames so its command buffers are
+   reused rather than reallocated every animated frame.
+7. **Geometry submission.** This is the step most worth getting right, and
+   the one [`PanoramaGeometryCache`](../include/ui/panorama/panorama_geometry_cache.hpp)
+   exists to do for you:
 
-`load` parses XML, expands `<Frame>` references, gathers stylesheet sources,
-collects script includes, loads snippets, applies localization when enabled, and
-builds the stylesheet cascade.
+   ```cpp
+   if (!visual_dirty && geometry_cache.replay(backend)) {
+       return; // nothing changed: cheapest possible frame, no diffing at all
+   }
+   PanoramaDrawList list = build_panorama_draw_list(root, glyphs, &scratch);
+   geometry_cache.submit(list, backend, ui_scale);
+   visual_dirty = false;
+   ```
 
-## Runtime Setup
+   `submit()` diffs each command against the previous frame by content
+   signature + texture + blend mode + scissor rect (position-by-position, so
+   draw-list command order should be stable frame to frame for the same
+   subtree — it already is, since paint always walks the tree in the same
+   order): unchanged commands are reused without recompiling, changed ones
+   are recompiled, and geometry that fell out of the list is released.
+   `valid()` is only true once every command compiled or reused successfully;
+   a partial failure releases everything it built that frame rather than
+   leave a cache silently missing draw commands, so the next frame retries
+   from a clean slate.
 
-For simple documents that only have root-level scripts, this is enough:
+   `ui_scale` must be the same value passed to `layout_panorama_tree()` that
+   frame — geometry is compiled in framebuffer pixels (design pixels *
+   `ui_scale`), and the cache's content signature folds in `ui_scale` for
+   exactly this reason (so the same command re-scaled doesn't false-positive
+   as unchanged).
 
-```cpp
-PanoramaRuntime runtime;
-runtime.initialize(root, session.resources(), session.document().script_includes);
-```
+   Call `geometry_cache.release()` before destroying or swapping the active
+   `PanoramaRenderBackend` (also safe to call from a destructor — it checks
+   `panorama_render_backend()` internally and simply forgets the cache
+   without calling into a backend that may already be gone).
 
-For real Panorama assets, prefer the context-preserving path. It keeps each
-script's `$.GetContextPanel()` bound to the layout root that included it,
-including frame and sublayout scripts:
+## Renderer responsibilities recap
 
-```cpp
-std::vector<PanoramaRuntimeScriptInclude> scripts;
-scripts.reserve(session.script_refs().size());
-for (const PanoramaScriptInclude& script : session.script_refs())
-{
-    scripts.push_back({script.path, script.context});
-}
+Implement `PanoramaRenderBackend` (`panorama_render_backend.hpp`). Only
+texture create/release and geometry compile/render/release are pure virtual;
+scissor, blend mode, texture in-place update, and backdrop blur all have safe
+no-op defaults, so a minimal backend (or the software rasterizer in
+`examples/02_software_raster/`) only needs five methods to get pixels on
+screen. `PanoramaDrawList` colors are straight (non-premultiplied) RGBA —
+premultiply in the backend only if your blend state requires it.
 
-PanoramaRuntime runtime;
-runtime.initialize_with_script_contexts(root, session.resources(), scripts, resource_root);
-```
+## What stays host-specific
 
-Set host hooks before `initialize` if scripts may use them during startup:
-
-```cpp
-runtime.set_host_action_handler(
-    [&](const std::string& action, const std::string& arg)
-    {
-        if (action == "cmd")
-        {
-            run_console_command(arg);
-        }
-        else if (action == "play")
-        {
-            start_match_from_panorama(arg);
-        }
-    });
-```
-
-## Sublayout And Snippet Loading
-
-`BLoadLayout`, `LoadLayout`, `BLoadLayoutSnippet`, and `BCreateChildren` are
-host-wired through `set_layout_loaders`. A loader should mutate the DOM through
-the session and execute any newly collected scripts:
-
-```cpp
-runtime.set_layout_loaders(
-    [&](PanoramaNode& target, const std::string& source)
-    {
-        PanoramaDocumentLoadResult result = session.load_sublayout(target, source);
-        for (const PanoramaScriptInclude& script : result.scripts_added)
-        {
-            std::optional<std::string> text = session.resources().read_text(script.path);
-            if (!text)
-            {
-                continue;
-            }
-
-            PanoramaNode& context = script.context != nullptr ? *script.context : root;
-            runtime.run_source_in_context(*text, "panorama://" + script.path, context);
-        }
-    },
-    [&](PanoramaNode& target, const std::string& name)
-    {
-        session.instantiate_snippet(target, name);
-    },
-    [&](const std::string& name)
-    {
-        return session.has_snippet(name);
-    });
-```
-
-After a loader changes the DOM, the normal dirty path should recompute styles
-and relayout.
-
-## Per-Frame Loop
-
-The host typically runs these steps each frame:
-
-1. Feed pointer and wheel state to `PanoramaInputController`.
-2. Pump `PanoramaRuntime::update`.
-3. If input or scripts changed the DOM or pseudo-class state, recompute styles
-   and capture transition targets.
-4. Advance transitions, keyframes, and smooth scroll animations.
-5. Relayout if the viewport, style, transition, or scroll state changed layout.
-6. Build a `PanoramaDrawList`.
-7. Submit draw commands to the renderer.
-
-```cpp
-bool dirty = input.update_pointer(root, mouse_x, mouse_y, mouse_down, &runtime);
-dirty |= input.update_wheel(root, mouse_x, mouse_y, wheel_ticks_y, &runtime);
-
-runtime.update(dt_seconds);
-dirty |= runtime.consume_dirty();
-
-if (dirty)
-{
-    session.style_sheet().compute(root);
-    panorama_apply_visibility_overrides(root);
-    panorama_apply_control_presentation(root);
-    panorama_capture_anim_targets(root);
-}
-
-PanoramaAnimationAdvanceResult transitions = panorama_advance_anim(root, dt_seconds);
-for (const PanoramaTransitionEnd& end : transitions.transition_ends)
-{
-    if (end.node != nullptr && end.property != nullptr)
-    {
-        runtime.dispatch_property_transition_end(*end.node, end.property);
-    }
-}
-
-PanoramaAnimationAdvanceResult keyframes =
-    panorama_advance_keyframes(root, session.style_sheet().keyframes(), dt_seconds);
-PanoramaAnimationAdvanceResult scrolls = panorama_advance_scroll_animations(root, dt_seconds);
-
-if (dirty || transitions.layout_changed || keyframes.layout_changed || scrolls.layout_changed)
-{
-    layout_panorama_tree(root, viewport_width, viewport_height, text_measure);
-}
-
-PanoramaDrawList draw_list;
-build_panorama_draw_list(draw_list, root, glyph_source, &paint_scratch);
-```
-
-If you use `PanoramaStyleSheet::compute_invalidated` for performance, pair it
-with `panorama_capture_anim_targets_recomputed`. Use full `compute` for focus
-changes because `:focus-within` can change ancestor styles.
-
-## Rendering The Draw List
-
-`build_panorama_draw_list` emits painter-ordered `PanoramaDrawCommand` batches.
-Each command contains vertices, indices, texture id, blend mode, optional
-scissor rectangle, or a backdrop blur request.
-
-Renderer notes:
-
-- `texture == 0` means an untextured solid batch; bind a 1x1 white texture or
-  use a solid-color path.
-- Colors are straight RGBA. Premultiply only if your blend state requires it.
-- `PanoramaGlyphSource::atlas_texture` is passed through on text commands.
-- `PanoramaGlyphSource` and `PanoramaTextMeasure` should use the same font data.
-- Backdrop blur commands carry no geometry. Blur the already-rendered
-  framebuffer region inside the command rectangle.
-- Scissor coordinates are in design pixels; scale to framebuffer pixels when
-  rendering at a different resolution.
-
-## Node Lifetime
-
-`PanoramaNode` destruction notifies global `PanoramaNodeLifetimeObserver`s.
-`PanoramaRuntime`, `PanoramaInputController`, and `PanoramaDocumentSession`
-already observe node destruction and clear their own raw pointers.
-
-If a host caches `PanoramaNode*` across frames or across script calls, either:
-
-- Register a `PanoramaNodeLifetimeObserver`, or
-- Use `PanoramaScopedNodeWatch` for a temporary pointer.
-
-JS wrappers become inert when their backing node is destroyed; Panel methods
-become safe no-ops and `panel.IsValid()` returns `false`.
+PanoramaEngine deliberately does not include: a windowing/input backend (SDL,
+Win32, etc. — a host polls its own input and calls
+`PanoramaInputController`), a thread pool (cascade forking across worker
+threads, if you want it for large trees, is host-owned — see the `CPUMT-49`
+comments in OpenStrike's `PanoramaNativeView::compute_full_cascade_forked()`
+for a worked example of the split points `PanoramaStyleSheet` exposes for
+exactly this), a virtual filesystem/VPK reader, or any specific texture
+decode format beyond what a `PanoramaResourceProvider` + your
+`PanoramaRenderBackend::generate_texture` choose to support. These are
+intentionally left to the host because they are exactly the pieces that
+differ most between engines.

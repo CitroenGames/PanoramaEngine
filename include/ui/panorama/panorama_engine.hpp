@@ -1,9 +1,9 @@
 #pragma once
 
 #include "ui/panorama/panorama_anim.hpp"
-#include "ui/panorama/panorama_converter.hpp"
 #include "ui/panorama/panorama_document_session.hpp"
 #include "ui/panorama/panorama_dom.hpp"
+#include "ui/panorama/panorama_font_atlas.hpp"
 #include "ui/panorama/panorama_input.hpp"
 #include "ui/panorama/panorama_layout.hpp"
 #include "ui/panorama/panorama_localization.hpp"

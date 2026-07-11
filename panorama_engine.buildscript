@@ -1,9 +1,18 @@
 # PanoramaEngine: self-contained CS:GO Panorama UI engine.
-# QuickJS is vendored as a private dependency under this library's own Thirdparty/.
-# The library is standalone: no engine or RmlUi dependency. Panorama XML is
-# parsed by the library's own panorama_xml SAX parser; the converter emits RML
-# markup as plain text for the host's transitional RmlUi render path.
+# QuickJS and FreeType are vendored under this library's own Thirdparty/.
+# The library is standalone: no engine dependency. Panorama XML is parsed by the
+# library's own panorama_xml SAX parser.
+#
+# Build outputs (outdir/intdir below) are all relative to THIS file's own
+# directory and land under PanoramaEngine/bin and PanoramaEngine/build, never
+# escaping this folder. Keep it that way: it's what lets this whole directory
+# be dropped into another engine's tree at any nesting depth without the build
+# reaching outside itself. A host project only needs to add PanoramaEngine as a
+# `target_link_libraries` dependency (or point its own linker at
+# PanoramaEngine/bin/<platform>/<config>) — it never needs to know how deep
+# PanoramaEngine sits in the host tree.
 include = Thirdparty/quickjs-0.15.0/quickjs.buildscript
+include = Thirdparty/freetype/freetype.buildscript
 
 [project:PanoramaEngine]
 type = lib
@@ -19,7 +28,7 @@ warning_level = Level3
 multiprocessor = true
 exceptions = true
 rtti = true
-target_link_libraries(PUBLIC QuickJS)
+target_link_libraries(PUBLIC QuickJS freetype)
 if(Windows)
 {
     defines = NOMINMAX, WIN32_LEAN_AND_MEAN
@@ -30,45 +39,45 @@ runtime_library = MultiThreadedDebug
 optimization = Disabled
 debug_info = ProgramDatabase
 generate_debug_info = true
-outdir = ../../../bin/x64/Debug
-intdir = ../../../build/obj/x64/Debug/PanoramaEngine
+outdir = bin/x64/Debug
+intdir = build/obj/x64/Debug/PanoramaEngine
 
 [config:Debug|macOS]
 runtime_library = MultiThreadedDebug
 optimization = Disabled
 debug_info = ProgramDatabase
 generate_debug_info = true
-outdir = ../../../bin/posix/Debug
-intdir = ../../../build/obj/posix/Debug/PanoramaEngine
+outdir = bin/posix/Debug
+intdir = build/obj/posix/Debug/PanoramaEngine
 
 [config:Debug|Linux]
 runtime_library = MultiThreadedDebug
 optimization = Disabled
 debug_info = ProgramDatabase
 generate_debug_info = true
-outdir = ../../../bin/posix/Debug
-intdir = ../../../build/obj/posix/Debug/PanoramaEngine
+outdir = bin/posix/Debug
+intdir = build/obj/posix/Debug/PanoramaEngine
 
 [config:Release|x64]
 runtime_library = MultiThreaded
 optimization = MaxSpeed
 debug_info = ProgramDatabase
 generate_debug_info = true
-outdir = ../../../bin/x64/Release
-intdir = ../../../build/obj/x64/Release/PanoramaEngine
+outdir = bin/x64/Release
+intdir = build/obj/x64/Release/PanoramaEngine
 
 [config:Release|macOS]
 runtime_library = MultiThreaded
 optimization = MaxSpeed
 debug_info = ProgramDatabase
 generate_debug_info = true
-outdir = ../../../bin/posix/Release
-intdir = ../../../build/obj/posix/Release/PanoramaEngine
+outdir = bin/posix/Release
+intdir = build/obj/posix/Release/PanoramaEngine
 
 [config:Release|Linux]
 runtime_library = MultiThreaded
 optimization = MaxSpeed
 debug_info = ProgramDatabase
 generate_debug_info = true
-outdir = ../../../bin/posix/Release
-intdir = ../../../build/obj/posix/Release/PanoramaEngine
+outdir = bin/posix/Release
+intdir = build/obj/posix/Release/PanoramaEngine
