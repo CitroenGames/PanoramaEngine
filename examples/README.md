@@ -126,13 +126,17 @@ $ ./PanoramaExampleWindowRaster [layout.xml]
 Resizing the window re-runs layout and re-rasterizes at the new size.
 Press Escape or close the window to exit.
 
-Text needs an actual font file, which this engine intentionally does not
-vendor (see [../docs/architecture.md](../docs/architecture.md#extension-points)'s
-"Text" extension point) — drop any `.ttf`/`.otf` under
-`sample/resource/ui/fonts/` (mirrors CS:GO's own content layout, the same
-path `PanoramaFontAtlas` already looks for on a real Panorama install)
-and it renders real glyphs; without one it logs a warning and text is
-skipped, same as example 02.
+Text needs an actual font file on disk, which the engine itself
+intentionally does not vendor (see
+[../docs/architecture.md](../docs/architecture.md#extension-points)'s "Text"
+extension point) — but this example bundles
+[Lato](https://fonts.google.com/specimen/Lato) (SIL Open Font License, see
+`sample/resource/ui/fonts/OFL.txt`) under `sample/resource/ui/fonts/`
+(mirrors CS:GO's own content layout, the same path `PanoramaFontAtlas`
+already looks for on a real Panorama install), so it renders real glyphs out
+of the box. Point it at a `layout.xml` elsewhere with no font under that
+same relative path and it logs a warning and skips text instead, same as
+example 02.
 
 ### POSIX build note
 

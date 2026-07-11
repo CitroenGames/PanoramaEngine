@@ -253,12 +253,15 @@ public:
             return false;
         }
 
-        // Text rendering needs an actual font file on disk, which this
-        // engine intentionally does not vendor (see docs/architecture.md's
-        // "Text" extension point) -- drop a .ttf/.otf under
+        // Text rendering needs an actual font file on disk; the engine
+        // itself intentionally does not vendor one (see docs/architecture.md's
+        // "Text" extension point), but this example bundles Lato (SIL OFL,
+        // see sample/resource/ui/fonts/OFL.txt) under
         // `<resource_root>/resource/ui/fonts/` (matching CS:GO's own content
-        // layout) to render real glyphs. Without one, load() logs a warning
-        // and glyph_source()/text_measure() below degrade to the same
+        // layout) so it renders real glyphs out of the box. Point --
+        // load() at a resource_root without a font under that path (e.g. a
+        // custom layout.xml elsewhere) and it logs a warning instead;
+        // glyph_source()/text_measure() below then degrade to the same
         // "panels paint, text is skipped" behaviour as
         // examples/02_software_raster.
         openstrike::set_panorama_render_backend(&textures_);
