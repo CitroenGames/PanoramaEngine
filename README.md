@@ -70,6 +70,7 @@ library and these standalone programs:
 | `PanoramaExampleHelloLayout` | In-memory resources, document load, cascade, layout, and box-tree inspection |
 | `PanoramaExampleSoftwareRaster` | Building a `PanoramaDrawList` and replaying it through a tiny CPU rasterizer |
 | `PanoramaExampleScriptedUi` | QuickJS runtime, input dispatch, DOM mutation, dirty handling, and relayout |
+| `PanoramaExampleWindowRaster` | The CPU rasterizer from above, blitted into a real Win32/X11 window from an XML file on disk |
 
 More build details are in [docs/building.md](docs/building.md).
 

@@ -194,3 +194,87 @@ debug_info = ProgramDatabase
 generate_debug_info = true
 outdir = ../bin/posix/Release
 intdir = ../build/obj/posix/Release/PanoramaExampleScriptedUi
+
+# One example, two native windowing backends: win32_main.cpp (GDI) on
+# Windows, posix_main.cpp (Xlib) on Linux/macOS. Both share raster_view.hpp
+# for document loading, layout, and CPU rasterization -- see
+# 04_window_raster/ and examples/README.md.
+[project:PanoramaExampleWindowRaster]
+type = exe
+std = 20
+sources = {
+    04_window_raster/win32_main.cpp [windows]
+    04_window_raster/posix_main.cpp [posix]
+}
+headers = 04_window_raster/raster_view.hpp
+includes = ../include
+warning_level = Level4
+multiprocessor = true
+exceptions = true
+rtti = true
+subsystem = Console
+target_link_libraries(PRIVATE PanoramaEngine)
+if(Windows)
+{
+    defines = NOMINMAX, WIN32_LEAN_AND_MEAN, UNICODE, _UNICODE
+    libs = user32.lib, gdi32.lib
+}
+if(Linux)
+{
+    libs = X11
+}
+if(macOS)
+{
+    # Xlib/XQuartz, not native Cocoa -- see examples/README.md.
+    libs = X11
+    includes = ../include, /opt/X11/include
+    libdirs = /opt/X11/lib
+}
+
+[config:Debug|x64]
+runtime_library = MultiThreadedDebug
+optimization = Disabled
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../bin/x64/Debug
+intdir = ../build/obj/x64/Debug/PanoramaExampleWindowRaster
+
+[config:Debug|macOS]
+runtime_library = MultiThreadedDebug
+optimization = Disabled
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../bin/posix/Debug
+intdir = ../build/obj/posix/Debug/PanoramaExampleWindowRaster
+
+[config:Debug|Linux]
+runtime_library = MultiThreadedDebug
+optimization = Disabled
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../bin/posix/Debug
+intdir = ../build/obj/posix/Debug/PanoramaExampleWindowRaster
+
+[config:Release|x64]
+runtime_library = MultiThreaded
+optimization = MaxSpeed
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../bin/x64/Release
+intdir = ../build/obj/x64/Release/PanoramaExampleWindowRaster
+
+[config:Release|macOS]
+runtime_library = MultiThreaded
+optimization = MaxSpeed
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../bin/posix/Release
+intdir = ../build/obj/posix/Release/PanoramaExampleWindowRaster
+
+[config:Release|Linux]
+runtime_library = MultiThreaded
+optimization = MaxSpeed
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../bin/posix/Release
+intdir = ../build/obj/posix/Release/PanoramaExampleWindowRaster

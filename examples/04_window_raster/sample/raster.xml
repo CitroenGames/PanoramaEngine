@@ -1,0 +1,24 @@
+<root>
+    <styles>
+        <include src="file://{resources}/styles/raster.css" />
+    </styles>
+    <Panel id="Screen" class="screen">
+        <Panel id="NavBar" class="nav">
+            <Label id="Brand" class="brand" text="PANORAMA ENGINE" />
+            <Panel class="nav-button selected" />
+            <Panel class="nav-button" />
+            <Panel class="nav-button" />
+        </Panel>
+        <Panel id="Body" class="body">
+            <Panel id="Sidebar" class="sidebar">
+                <Panel class="tile" />
+                <Panel class="tile" />
+                <Panel class="tile accent" />
+            </Panel>
+            <Panel id="Card" class="card">
+                <Label class="card-title" text="CPU Rasterized" />
+                <Label class="card-text" text="This frame was loaded from raster.xml and rasterized entirely on the CPU, then blitted into a native window -- no GPU, no game engine." />
+            </Panel>
+        </Panel>
+    </Panel>
+</root>

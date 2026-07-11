@@ -1,12 +1,14 @@
 # Examples
 
-Three standalone console programs, each a single `main.cpp` with no window,
-GPU, or game-filesystem dependency. They link only `PanoramaEngine` and its
-vendored `Thirdparty/` dependencies, and are the fastest way to confirm a
-fresh checkout (or a port to a new build system) actually compiles and runs.
-See [../docs/building.md](../docs/building.md) for build-system-agnostic
-requirements and [../docs/integration.md](../docs/integration.md) for what a
-production host does beyond what these examples show.
+Four standalone example programs. The first three are console-only (a single
+`main.cpp` with no window, GPU, or game-filesystem dependency), the fastest
+way to confirm a fresh checkout (or a port to a new build system) actually
+compiles and runs. The fourth puts the same CPU rasterizer behind a real
+native window. All of them link only `PanoramaEngine` and its vendored
+`Thirdparty/` dependencies. See [../docs/building.md](../docs/building.md)
+for build-system-agnostic requirements and
+[../docs/integration.md](../docs/integration.md) for what a production host
+does beyond what these examples show.
 
 ## Building and running
 
@@ -97,3 +99,45 @@ after click 2:
 `[panorama] ...` lines come from the engine's own logger
 (`panorama_log.hpp`) and from `$.Msg` inside `app.js` — a host redirects both
 by installing its own log sink instead of the default stderr one.
+
+## 04_window_raster
+
+The same load/cascade/layout/paint pipeline as 02, but blitted into a real
+native window instead of a `.bmp`: `raster_view.hpp` holds the shared
+document-loading, layout, and CPU-rasterization code (including a minimal
+`PanoramaRenderBackend` that stores textures as plain CPU buffers, so glyph
+atlas quads from `PanoramaFontAtlas` rasterize too, not just untextured
+panels); `win32_main.cpp` blits the resulting framebuffer with GDI's
+`StretchDIBits`, `posix_main.cpp` does the same over Xlib with `XPutImage`.
+Only one of the two compiles into the binary per platform (Windows gets
+`win32_main.cpp`, Linux/macOS get `posix_main.cpp`), matching the "host
+brings its own windowing" split described in
+[../docs/integration.md](../docs/integration.md#what-stays-host-specific).
+
+Unlike 01-03, this example loads its layout from a real file on disk via
+`PanoramaDirectoryResourceProvider` instead of an in-memory string — pass a
+path as the first argument, or run with none to load the bundled
+`sample/raster.xml`:
+
+```
+$ ./PanoramaExampleWindowRaster [layout.xml]
+```
+
+Resizing the window re-runs layout and re-rasterizes at the new size.
+Press Escape or close the window to exit.
+
+Text needs an actual font file, which this engine intentionally does not
+vendor (see [../docs/architecture.md](../docs/architecture.md#extension-points)'s
+"Text" extension point) — drop any `.ttf`/`.otf` under
+`sample/resource/ui/fonts/` (mirrors CS:GO's own content layout, the same
+path `PanoramaFontAtlas` already looks for on a real Panorama install)
+and it renders real glyphs; without one it logs a warning and text is
+skipped, same as example 02.
+
+### POSIX build note
+
+`posix_main.cpp` targets Xlib specifically (not a native Cocoa backend), so
+it links against `X11` on Linux out of the box. On macOS it needs
+[XQuartz](https://www.xquartz.org/) installed — `examples.buildscript`
+already points the macOS config at XQuartz's standard install location
+(`/opt/X11`).

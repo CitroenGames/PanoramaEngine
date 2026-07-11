@@ -1,0 +1,96 @@
+.screen
+{
+    flow-children: down;
+    width: 100%;
+    height: 100%;
+    background-color: #181b20ff;
+}
+
+.nav
+{
+    flow-children: right;
+    width: 100%;
+    height: 72px;
+    padding: 12px;
+    background-color: #101216ff;
+}
+
+.nav-button
+{
+    width: 120px;
+    height: fill-parent-flow( 1.0 );
+    margin-right: 10px;
+    background-color: #262b33ff;
+    border-radius: 6px;
+}
+
+.nav-button.selected
+{
+    background-color: #4a90d9ff;
+}
+
+.brand
+{
+    color: #eef2f7ff;
+    font-size: 20px;
+    font-weight: 700;
+    margin-right: 28px;
+}
+
+.body
+{
+    flow-children: right;
+    width: 100%;
+    height: fill-parent-flow( 1.0 );
+    padding: 16px;
+}
+
+.sidebar
+{
+    flow-children: down;
+    width: 220px;
+    height: 100%;
+    margin-right: 16px;
+}
+
+.tile
+{
+    width: 100%;
+    height: 90px;
+    margin-bottom: 12px;
+    background-color: #20242bff;
+    border: 1px solid #303743ff;
+    border-radius: 8px;
+}
+
+.tile.accent
+{
+    background-color: #2f7a4dff;
+}
+
+.card
+{
+    flow-children: down;
+    width: fill-parent-flow( 1.0 );
+    height: 100%;
+    padding: 24px;
+    background-color: #1d2027ff;
+    border: 1px solid #343c49ff;
+    border-radius: 12px;
+    box-shadow: #00000066 4px 4px 12px 0px;
+}
+
+.card-title
+{
+    color: #eef2f7ff;
+    font-size: 22px;
+    font-weight: 700;
+    margin-bottom: 10px;
+}
+
+.card-text
+{
+    color: #aab2c0ff;
+    font-size: 15px;
+    width: 100%;
+}

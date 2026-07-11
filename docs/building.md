@@ -14,8 +14,9 @@ buildscripts itself, so building this one file is enough to produce:
 - `PanoramaEngine` (the library)
 - `QuickJS` and `freetype` (vendored dependencies)
 - `PanoramaExampleHelloLayout`, `PanoramaExampleSoftwareRaster`,
-  `PanoramaExampleScriptedUi` (the `examples/` programs, pulled in
-  transitively because `panorama_engine.buildscript` is itself included from
+  `PanoramaExampleScriptedUi`, `PanoramaExampleWindowRaster` (the
+  `examples/` programs, pulled in transitively because
+  `panorama_engine.buildscript` is itself included from
   `examples/examples.buildscript`)
 
 All build output (`outdir`/`intdir` in every buildscript under this
@@ -66,17 +67,23 @@ target_link_libraries(PanoramaEngine PUBLIC QuickJS freetype)
 
 ## Examples
 
-The three programs under `examples/` are plain console apps with no window,
-GPU, or game filesystem dependency — each is a single `main.cpp` linking only
-`PanoramaEngine` and its vendored dependencies. They are the fastest way to
-confirm a fresh checkout (or a port to a new build system) actually compiles
-and runs before wiring up a real host renderer:
+The first three programs under `examples/` are plain console apps with no
+window, GPU, or game filesystem dependency — each is a single `main.cpp`
+linking only `PanoramaEngine` and its vendored dependencies. They are the
+fastest way to confirm a fresh checkout (or a port to a new build system)
+actually compiles and runs before wiring up a real host renderer. The fourth,
+`PanoramaExampleWindowRaster`, is the odd one out: it opens a real Win32 or
+X11 window (`win32_main.cpp` / `posix_main.cpp`, platform-conditional in
+`examples.buildscript`, so only one compiles per platform) to demonstrate
+what a minimal host-owned windowing layer around the same CPU rasterizer
+looks like — see [../examples/README.md](../examples/README.md#04_window_raster).
 
 | Example | What it exercises |
 | --- | --- |
 | `PanoramaExampleHelloLayout` | In-memory resource provider, document load, cascade, layout, box-tree dump |
 | `PanoramaExampleSoftwareRaster` | Building a `PanoramaDrawList` and replaying it through a tiny CPU rasterizer to a `.bmp` |
 | `PanoramaExampleScriptedUi` | QuickJS runtime + `PanoramaInputController` synthetic clicks mutating the DOM |
+| `PanoramaExampleWindowRaster` | Same CPU rasterizer as above, live in a Win32/X11 window, loading its layout from a real XML file on disk |
 
 ## Tests
 
