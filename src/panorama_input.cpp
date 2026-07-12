@@ -314,7 +314,7 @@ bool panorama_node_is_hittable(const PanoramaNode& node)
 
 PanoramaNode* panorama_hit_test_open_dropdown_popup(PanoramaNode& root, float x, float y)
 {
-    if (!root.computed.visible)
+    if (!root.computed.visible || !root.subtree_has_popup_layout)
     {
         return nullptr;
     }

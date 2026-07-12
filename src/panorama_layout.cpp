@@ -602,6 +602,7 @@ void position_open_dropdown_popup(PanoramaNode& node, const PanoramaTextMeasure&
         refresh_content_box(popup_box, cs);
 
         child.has_popup_layout = true;
+        child.subtree_has_popup_layout = true;
         child.popup_layout = popup_box;
         if (!participates_in_parent_flow(child, open_dropdown_header))
         {
@@ -614,6 +615,16 @@ void position_open_dropdown_popup(PanoramaNode& node, const PanoramaTextMeasure&
     }
 
     node.has_popup_layout = popup_height > 0.0F;
+    if (node.has_popup_layout)
+    {
+        // Popup hit-testing starts at the document root. Publish the aggregate
+        // while layout already has the ancestry at hand so the common closed-
+        // menu path needs no extra full-tree maintenance pass.
+        for (PanoramaNode* ancestor = &node; ancestor != nullptr; ancestor = ancestor->parent)
+        {
+            ancestor->subtree_has_popup_layout = true;
+        }
+    }
     node.popup_layout = {
         node.layout.x,
         node.layout.y + node.layout.height,
@@ -1458,6 +1469,7 @@ void resolve_node(PanoramaNode& node, const PanoramaTextMeasure& tm)
 void clear_popup_layouts(PanoramaNode& node)
 {
     node.has_popup_layout = false;
+    node.subtree_has_popup_layout = false;
     node.popup_layout = PanoramaLayoutBox{};
     for (const auto& child : node.children)
     {

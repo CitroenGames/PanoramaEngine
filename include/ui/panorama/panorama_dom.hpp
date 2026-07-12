@@ -289,6 +289,9 @@ struct PanoramaNode
     PanoramaLayoutBox layout;       // filled by the layout solver
     PanoramaLayoutBox popup_layout; // optional top-level popup geometry (dropdown menus)
     bool has_popup_layout = false;
+    // Layout-derived aggregate including this node. The input controller uses it
+    // to prune the popup-only hit-test without searching closed-menu subtrees.
+    bool subtree_has_popup_layout = false;
 
     // Host-populated texture for image-like nodes (e.g. a rasterized SVG icon).
     // When non-zero, the paint layer emits a textured quad over the content box.
