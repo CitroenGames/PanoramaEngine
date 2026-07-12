@@ -90,7 +90,11 @@ plain `std::function` field rather than a subclass hierarchy to walk:
 
 1. **Rendering** — implement `PanoramaRenderBackend` (5 required methods:
    texture create/release, geometry compile/render/release; everything else
-   has a safe no-op default).
+   has a safe no-op default). For Direct3D 12 and Vulkan hosts, `adapters/`
+   ships ready-made, opt-in implementations of this interface
+   (`panorama_d3d12_backend.hpp`, `panorama_vulkan_backend.hpp`) that are not
+   compiled into the library — the core stays graphics-API-free — but can be
+   `#include`d directly; see [../adapters/README.md](../adapters/README.md).
 2. **Resources** — implement `PanoramaResourceProvider` (one required `read()`
    method) or use the three shipped providers (`Memory`/`Package`/`Directory`)
    and layer them by priority in a `PanoramaResourceManager`.

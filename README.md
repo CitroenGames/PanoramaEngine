@@ -47,6 +47,7 @@ optional FreeType-backed font atlas is backed by the vendored
 | --- | --- |
 | `include/ui/panorama/` | Public headers and host-facing API |
 | `src/` | Engine implementation |
+| `adapters/` | Optional, opt-in `PanoramaRenderBackend` implementations for real GPU APIs (Direct3D 12, Vulkan) — not part of the library; a host includes one and links the SDK itself |
 | `examples/` | Three small standalone console examples |
 | `Thirdparty/quickjs-0.15.0/` | Vendored QuickJS dependency |
 | `Thirdparty/freetype/` | Vendored FreeType dependency used by `PanoramaFontAtlas` |
@@ -204,3 +205,8 @@ in [docs/integration.md](docs/integration.md).
   `PanoramaGlyphSource`, but both should come from the same font source.
 - The engine should not include host headers. Dependency direction is host to
   PanoramaEngine.
+- If you render through Direct3D 12 or Vulkan, `adapters/` ships ready-made
+  `PanoramaRenderBackend` implementations (`panorama_d3d12_backend.hpp`,
+  `panorama_vulkan_backend.hpp`) you can `#include` as a starting point instead
+  of writing the backend from scratch — see [adapters/README.md](adapters/README.md).
+  They are optional and opt-in: the library itself stays graphics-API-free.

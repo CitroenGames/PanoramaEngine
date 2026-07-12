@@ -14,6 +14,12 @@
 include = Thirdparty/quickjs-0.15.0/quickjs.buildscript
 include = Thirdparty/freetype/freetype.buildscript
 
+# NOTE: adapters/ (the optional Direct3D 12 / Vulkan PanoramaRenderBackend
+# implementations) is intentionally NOT part of this target. Those headers depend
+# on a graphics SDK; folding them in here would give the engine core a
+# graphics-API dependency, which is exactly what keeps it host-neutral. A host
+# that wants one #includes it directly and links the SDK itself — see
+# adapters/README.md.
 [project:PanoramaEngine]
 type = lib
 std = 20

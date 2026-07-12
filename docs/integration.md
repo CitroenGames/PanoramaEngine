@@ -151,6 +151,16 @@ no-op defaults, so a minimal backend (or the software rasterizer in
 screen. `PanoramaDrawList` colors are straight (non-premultiplied) RGBA —
 premultiply in the backend only if your blend state requires it.
 
+If you target Direct3D 12 or Vulkan, `adapters/` provides drop-in,
+header-only implementations of this interface
+(`panorama_d3d12_backend.hpp`, `panorama_vulkan_backend.hpp`) that already
+handle textures, per-blend-mode pipelines, scissor, and the geometry
+compile/render/release path. They are opt-in and SDK-linked (not part of the
+library, which stays graphics-API-free); a host injects its device/queue and
+hands the adapter the command list it records each frame. See
+[../adapters/README.md](../adapters/README.md) for the per-frame usage and
+limits (notably: backdrop blur is left unimplemented).
+
 ## What stays host-specific
 
 PanoramaEngine deliberately does not include: a windowing/input backend (SDL,
