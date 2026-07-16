@@ -6,6 +6,7 @@
 // the CPU. The rasterizer itself is the same ~60-line triangle fill used by
 // examples/02_software_raster, factored out here so both platform mains blit
 // the same framebuffer instead of each hand-rolling their own.
+#include "ui/panorama/panorama_anim.hpp"
 #include "ui/panorama/panorama_document_session.hpp"
 #include "ui/panorama/panorama_font_atlas.hpp"
 #include "ui/panorama/panorama_input.hpp"
@@ -13,6 +14,7 @@
 #include "ui/panorama/panorama_paint.hpp"
 #include "ui/panorama/panorama_render_backend.hpp"
 #include "ui/panorama/panorama_resource_provider.hpp"
+#include "ui/panorama/panorama_runtime.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -21,6 +23,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -280,6 +283,46 @@ public:
         return true;
     }
 
+    // Boots the Panorama JS runtime against the loaded tree. Call once after
+    // load() and the first layout_and_rasterize(). Returns false if the
+    // QuickJS interpreter could not be created.
+    [[nodiscard]] bool init_runtime()
+    {
+        if (runtime_initialized_)
+        {
+            return true;
+        }
+
+        panorama::PanoramaNode& root = *session_.document().root;
+        if (!runtime_.initialize(root, session_.resources(), session_.document().script_includes))
+        {
+            std::fprintf(stderr, "failed to initialize Panorama JS runtime\n");
+            return false;
+        }
+
+        // Script init-time execution may have mutated the DOM.
+        if (runtime_.consume_dirty())
+        {
+            session_.style_sheet().compute(root);
+            panorama_apply_visibility_overrides(root);
+            panorama_apply_control_presentation(root);
+        }
+        panorama_capture_anim_targets(root);
+
+        runtime_initialized_ = true;
+        return true;
+    }
+
+    // Tears down the JS runtime. Call before destroying RasterDocument.
+    void shutdown_runtime()
+    {
+        if (runtime_initialized_)
+        {
+            runtime_.shutdown();
+            runtime_initialized_ = false;
+        }
+    }
+
     // Re-runs layout at the given viewport size and rasterizes the resulting
     // draw list into framebuffer(). Cheap enough to call on every resize
     // event -- this is a CPU rasterizer over one static document, not an
@@ -301,6 +344,90 @@ public:
         rasterize_draw_list(framebuffer_, draw_list, textures_);
     }
 
+    // Per-frame update: feeds input, pumps the JS runtime, recomputes styles
+    // when dirty, advances animations, re-layouts, and re-rasterizes. Call
+    // once per frame with the current pointer/keyboard state.
+    void update_frame(
+        int width,
+        int height,
+        float mouse_x,
+        float mouse_y,
+        bool mouse_down,
+        float wheel_ticks_y,
+        const panorama::PanoramaKeyEvent* key_down_event,
+        std::string_view text_input)
+    {
+        width = std::max(width, 1);
+        height = std::max(height, 1);
+
+        panorama::PanoramaNode& root = *session_.document().root;
+        const float design_w = static_cast<float>(width);
+        const float design_h = static_cast<float>(height);
+        bool dirty = false;
+
+        // Input.
+        if (runtime_initialized_)
+        {
+            dirty |= input_.update_pointer(root, mouse_x, mouse_y, mouse_down, &runtime_);
+            if (wheel_ticks_y != 0.0F)
+            {
+                dirty |= input_.update_wheel(root, mouse_x, mouse_y, wheel_ticks_y, &runtime_);
+            }
+            if (key_down_event != nullptr)
+            {
+                dirty |= input_.handle_key_down(root, *key_down_event, &runtime_);
+            }
+            if (!text_input.empty())
+            {
+                dirty |= input_.handle_text_input(root, text_input, &runtime_);
+            }
+
+            // Script pump.
+            runtime_.update(1.0 / 60.0);
+            dirty |= runtime_.consume_dirty();
+        }
+
+        // Cascade.
+        if (dirty)
+        {
+            session_.style_sheet().compute(root);
+            panorama_apply_visibility_overrides(root);
+            panorama_apply_control_presentation(root);
+            panorama_capture_anim_targets(root);
+        }
+
+        // Animation advance.
+        auto transitions = panorama_advance_anim(root, 1.0f / 60.0f);
+        for (const auto& ended : transitions.transition_ends)
+        {
+            if (ended.node != nullptr && ended.property != nullptr)
+            {
+                runtime_.dispatch_property_transition_end(*ended.node, ended.property);
+            }
+        }
+        auto keyframes = panorama_advance_keyframes(
+            root, session_.style_sheet().keyframes(), 1.0f / 60.0f);
+        auto scrolls = panorama_advance_scroll_animations(root, 1.0f / 60.0f);
+
+        const bool layout_needed =
+            dirty || transitions.layout_changed || keyframes.layout_changed || scrolls.layout_changed;
+
+        // Layout.
+        if (layout_needed)
+        {
+            layout_panorama_tree(root, design_w, design_h, font_atlas_.text_measure());
+        }
+
+        // Text + paint + rasterize.
+        font_atlas_.ensure_tree_text(root);
+        font_atlas_.upload_if_dirty();
+        const panorama::PanoramaDrawList draw_list = build_panorama_draw_list(root, font_atlas_.glyph_source());
+
+        framebuffer_.resize(width, height);
+        framebuffer_.clear(24, 27, 32);
+        rasterize_draw_list(framebuffer_, draw_list, textures_);
+    }
+
     [[nodiscard]] const Framebuffer& framebuffer() const noexcept { return framebuffer_; }
 
 private:
@@ -308,5 +435,8 @@ private:
     panorama::PanoramaFontAtlas font_atlas_;
     CpuTextureStore textures_;
     Framebuffer framebuffer_;
+    panorama::PanoramaRuntime runtime_;
+    panorama::PanoramaInputController input_;
+    bool runtime_initialized_ = false;
 };
 }

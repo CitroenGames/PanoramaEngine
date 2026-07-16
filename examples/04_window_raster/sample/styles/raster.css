@@ -93,4 +93,112 @@
     color: #aab2c0ff;
     font-size: 15px;
     width: 100%;
+    margin-bottom: 16px;
+}
+
+/* --- Section labels --- */
+
+.section-label
+{
+    color: #7a8290ff;
+    font-size: 13px;
+    font-weight: 700;
+    text-transform: uppercase;
+    margin-top: 12px;
+    margin-bottom: 6px;
+}
+
+/* --- Status labels --- */
+
+.status-label
+{
+    color: #8b93a0ff;
+    font-size: 13px;
+    margin-top: 4px;
+    margin-bottom: 8px;
+}
+
+/* --- Button --- */
+
+.action-button
+{
+    width: 200px;
+    height: 40px;
+    background-color: #2a6cb6ff;
+    border-radius: 6px;
+}
+
+.action-button:hover
+{
+    background-color: #3a82d2ff;
+}
+
+.action-button:active
+{
+    background-color: #1e5a9eff;
+}
+
+.button-label
+{
+    color: #ffffffff;
+    font-size: 16px;
+    font-weight: 700;
+}
+
+/* --- TextEntry --- */
+
+.text-entry
+{
+    width: 280px;
+    height: 36px;
+    padding: 4px 10px;
+    background-color: #262b33ff;
+    border: 1px solid #3a4250ff;
+    border-radius: 4px;
+    color: #eef2f7ff;
+    font-size: 15px;
+}
+
+.text-entry:focus
+{
+    border: 1px solid #4a90d9ff;
+}
+
+#PlaceholderText
+{
+    color: #555d6aff;
+    font-size: 15px;
+}
+
+/* --- Slider --- */
+
+.horizontal-slider
+{
+    width: 280px;
+    height: 24px;
+}
+
+#SliderTrack
+{
+    width: 100%;
+    height: 8px;
+    margin-top: 8px;
+    background-color: #303743ff;
+    border-radius: 4px;
+}
+
+#SliderTrackProgress
+{
+    height: 100%;
+    background-color: #4a90d9ff;
+    border-radius: 4px;
+}
+
+#SliderThumb
+{
+    width: 16px;
+    height: 16px;
+    background-color: #eef2f7ff;
+    border-radius: 50%;
+    margin-top: -4px;
 }

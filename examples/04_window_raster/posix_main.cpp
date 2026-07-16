@@ -3,15 +3,19 @@
 // Loads a Panorama layout from an XML file on disk, lays it out, rasterizes
 // it on the CPU (raster_view.hpp, the same rasterizer as
 // examples/02_software_raster), and blits the result into an X11 window with
-// XPutImage. Re-lays-out and re-rasterizes on every resize. See
-// win32_main.cpp for the Windows equivalent -- both share raster_view.hpp
-// and differ only in how they open a window and get pixels on screen.
+// XPutImage. Feeds mouse, keyboard, and text input to the engine's
+// PanoramaInputController and boots the PanoramaRuntime (QuickJS) so buttons,
+// text entries, and sliders are fully interactive. See win32_main.cpp for the
+// Windows equivalent -- both share raster_view.hpp and differ only in how they
+// open a window, gather input, and get pixels on screen.
 #include "raster_view.hpp"
 
 #include <X11/Xlib.h>
+#include <X11/Xutil.h>
 #include <X11/keysym.h>
 
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <vector>
 
@@ -64,6 +68,53 @@ void pack_framebuffer(const panorama_example::Framebuffer& fb, const PixelPacker
         out[i] = packer.pack(fb.rgba[i * 4 + 0], fb.rgba[i * 4 + 1], fb.rgba[i * 4 + 2]);
     }
 }
+
+// Map X11 KeySyms to the engine's PanoramaKey enum.
+panorama::PanoramaKey keysym_to_panorama_key(KeySym keysym)
+{
+    switch (keysym)
+    {
+    case XK_Left:    return panorama::PanoramaKey::ArrowLeft;
+    case XK_Right:   return panorama::PanoramaKey::ArrowRight;
+    case XK_Up:      return panorama::PanoramaKey::ArrowUp;
+    case XK_Down:    return panorama::PanoramaKey::ArrowDown;
+    case XK_Home:    return panorama::PanoramaKey::Home;
+    case XK_End:     return panorama::PanoramaKey::End;
+    case XK_BackSpace: return panorama::PanoramaKey::Backspace;
+    case XK_Delete:  return panorama::PanoramaKey::Delete;
+    case XK_Return:  return panorama::PanoramaKey::Enter;
+    case XK_Tab:     return panorama::PanoramaKey::Tab;
+    case XK_Escape:  return panorama::PanoramaKey::Escape;
+    case XK_a:       return panorama::PanoramaKey::A;
+    default:         return panorama::PanoramaKey::Unknown;
+    }
+}
+
+// Blit the document's framebuffer to the X11 window.
+void blit(Display* display, Window window, GC gc, int width, int height,
+          const panorama_example::RasterDocument& document, const PixelPacker& packer,
+          std::vector<std::uint32_t>& packed)
+{
+    pack_framebuffer(document.framebuffer(), packer, packed);
+
+    Visual* visual = DefaultVisual(display, DefaultScreen(display));
+    const int depth = DefaultDepth(display, DefaultScreen(display));
+
+    XImage* image = XCreateImage(
+        display, visual, static_cast<unsigned int>(depth), ZPixmap, 0,
+        reinterpret_cast<char*>(packed.data()),
+        static_cast<unsigned int>(width), static_cast<unsigned int>(height),
+        32, 0);
+    if (image == nullptr)
+    {
+        return;
+    }
+    XPutImage(
+        display, window, gc, image, 0, 0, 0, 0,
+        static_cast<unsigned int>(width), static_cast<unsigned int>(height));
+    image->data = nullptr; // `packed` owns the pixel storage; don't let XDestroyImage free() it
+    XDestroyImage(image);
+}
 }
 
 int main(int argc, char** argv)
@@ -108,7 +159,8 @@ int main(int argc, char** argv)
         0, 0, static_cast<unsigned int>(width), static_cast<unsigned int>(height),
         0, BlackPixel(display, screen), BlackPixel(display, screen));
     XStoreName(display, window, "PanoramaEngine - Window Raster");
-    XSelectInput(display, window, ExposureMask | StructureNotifyMask | KeyPressMask);
+    XSelectInput(display, window, ExposureMask | StructureNotifyMask | KeyPressMask | KeyReleaseMask |
+                                  ButtonPressMask | ButtonReleaseMask | PointerMotionMask);
 
     Atom wm_delete_window = XInternAtom(display, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(display, window, &wm_delete_window, 1);
@@ -119,39 +171,60 @@ int main(int argc, char** argv)
     std::vector<std::uint32_t> packed;
     GC gc = DefaultGC(display, screen);
 
-    const auto repaint = [&](int paint_width, int paint_height) {
-        document.layout_and_rasterize(paint_width, paint_height);
-        pack_framebuffer(document.framebuffer(), packer, packed);
+    // Track pointer state across events.
+    float mouse_x = 0.0F;
+    float mouse_y = 0.0F;
+    bool mouse_down = false;
+    bool needs_refresh = false;
 
-        XImage* image = XCreateImage(
-            display, visual, static_cast<unsigned int>(depth), ZPixmap, 0,
-            reinterpret_cast<char*>(packed.data()),
-            static_cast<unsigned int>(paint_width), static_cast<unsigned int>(paint_height),
-            32, 0);
-        if (image == nullptr)
-        {
-            return;
-        }
-        XPutImage(
-            display, window, gc, image, 0, 0, 0, 0,
-            static_cast<unsigned int>(paint_width), static_cast<unsigned int>(paint_height));
-        image->data = nullptr; // `packed` owns the pixel storage; don't let XDestroyImage free() it
-        XDestroyImage(image);
+    // Helper: run a full update_frame + blit.
+    auto refresh = [&]() {
+        document.update_frame(
+            width, height,
+            mouse_x, mouse_y,
+            mouse_down, 0.0F,
+            nullptr, nullptr);
+        blit(display, window, gc, width, height, document, packer, packed);
     };
 
-    repaint(width, height);
+    // Initial layout + rasterize before the runtime exists.
+    document.layout_and_rasterize(width, height);
+    blit(display, window, gc, width, height, document, packer, packed);
+
+    // Boot the JS runtime.
+    if (!document.init_runtime())
+    {
+        std::fprintf(stderr, "failed to init runtime\n");
+        XCloseDisplay(display);
+        return 1;
+    }
+
+    // Runtime init may have mutated the DOM; re-layout + rasterize.
+    refresh();
+
+    // X11 text input context for composed text (IME / dead keys).
+    XIC xic = nullptr;
+    {
+        XIM xim = XOpenIM(display, nullptr, nullptr, nullptr);
+        if (xim != nullptr)
+        {
+            xic = XCreateIC(xim, XNInputStyle, XIMPreeditNothing | XIMStatusNothing,
+                            XNClientWindow, window, nullptr);
+        }
+    }
 
     bool running = true;
     while (running)
     {
         XEvent event;
         XNextEvent(display, &event);
+
         switch (event.type)
         {
         case Expose:
             if (event.xexpose.count == 0)
             {
-                repaint(width, height);
+                blit(display, window, gc, width, height, document, packer, packed);
             }
             break;
 
@@ -160,16 +233,93 @@ int main(int argc, char** argv)
             {
                 width = event.xconfigure.width;
                 height = event.xconfigure.height;
-                repaint(width, height);
+                refresh();
             }
             break;
 
-        case KeyPress:
-            if (XLookupKeysym(&event.xkey, 0) == XK_Escape)
+        case MotionNotify:
+            mouse_x = static_cast<float>(event.xmotion.x);
+            mouse_y = static_cast<float>(event.xmotion.y);
+            refresh();
+            break;
+
+        case ButtonPress:
+            if (event.xbutton.button == Button1)
             {
-                running = false;
+                mouse_down = true;
+                mouse_x = static_cast<float>(event.xbutton.x);
+                mouse_y = static_cast<float>(event.xbutton.y);
+                refresh();
+            }
+            else if (event.xbutton.button == Button4 || event.xbutton.button == Button5)
+            {
+                // Scroll wheel: Button4 = up, Button5 = down.
+                const float wheel = (event.xbutton.button == Button4) ? 1.0F : -1.0F;
+                mouse_x = static_cast<float>(event.xbutton.x);
+                mouse_y = static_cast<float>(event.xbutton.y);
+                document.update_frame(
+                    width, height,
+                    mouse_x, mouse_y,
+                    mouse_down, wheel,
+                    nullptr, nullptr);
+                blit(display, window, gc, width, height, document, packer, packed);
             }
             break;
+
+        case ButtonRelease:
+            if (event.xbutton.button == Button1)
+            {
+                mouse_down = false;
+                mouse_x = static_cast<float>(event.xbutton.x);
+                mouse_y = static_cast<float>(event.xbutton.y);
+                refresh();
+            }
+            break;
+
+        case KeyPress: {
+            KeySym keysym = XLookupKeysym(&event.xkey, 0);
+
+            if (keysym == XK_Escape)
+            {
+                running = false;
+                break;
+            }
+
+            // Try to get composed text from the input context first.
+            char buf[32] = {};
+            Status status;
+            if (xic != nullptr && Xutf8LookupString(xic, &event.xkey, buf, sizeof(buf) - 1, &keysym, &status) > 0)
+            {
+                // Got composed text -- feed it as text input.
+                document.update_frame(
+                    width, height,
+                    mouse_x, mouse_y,
+                    mouse_down, 0.0F,
+                    nullptr,
+                    std::string_view(buf));
+                blit(display, window, gc, width, height, document, packer, packed);
+            }
+            else
+            {
+                // Non-character key: feed as a key-down event.
+                const panorama::PanoramaKey key = keysym_to_panorama_key(keysym);
+                if (key != panorama::PanoramaKey::Unknown)
+                {
+                    panorama::PanoramaKeyEvent event_key;
+                    event_key.key = key;
+                    event_key.shift = (event.xkey.state & ShiftMask) != 0;
+                    event_key.ctrl = (event.xkey.state & ControlMask) != 0;
+                    event_key.alt = (event.xkey.state & Mod1Mask) != 0;
+                    document.update_frame(
+                        width, height,
+                        mouse_x, mouse_y,
+                        mouse_down, 0.0F,
+                        &event_key, nullptr);
+                    blit(display, window, gc, width, height, document, packer, packed);
+                }
+            }
+            break;
+        }
 
         case ClientMessage:
             if (static_cast<Atom>(event.xclient.data.l[0]) == wm_delete_window)
@@ -183,6 +333,11 @@ int main(int argc, char** argv)
         }
     }
 
+    if (xic != nullptr)
+    {
+        XDestroyIC(xic);
+    }
+    document.shutdown_runtime();
     XCloseDisplay(display);
     return 0;
 }

@@ -3,12 +3,15 @@
 // Loads a Panorama layout from an XML file on disk, lays it out, rasterizes
 // it on the CPU (raster_view.hpp, the same rasterizer as
 // examples/02_software_raster), and blits the result into a Win32 window
-// with StretchDIBits. Re-lays-out and re-rasterizes on every resize. See
-// posix_main.cpp for the X11 equivalent -- both share raster_view.hpp and
-// differ only in how they open a window and get pixels on screen.
+// with StretchDIBits. Feeds mouse, keyboard, and text input to the engine's
+// PanoramaInputController and boots the PanoramaRuntime (QuickJS) so buttons,
+// text entries, and sliders are fully interactive. See posix_main.cpp for the
+// X11 equivalent -- both share raster_view.hpp and differ only in how they
+// open a window, gather input, and get pixels on screen.
 #include "raster_view.hpp"
 
 #include <windows.h>
+#include <windowsx.h>
 
 #include <cstdio>
 #include <filesystem>
@@ -24,6 +27,9 @@ struct AppState
     std::vector<std::uint8_t> bgra; // repacked from document.framebuffer() for StretchDIBits
     int width = 0;
     int height = 0;
+    bool mouse_down = false;
+    float mouse_x = 0.0F;
+    float mouse_y = 0.0F;
 };
 
 // StretchDIBits expects each pixel as B,G,R,X in memory (little-endian
@@ -41,17 +47,60 @@ void repack_bgra(const panorama_example::Framebuffer& fb, std::vector<std::uint8
     }
 }
 
-void relayout(HWND hwnd, AppState& state, int width, int height)
+// Helper: run a full update_frame + repack + invalidate.
+void refresh(HWND hwnd, AppState& state, float wheel = 0.0F,
+             const panorama::PanoramaKeyEvent* key = nullptr, std::string_view text = {})
 {
-    if (width <= 0 || height <= 0)
-    {
-        return;
-    }
-    state.width = width;
-    state.height = height;
-    state.document.layout_and_rasterize(width, height);
+    state.document.update_frame(
+        state.width, state.height,
+        state.mouse_x, state.mouse_y,
+        state.mouse_down, wheel,
+        key, text);
     repack_bgra(state.document.framebuffer(), state.bgra);
     InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+// Map Win32 virtual-key codes to the engine's PanoramaKey enum.
+panorama::PanoramaKey vk_to_panorama_key(WPARAM vk)
+{
+    switch (vk)
+    {
+    case VK_LEFT:   return panorama::PanoramaKey::ArrowLeft;
+    case VK_RIGHT:  return panorama::PanoramaKey::ArrowRight;
+    case VK_UP:     return panorama::PanoramaKey::ArrowUp;
+    case VK_DOWN:   return panorama::PanoramaKey::ArrowDown;
+    case VK_HOME:   return panorama::PanoramaKey::Home;
+    case VK_END:    return panorama::PanoramaKey::End;
+    case VK_BACK:   return panorama::PanoramaKey::Backspace;
+    case VK_DELETE: return panorama::PanoramaKey::Delete;
+    case VK_RETURN: return panorama::PanoramaKey::Enter;
+    case VK_TAB:    return panorama::PanoramaKey::Tab;
+    case VK_ESCAPE: return panorama::PanoramaKey::Escape;
+    case 'A':       return panorama::PanoramaKey::A;
+    default:        return panorama::PanoramaKey::Unknown;
+    }
+}
+
+// Convert a single BMP wchar_t to UTF-8 (handles BMP characters only, which
+// covers virtually all text-entry use cases). Returns the number of bytes
+// written into `out`.
+int wchar_to_utf8(wchar_t ch, char* out)
+{
+    if (ch < 0x80)
+    {
+        out[0] = static_cast<char>(ch);
+        return 1;
+    }
+    if (ch < 0x800)
+    {
+        out[0] = static_cast<char>(0xC0 | (ch >> 6));
+        out[1] = static_cast<char>(0x80 | (ch & 0x3F));
+        return 2;
+    }
+    out[0] = static_cast<char>(0xE0 | (ch >> 12));
+    out[1] = static_cast<char>(0x80 | ((ch >> 6) & 0x3F));
+    out[2] = static_cast<char>(0x80 | (ch & 0x3F));
+    return 3;
 }
 
 LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
@@ -66,7 +115,12 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
     case WM_SIZE:
         if (state != nullptr && wparam != SIZE_MINIMIZED)
         {
-            relayout(hwnd, *state, LOWORD(lparam), HIWORD(lparam));
+            state->width = LOWORD(lparam);
+            state->height = HIWORD(lparam);
+            if (state->width > 0 && state->height > 0)
+            {
+                refresh(hwnd, *state);
+            }
         }
         return 0;
 
@@ -96,10 +150,101 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
         return 0;
     }
 
-    case WM_KEYDOWN:
-        if (wparam == VK_ESCAPE)
+    case WM_MOUSEMOVE:
+        if (state != nullptr)
         {
-            DestroyWindow(hwnd);
+            state->mouse_x = static_cast<float>(GET_X_LPARAM(lparam));
+            state->mouse_y = static_cast<float>(GET_Y_LPARAM(lparam));
+            refresh(hwnd, *state);
+        }
+        return 0;
+
+    case WM_LBUTTONDOWN:
+        if (state != nullptr)
+        {
+            SetCapture(hwnd);
+            state->mouse_down = true;
+            state->mouse_x = static_cast<float>(GET_X_LPARAM(lparam));
+            state->mouse_y = static_cast<float>(GET_Y_LPARAM(lparam));
+            refresh(hwnd, *state);
+        }
+        return 0;
+
+    case WM_LBUTTONUP:
+        if (state != nullptr)
+        {
+            ReleaseCapture();
+            state->mouse_down = false;
+            state->mouse_x = static_cast<float>(GET_X_LPARAM(lparam));
+            state->mouse_y = static_cast<float>(GET_Y_LPARAM(lparam));
+            refresh(hwnd, *state);
+        }
+        return 0;
+
+    case WM_MOUSEWHEEL:
+        if (state != nullptr)
+        {
+            // WM_MOUSEWHEEL delivers pointer position in SCREEN coordinates.
+            POINT pt;
+            pt.x = GET_X_LPARAM(lparam);
+            pt.y = GET_Y_LPARAM(lparam);
+            ScreenToClient(hwnd, &pt);
+            state->mouse_x = static_cast<float>(pt.x);
+            state->mouse_y = static_cast<float>(pt.y);
+
+            const float wheel_ticks =
+                static_cast<float>(GET_WHEEL_DELTA_WPARAM(wparam)) / static_cast<float>(WHEEL_DELTA);
+            refresh(hwnd, *state, wheel_ticks);
+        }
+        return 0;
+
+    case WM_KEYDOWN:
+        if (state != nullptr)
+        {
+            if (wparam == VK_ESCAPE)
+            {
+                DestroyWindow(hwnd);
+                return 0;
+            }
+
+            const panorama::PanoramaKey key = vk_to_panorama_key(wparam);
+            if (key != panorama::PanoramaKey::Unknown)
+            {
+                panorama::PanoramaKeyEvent event;
+                event.key = key;
+                event.shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+                event.ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+                event.alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+                refresh(hwnd, *state, 0.0F, &event);
+            }
+        }
+        return 0;
+
+    case WM_CHAR:
+        if (state != nullptr)
+        {
+            const wchar_t ch = static_cast<wchar_t>(wparam);
+
+            // Skip control characters (tab, enter, backspace, etc.) -- those
+            // are handled via WM_KEYDOWN above. WM_CHAR also sends '\r' for
+            // Enter and '\t' for Tab; skip them to avoid double-handling.
+            if (ch < 0x20 || ch == 0x7F || ch == L'\r')
+            {
+                break;
+            }
+
+            char utf8[4] = {};
+            const int len = wchar_to_utf8(ch, utf8);
+            refresh(hwnd, *state, 0.0F, nullptr, std::string_view(utf8, len));
+        }
+        break;
+
+    case WM_MOUSELEAVE:
+        if (state != nullptr)
+        {
+            state->mouse_x = -1.0F;
+            state->mouse_y = -1.0F;
+            refresh(hwnd, *state);
         }
         return 0;
 
@@ -110,6 +255,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
     default:
         return DefWindowProcW(hwnd, message, wparam, lparam);
     }
+    return DefWindowProcW(hwnd, message, wparam, lparam);
 }
 }
 
@@ -164,7 +310,27 @@ int main(int argc, char** argv)
 
     RECT client_rect{};
     GetClientRect(hwnd, &client_rect);
-    relayout(hwnd, state, client_rect.right - client_rect.left, client_rect.bottom - client_rect.top);
+    state.width = client_rect.right - client_rect.left;
+    state.height = client_rect.bottom - client_rect.top;
+
+    // Initial layout + rasterize before the runtime exists.
+    state.document.layout_and_rasterize(state.width, state.height);
+    repack_bgra(state.document.framebuffer(), state.bgra);
+
+    // Boot the JS runtime against the already-laid-out tree.
+    if (!state.document.init_runtime())
+    {
+        std::fprintf(stderr, "failed to init runtime\n");
+        return 1;
+    }
+
+    // Runtime init may have mutated the DOM; re-layout + rasterize.
+    state.document.update_frame(
+        state.width, state.height,
+        state.mouse_x, state.mouse_y,
+        state.mouse_down, 0.0F,
+        nullptr, nullptr);
+    repack_bgra(state.document.framebuffer(), state.bgra);
 
     ShowWindow(hwnd, SW_SHOWDEFAULT);
     UpdateWindow(hwnd);
@@ -175,5 +341,7 @@ int main(int argc, char** argv)
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+
+    state.document.shutdown_runtime();
     return static_cast<int>(msg.wParam);
 }

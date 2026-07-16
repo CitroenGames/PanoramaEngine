@@ -2,6 +2,9 @@
     <styles>
         <include src="file://{resources}/styles/raster.css" />
     </styles>
+    <scripts>
+        <include src="file://{resources}/scripts/app.js" />
+    </scripts>
     <Panel id="Screen" class="screen">
         <Panel id="NavBar" class="nav">
             <Label id="Brand" class="brand" text="PANORAMA ENGINE" />
@@ -16,8 +19,22 @@
                 <Panel class="tile accent" />
             </Panel>
             <Panel id="Card" class="card">
-                <Label class="card-title" text="CPU Rasterized" />
-                <Label class="card-text" text="This frame was loaded from raster.xml and rasterized entirely on the CPU, then blitted into a native window -- no GPU, no game engine." />
+                <Label class="card-title" text="Interactive Controls" />
+                <Label class="card-text" text="This frame was loaded from raster.xml and rasterized entirely on the CPU. The controls below are fully interactive -- hover, click, type, and drag them." />
+
+                <Label class="section-label" text="Button" />
+                <Button id="ClickButton" class="action-button" onactivate="OnButtonClick()">
+                    <Label class="button-label" text="CLICK ME" />
+                </Button>
+                <Label id="ButtonStatus" class="status-label" text="Clicks: 0" />
+
+                <Label class="section-label" text="Text Entry" />
+                <TextEntry id="NameEntry" class="text-entry" placeholder="Type your name..." maxchars="40" />
+                <Label id="TextStatus" class="status-label" text="" />
+
+                <Label class="section-label" text="Slider" />
+                <Slider id="VolumeSlider" class="horizontal-slider" value="50" min="0" max="100" />
+                <Label id="SliderStatus" class="status-label" text="Value: 50" />
             </Panel>
         </Panel>
     </Panel>
