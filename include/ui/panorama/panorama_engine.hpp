@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ui/panorama/panorama_anim.hpp"
+#include "ui/panorama/panorama_diagnostics.hpp"
 #include "ui/panorama/panorama_document_session.hpp"
 #include "ui/panorama/panorama_dom.hpp"
 #include "ui/panorama/panorama_font_atlas.hpp"

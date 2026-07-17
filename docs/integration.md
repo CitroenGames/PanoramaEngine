@@ -38,6 +38,26 @@ After setting the active render backend, bind a loaded `PanoramaFontAtlas` with
 before paint, or supply matching custom text measurement and glyph callbacks with
 `set_text_measure()`/`set_glyph_source()`.
 
+For a relocatable standalone application, configure font files explicitly (or
+provide explicit search directories) rather than relying on discovery:
+
+```cpp
+PanoramaFontAtlas atlas;
+PanoramaFontAtlasLoadOptions fonts;
+fonts.resource_root = resource_root;
+fonts.faces = {
+    {"fonts/App-Regular.ttf", 400},
+    {"fonts/App-Semibold.ttf", 600},
+};
+if (atlas.load(fonts))
+    view.set_font_atlas(&atlas);
+```
+
+Relative face paths resolve against `resource_root`, then each
+`search_directory`. With no explicit faces, the atlas searches the configured
+directories first and then conventional font folders near `resource_root`.
+`clear()` releases atlas state so the same object can load a different font set.
+
 The remainder of this guide documents the lower-level components for custom
 scheduling, partial-cascade threading, or direct geometry-cache submission.
 

@@ -29,7 +29,7 @@ constexpr std::string_view kLayoutXml = R"xml(<root>
     </styles>
     <Panel id="Screen" class="screen">
         <Panel id="NavBar" class="nav">
-            <Label id="Title" class="title" text="OPENSTRIKE" />
+            <Label id="Title" class="title" text="PANORAMA" />
             <Button id="PlayButton" class="nav-button" onactivate="OnPlay()">
                 <Label text="PLAY" />
             </Button>

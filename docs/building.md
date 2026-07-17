@@ -17,8 +17,9 @@ Useful options:
   (this is already the default when added through `add_subdirectory`).
 - `PANORAMA_BUILD_WINDOW_EXAMPLE=OFF` skips the Win32/X11 window example while
   retaining the three headless examples.
-- `PANORAMA_BUILD_TESTS=OFF` skips CTest registration (this already defaults to
-  off when PanoramaEngine is added through `add_subdirectory`).
+- `PANORAMA_BUILD_TESTS=OFF` skips the dedicated standalone API test target and
+  CTest registration (this already defaults to off when PanoramaEngine is
+  added through `add_subdirectory`).
 - `PANORAMA_MSVC_STATIC_RUNTIME=OFF` uses CMake's default MSVC runtime. This
   defaults to `ON` for a top-level standalone build (matching sighmake) and
   `OFF` as a subdirectory, so PanoramaEngine follows the surrounding CMake
@@ -109,10 +110,16 @@ looks like — see [../examples/README.md](../examples/README.md#04_window_raste
 
 ## Tests
 
-The CMake build registers `PanoramaStandaloneScriptedUi`, a headless lifecycle
-smoke test covering load/runtime initialization, runtime sublayouts and child
-script contexts, idle-frame stability, resize invalidation, synthetic input,
-script DOM mutation, cascade, relayout, and draw-list rebuilding:
+The CMake build always registers `PanoramaStandaloneApi` when tests are enabled.
+It validates the public diagnostics configuration plus deterministic font
+discovery, explicit weighted faces, measurement, and atlas reset. This target is
+independent of `PANORAMA_BUILD_EXAMPLES`, so consumers can test a library-only
+configuration.
+
+When examples are also enabled, `PanoramaStandaloneViewLifecycle` adds a
+headless lifecycle smoke test covering load/runtime initialization, runtime
+sublayouts and child script contexts, idle-frame stability, resize invalidation,
+synthetic input, script DOM mutation, cascade, relayout, and draw-list rebuilding:
 
 ```powershell
 ctest --test-dir build/cmake -C Debug --output-on-failure

@@ -131,12 +131,12 @@ intentionally does not vendor (see
 [../docs/architecture.md](../docs/architecture.md#extension-points)'s "Text"
 extension point) — but this example bundles
 [Lato](https://fonts.google.com/specimen/Lato) (SIL Open Font License, see
-`sample/resource/ui/fonts/OFL.txt`) under `sample/resource/ui/fonts/`
-(mirrors CS:GO's own content layout, the same path `PanoramaFontAtlas`
-already looks for on a real Panorama install), so it renders real glyphs out
-of the box. Point it at a `layout.xml` elsewhere with no font under that
-same relative path and it logs a warning and skips text instead, same as
-example 02.
+`sample/resource/ui/fonts/OFL.txt`) under `sample/resource/ui/fonts/`, one of
+the generic directories discovered by `PanoramaFontAtlas`, so it renders real
+glyphs out of the box. Applications can instead pass explicit face files or
+search directories through `PanoramaFontAtlasLoadOptions`. Point the example at
+a `layout.xml` elsewhere with no discoverable font and it logs a warning and
+skips text instead, same as example 02.
 
 ### POSIX build note
 

@@ -50,6 +50,7 @@ sequencing used by `PanoramaView` and custom coordinators.
 | `panorama_geometry_cache.hpp` | `PanoramaGeometryCache` — incremental GPU geometry submission (see [integration.md](integration.md)) |
 | `panorama_render_backend.hpp` | `PanoramaRenderBackend` (the GPU contract), `panorama_render_backend()`/`set_panorama_render_backend()` (current-backend global) |
 | `panorama_font_atlas.hpp` | `PanoramaFontAtlas` — the built-in FreeType-backed `PanoramaTextMeasure`/`PanoramaGlyphSource` implementation |
+| `panorama_diagnostics.hpp` | Process-wide tree-guard and style-path diagnostic configuration |
 | `panorama_input.hpp` | `PanoramaInputController` — pointer/wheel hit-testing, hover/active/focus, radio groups, dropdown/scrollbar internals |
 | `panorama_runtime.hpp` | `PanoramaRuntime` — QuickJS interpreter, `Panel`/`$` bindings over `PanoramaNode`, event bus, native-action/layout-loader/focus hooks |
 | `panorama_resource_provider.hpp` | `PanoramaResourceManager` + `Memory`/`Package`/`Directory` provider implementations |
@@ -107,9 +108,17 @@ plain `std::function` field rather than a subclass hierarchy to walk:
 3. **Text** — supply a `PanoramaTextMeasure` function and a
    `PanoramaGlyphSource` (glyph + ascent functions) if you don't want the
    built-in FreeType `PanoramaFontAtlas`; both must agree on the same font so
-   measured and painted text line up.
+   measured and painted text line up. The built-in atlas accepts explicit
+   weighted faces and search directories through `PanoramaFontAtlasLoadOptions`,
+   so reusable applications do not need a game-specific filesystem layout.
 4. **Engine actions / sublayout loading** — `PanoramaRuntime::set_host_action_handler`,
    `set_layout_loaders`, and `set_focus_request_handler` are the bridge
    points for application services such as matchmaking, native controls, and
    console commands. A minimal integration can leave all three unset and run
    self-authored, non-game-backed Panorama UI.
+
+Process-wide diagnostic behavior is also an explicit public configuration:
+`PanoramaDiagnostics` controls the tree lifetime guard and the style index/
+sharing A/B paths. Its defaults are read once from generic `PANORAMA_*`
+environment switches, and embedders can replace them deterministically with
+`set_panorama_diagnostics()` before creating surfaces.

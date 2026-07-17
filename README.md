@@ -126,6 +126,24 @@ implementations can instead use `set_text_measure()` plus `set_glyph_source()`.
 Native DOM edits can call `mark_style_dirty()` on the changed node;
 `PanoramaView::update()` detects the propagated dirty bits.
 
+Standalone applications can make font selection deterministic instead of
+depending on content-tree discovery:
+
+```cpp
+PanoramaFontAtlasLoadOptions fonts;
+fonts.resource_root = resource_root;
+fonts.faces = {
+    {"fonts/Inter-Regular.ttf", 400},
+    {"fonts/Inter-Bold.ttf", 700},
+};
+if (font_atlas.load(fonts))
+    view.set_font_atlas(&font_atlas);
+```
+
+When `faces` is empty, `search_directories` and conventional `fonts/`,
+`ui/fonts/`, and `resource/ui/fonts/` directories near `resource_root` are
+searched. No application-specific current-working-directory path is probed.
+
 ## Low-Level Integration
 
 Applications that need custom scheduling or partial-cascade control can compose
@@ -258,6 +276,10 @@ shown in [docs/integration.md](docs/integration.md).
   integrations may instead provide their own `PanoramaTextMeasure` and
   `PanoramaGlyphSource`, but both should come from the same font source.
 - Application-specific headers and dependencies belong outside PanoramaEngine.
+- Expensive diagnostics are configured through `PanoramaDiagnostics` and
+  `set_panorama_diagnostics()`. The generic `PANORAMA_TREE_GUARD`,
+  `PANORAMA_DISABLE_STYLE_INDEX`, and `PANORAMA_DISABLE_STYLE_SHARING`
+  environment switches provide a command-line-friendly alternative.
 - If you render through Direct3D 12 or Vulkan, `adapters/` ships ready-made
   `PanoramaRenderBackend` implementations (`panorama_d3d12_backend.hpp`,
   `panorama_vulkan_backend.hpp`) you can `#include` as a starting point instead

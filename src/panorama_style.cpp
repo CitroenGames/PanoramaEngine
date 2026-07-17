@@ -1,6 +1,7 @@
 #include "ui/panorama/panorama_style.hpp"
 
 #include "panorama_string_util.hpp"
+#include "ui/panorama/panorama_diagnostics.hpp"
 #include "ui/panorama/panorama_dom.hpp"
 
 #include <algorithm>
@@ -49,22 +50,6 @@ bool is_custom_property_name(std::string_view property)
 bool contains(std::string_view text, std::string_view needle)
 {
     return text.find(needle) != std::string_view::npos;
-}
-
-bool environment_flag_set(const char* name)
-{
-#if defined(_MSC_VER)
-    char* value = nullptr;
-    std::size_t size = 0;
-    if (_dupenv_s(&value, &size, name) != 0 || value == nullptr)
-    {
-        return false;
-    }
-    std::free(value);
-    return size > 0;
-#else
-    return std::getenv(name) != nullptr;
-#endif
 }
 
 // Parses the leading numeric portion of a token, ignoring a trailing unit.
@@ -4637,10 +4622,9 @@ void PanoramaStyleSheet::compute_node_impl(PanoramaNode& node, const PanoramaNod
     // scratch buffers avoid per-node allocation in this hot path.
     static thread_local std::vector<int> candidates;
     candidates.clear();
-    // Diagnostic A/B switch: OPENSTRIKE_PANORAMA_NOINDEX=1 reverts to scanning the
-    // whole sheet, so the indexed path can be profiled against the old behaviour.
-    static const bool no_index = environment_flag_set("OPENSTRIKE_PANORAMA_NOINDEX");
-    if (no_index)
+    // Diagnostic A/B switch reverts to scanning the whole sheet, so the indexed
+    // path can be profiled against the full-rule-list implementation.
+    if (style_index_disabled_)
     {
         candidates.resize(rules_.size());
         for (std::size_t i = 0; i < rules_.size(); ++i)
@@ -5050,8 +5034,9 @@ void PanoramaStyleSheet::compute_node_impl(PanoramaNode& node, const PanoramaNod
 
 void PanoramaStyleSheet::seed_sharing_flags(const PanoramaNode& root) const
 {
-    static const bool env_disabled = environment_flag_set("OPENSTRIKE_PANORAMA_NOSHARE");
-    sharing_active_ = style_sharing_enabled_ && !env_disabled;
+    const PanoramaDiagnostics diagnostics = panorama_diagnostics();
+    style_index_disabled_ = diagnostics.disable_style_index;
+    sharing_active_ = style_sharing_enabled_ && !diagnostics.disable_style_sharing;
     // The focus-within cross-check only matters when such a rule exists and a node is
     // actually focused; otherwise :focus-within is uniformly false across siblings.
     sharing_focus_within_active_ =

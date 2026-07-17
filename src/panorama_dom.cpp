@@ -1,6 +1,7 @@
 #include "ui/panorama/panorama_dom.hpp"
 
 #include "panorama_string_util.hpp"
+#include "ui/panorama/panorama_diagnostics.hpp"
 
 #include <algorithm>
 #include <array>
@@ -705,11 +706,7 @@ void PanoramaScopedNodeWatch::on_panorama_node_destroyed(PanoramaNode& node)
 
 bool panorama_debug_tree_guard_enabled()
 {
-    static const bool enabled = []() {
-        const char* value = std::getenv("OPENSTRIKE_PANORAMA_TREEGUARD");
-        return value != nullptr && value[0] != '\0' && value[0] != '0';
-    }();
-    return enabled;
+    return panorama_diagnostics().tree_guard;
 }
 
 void panorama_debug_set_mutation_context(std::string context)

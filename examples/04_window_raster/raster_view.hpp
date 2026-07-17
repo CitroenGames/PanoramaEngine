@@ -263,7 +263,9 @@ public:
         // `<resource_root>/resource/ui/fonts/` (matching CS:GO's own content
         // layout) so it renders real glyphs out of the box. Point --
         // load() at a resource_root without a font under that path (e.g. a
-        // custom layout.xml elsewhere) and it logs a warning instead;
+        // custom layout.xml elsewhere) and it logs a warning instead. Production
+        // callers can use PanoramaFontAtlasLoadOptions to name their own font
+        // folders or weighted face files explicitly;
         // glyph_source()/text_measure() below then degrade to the same
         // "panels paint, text is skipped" behaviour as
         // examples/02_software_raster.

@@ -12,8 +12,8 @@
 // far too slow for an animated UI, but reusing GPU handles across frames without
 // silently going stale (behind a text/color change, a resized scissor rect, a
 // tree edit that shifts command order) is easy to get subtly wrong. This class
-// is the host-independent solution, factored out of OpenStrike's own Panorama
-// host bridge after it had already had these bugs found and fixed once.
+// is the host-independent solution, factored out of a production Panorama host
+// bridge after it had already had these bugs found and fixed once.
 namespace panorama
 {
 // Content signature of a single draw command, scaled by `ui_scale` (geometry is

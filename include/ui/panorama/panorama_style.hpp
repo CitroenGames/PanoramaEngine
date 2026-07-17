@@ -822,7 +822,8 @@ public:
     // descendant/child-combinator matches). compute() then copies that style
     // outright instead of gathering candidates and re-matching. Enabled by default;
     // a test can disable it to assert the shared path matches the matched-from-
-    // scratch path, and the OPENSTRIKE_PANORAMA_NOSHARE env var disables it too.
+    // scratch path, and PanoramaDiagnostics::disable_style_sharing disables it
+    // process-wide for diagnostic A/B comparisons.
     void set_style_sharing_enabled(bool enabled) { style_sharing_enabled_ = enabled; }
 
     // CPUMT-49: split entry points for forking a full compute() across worker
@@ -907,10 +908,11 @@ private:
     // captured by the sibling-local style-sharing comparison. Derived in add_source.
     bool has_focus_within_rules_ = false;
 
-    // Style-sharing master switch (set_style_sharing_enabled / env override) and the
-    // per-pass derived flags compute() seeds before recursing (mutable: compute() is
-    // const, mirroring the thread_local cascade scratch this class already keeps).
+    // Style-sharing master switch and the per-pass diagnostic/sharing flags
+    // compute() seeds before recursing (mutable: compute() is const, mirroring the
+    // thread_local cascade scratch this class already keeps).
     bool style_sharing_enabled_ = true;
+    mutable bool style_index_disabled_ = false;        // full rule scan for this pass
     mutable bool sharing_active_ = false;              // sharing in effect for this pass
     mutable bool sharing_focus_within_active_ = false; // a focus-within rule exists AND a node is focused
 

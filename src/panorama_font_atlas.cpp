@@ -43,29 +43,50 @@ bool is_font_file(const std::filesystem::path& path)
     return extension == ".ttf" || extension == ".otf";
 }
 
-std::vector<std::filesystem::path> font_roots_from_resource_root(const std::filesystem::path& resource_root)
+void append_unique_root(std::vector<std::filesystem::path>& roots, std::filesystem::path root)
+{
+    if (root.empty())
+    {
+        return;
+    }
+    root = root.lexically_normal();
+    if (std::find(roots.begin(), roots.end(), root) == roots.end())
+    {
+        roots.push_back(std::move(root));
+    }
+}
+
+std::vector<std::filesystem::path> font_roots(const PanoramaFontAtlasLoadOptions& options)
 {
     std::vector<std::filesystem::path> roots;
-    const std::filesystem::path normalized = resource_root.lexically_normal();
+    for (const std::filesystem::path& directory : options.search_directories)
+    {
+        append_unique_root(roots, directory);
+    }
+
+    const std::filesystem::path normalized = options.resource_root.lexically_normal();
     if (!normalized.empty())
     {
-        roots.push_back(normalized.parent_path() / "resource/ui/fonts");
-        roots.push_back(normalized / "resource/ui/fonts");
-        roots.push_back(normalized / "csgo/resource/ui/fonts");
-        roots.push_back(normalized.parent_path().parent_path() / "csgo/resource/ui/fonts");
+        // Support a resource root that is itself a font directory as well as
+        // generic standalone layouts and Valve's conventional content tree.
+        append_unique_root(roots, normalized);
+        append_unique_root(roots, normalized / "fonts");
+        append_unique_root(roots, normalized / "ui/fonts");
+        append_unique_root(roots, normalized / "resource/ui/fonts");
+        append_unique_root(roots, normalized.parent_path() / "resource/ui/fonts");
+        append_unique_root(roots, normalized / "csgo/resource/ui/fonts");
+        append_unique_root(roots, normalized.parent_path().parent_path() / "csgo/resource/ui/fonts");
     }
-    roots.push_back(std::filesystem::path("openstrike/Content/csgo/resource/ui/fonts"));
-    roots.push_back(std::filesystem::path("Content/csgo/resource/ui/fonts"));
     return roots;
 }
 
 std::filesystem::path find_font_file_from_names(
-    const std::filesystem::path& resource_root,
+    const std::vector<std::filesystem::path>& roots,
     const char* const* preferred_names,
     std::size_t preferred_count,
     bool allow_fallback)
 {
-    for (const std::filesystem::path& root : font_roots_from_resource_root(resource_root))
+    for (const std::filesystem::path& root : roots)
     {
         std::error_code error;
         if (!std::filesystem::is_directory(root, error))
@@ -109,7 +130,7 @@ std::filesystem::path find_font_file_from_names(
     return {};
 }
 
-std::filesystem::path find_regular_font_file(const std::filesystem::path& resource_root)
+std::filesystem::path find_regular_font_file(const std::vector<std::filesystem::path>& roots)
 {
     static constexpr const char* kPreferredFonts[] = {
         "Stratum2-Regular.ttf",
@@ -118,20 +139,20 @@ std::filesystem::path find_regular_font_file(const std::filesystem::path& resour
         "LatoLatin-Regular.ttf",
     };
     return find_font_file_from_names(
-        resource_root, kPreferredFonts, sizeof(kPreferredFonts) / sizeof(kPreferredFonts[0]), true);
+        roots, kPreferredFonts, sizeof(kPreferredFonts) / sizeof(kPreferredFonts[0]), true);
 }
 
-std::filesystem::path find_medium_font_file(const std::filesystem::path& resource_root)
+std::filesystem::path find_medium_font_file(const std::vector<std::filesystem::path>& roots)
 {
     static constexpr const char* kPreferredFonts[] = {
         "Stratum2-Medium.ttf",
         "NotoSans-Regular.ttf",
     };
     return find_font_file_from_names(
-        resource_root, kPreferredFonts, sizeof(kPreferredFonts) / sizeof(kPreferredFonts[0]), false);
+        roots, kPreferredFonts, sizeof(kPreferredFonts) / sizeof(kPreferredFonts[0]), false);
 }
 
-std::filesystem::path find_bold_font_file(const std::filesystem::path& resource_root)
+std::filesystem::path find_bold_font_file(const std::vector<std::filesystem::path>& roots)
 {
     static constexpr const char* kPreferredFonts[] = {
         "Stratum2-Bold.ttf",
@@ -140,7 +161,48 @@ std::filesystem::path find_bold_font_file(const std::filesystem::path& resource_
         "NotoSerif-Bold.ttf",
     };
     return find_font_file_from_names(
-        resource_root, kPreferredFonts, sizeof(kPreferredFonts) / sizeof(kPreferredFonts[0]), false);
+        roots, kPreferredFonts, sizeof(kPreferredFonts) / sizeof(kPreferredFonts[0]), false);
+}
+
+std::filesystem::path resolve_configured_face(
+    const PanoramaFontAtlasLoadOptions& options,
+    const std::vector<std::filesystem::path>& roots,
+    const std::filesystem::path& path)
+{
+    if (path.empty())
+    {
+        return {};
+    }
+
+    std::vector<std::filesystem::path> candidates;
+    if (path.is_absolute())
+    {
+        candidates.push_back(path);
+    }
+    else
+    {
+        if (!options.resource_root.empty())
+        {
+            candidates.push_back(options.resource_root / path);
+        }
+        for (const std::filesystem::path& root : roots)
+        {
+            candidates.push_back(root / path);
+        }
+        // An explicitly supplied relative path with no root remains useful for
+        // small command-line applications whose working directory is deliberate.
+        candidates.push_back(path);
+    }
+
+    for (const std::filesystem::path& candidate : candidates)
+    {
+        std::error_code error;
+        if (std::filesystem::is_regular_file(candidate, error))
+        {
+            return candidate.lexically_normal();
+        }
+    }
+    return {};
 }
 
 char32_t next_codepoint(std::string_view text, std::size_t& i)
@@ -804,15 +866,58 @@ PanoramaFontAtlas::~PanoramaFontAtlas() = default;
 
 bool PanoramaFontAtlas::load(const std::filesystem::path& resource_root)
 {
+    PanoramaFontAtlasLoadOptions options;
+    options.resource_root = resource_root;
+    return load(options);
+}
+
+bool PanoramaFontAtlas::load(const PanoramaFontAtlasLoadOptions& options)
+{
     if (impl_->loaded())
     {
         return true;
     }
 
-    const std::filesystem::path regular_path = find_regular_font_file(resource_root);
-    if (regular_path.empty())
+    const std::vector<std::filesystem::path> roots = font_roots(options);
+    std::vector<PanoramaFontAtlasFace> faces;
+    if (!options.faces.empty())
     {
-        pano_log_warning("Panorama font atlas: no font found near '{}'", resource_root.lexically_normal().generic_string());
+        faces.reserve(options.faces.size());
+        for (const PanoramaFontAtlasFace& configured : options.faces)
+        {
+            const std::filesystem::path resolved = resolve_configured_face(options, roots, configured.path);
+            if (resolved.empty())
+            {
+                pano_log_warning(
+                    "Panorama font atlas: configured font '{}' was not found",
+                    configured.path.generic_string());
+                continue;
+            }
+            faces.push_back(PanoramaFontAtlasFace{resolved, std::clamp(configured.weight, 1, 1000)});
+        }
+    }
+    else
+    {
+        const std::filesystem::path regular_path = find_regular_font_file(roots);
+        if (!regular_path.empty())
+        {
+            faces.push_back(PanoramaFontAtlasFace{regular_path, 400});
+        }
+        if (const std::filesystem::path medium_path = find_medium_font_file(roots); !medium_path.empty())
+        {
+            faces.push_back(PanoramaFontAtlasFace{medium_path, 500});
+        }
+        if (const std::filesystem::path bold_path = find_bold_font_file(roots); !bold_path.empty())
+        {
+            faces.push_back(PanoramaFontAtlasFace{bold_path, 700});
+        }
+    }
+
+    if (faces.empty())
+    {
+        pano_log_warning(
+            "Panorama font atlas: no font found for resource root '{}'",
+            options.resource_root.lexically_normal().generic_string());
         return false;
     }
 
@@ -822,15 +927,15 @@ bool PanoramaFontAtlas::load(const std::filesystem::path& resource_root)
         return false;
     }
 
-    const auto load_face = [&](const std::filesystem::path& path, int weight, bool required) {
+    const auto load_face = [&](const std::filesystem::path& path, int weight) {
         if (path.empty())
         {
-            return !required;
+            return false;
         }
         const std::filesystem::path normalized = path.lexically_normal();
         for (const PanoramaFontAtlas::Impl::FontFace& font : impl_->faces)
         {
-            if (font.path == normalized)
+            if (font.path == normalized && font.weight == weight)
             {
                 return true;
             }
@@ -840,11 +945,8 @@ bool PanoramaFontAtlas::load(const std::filesystem::path& resource_root)
         const std::string font_path_string = normalized.string();
         if (FT_New_Face(impl_->library, font_path_string.c_str(), 0, &face) != 0)
         {
-            if (required)
-            {
-                pano_log_warning("Panorama font atlas: failed to load '{}'", normalized.generic_string());
-            }
-            return !required;
+            pano_log_warning("Panorama font atlas: failed to load '{}'", normalized.generic_string());
+            return false;
         }
 
         PanoramaFontAtlas::Impl::FontFace font;
@@ -856,15 +958,25 @@ bool PanoramaFontAtlas::load(const std::filesystem::path& resource_root)
         return true;
     };
 
-    if (!load_face(regular_path, 400, true))
+    bool loaded_any = false;
+    for (const PanoramaFontAtlasFace& face : faces)
+    {
+        loaded_any = load_face(face.path, face.weight) || loaded_any;
+    }
+    if (!loaded_any)
     {
         FT_Done_FreeType(impl_->library);
         impl_->library = nullptr;
         return false;
     }
-    (void)load_face(find_medium_font_file(resource_root), 500, false);
-    (void)load_face(find_bold_font_file(resource_root), 700, false);
     return true;
+}
+
+void PanoramaFontAtlas::clear()
+{
+    const float ui_scale = impl_->ui_scale;
+    impl_ = std::make_unique<Impl>();
+    impl_->ui_scale = ui_scale;
 }
 
 bool PanoramaFontAtlas::loaded() const

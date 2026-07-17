@@ -221,7 +221,7 @@ public:
 void panorama_add_node_lifetime_observer(PanoramaNodeLifetimeObserver& observer);
 void panorama_remove_node_lifetime_observer(PanoramaNodeLifetimeObserver& observer);
 
-// Tree guard (diagnostic, OPENSTRIKE_PANORAMA_TREEGUARD=1) --------------------
+// Tree guard (diagnostic, PanoramaDiagnostics::tree_guard) --------------------
 //
 // Hunts use-after-free tree corruption: every node carries a liveness canary
 // that ~PanoramaNode flips, and scan_dead_links walks a document's children
