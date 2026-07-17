@@ -7,8 +7,8 @@ compiles and runs. The fourth puts the same CPU rasterizer behind a real
 native window. All of them link only `PanoramaEngine` and its vendored
 `Thirdparty/` dependencies. See [../docs/building.md](../docs/building.md)
 for build-system-agnostic requirements and
-[../docs/integration.md](../docs/integration.md) for what a production host
-does beyond what these examples show.
+[../docs/integration.md](../docs/integration.md) for production integration
+details beyond what these examples show.
 
 ## Building and running
 
@@ -72,13 +72,13 @@ sidebar of rounded tiles (one accented), and a card with a soft drop shadow.
 
 ## 03_scripted_ui
 
-The full headless per-frame loop a host runs: `PanoramaRuntime` (QuickJS with
-`$`/`Panel` bound to the live tree) plus `PanoramaInputController` driving
-synthetic pointer presses/releases at the `#Toggle` button's laid-out
-coordinates. The document's own `app.js` updates `#Status` and flips a class
-on each click; `runtime.consume_dirty()` and a recompute/relayout follow each
-input step, exactly as [docs/integration.md](../docs/integration.md#4-per-frame-loop)
-describes.
+The recommended standalone path: `PanoramaView` owns the document, QuickJS
+runtime, input controller, cascade/layout sequencing, animation pump, and draw
+list. Synthetic pointer presses/releases target the laid-out `#Toggle` button.
+The document's own `app.js` updates `#Status` and flips a class on each click;
+one `view.update()` call performs the required dirty recompute and relayout. The
+first click also loads a scripted child layout, proving the view's built-in
+runtime sublayout and context-panel bridge.
 
 ```
 $ ./PanoramaExampleScriptedUi
@@ -97,8 +97,8 @@ after click 2:
 ```
 
 `[panorama] ...` lines come from the engine's own logger
-(`panorama_log.hpp`) and from `$.Msg` inside `app.js` — a host redirects both
-by installing its own log sink instead of the default stderr one.
+(`panorama_log.hpp`) and from `$.Msg` inside `app.js`. Applications can redirect
+both by installing a log sink instead of using the default stderr sink.
 
 ## 04_window_raster
 
@@ -110,9 +110,9 @@ atlas quads from `PanoramaFontAtlas` rasterize too, not just untextured
 panels); `win32_main.cpp` blits the resulting framebuffer with GDI's
 `StretchDIBits`, `posix_main.cpp` does the same over Xlib with `XPutImage`.
 Only one of the two compiles into the binary per platform (Windows gets
-`win32_main.cpp`, Linux/macOS get `posix_main.cpp`), matching the "host
-brings its own windowing" split described in
-[../docs/integration.md](../docs/integration.md#what-stays-host-specific).
+`win32_main.cpp`, Linux/macOS get `posix_main.cpp`), matching the platform
+windowing boundary described in
+[../docs/integration.md](../docs/integration.md#application-defined-services).
 
 Unlike 01-03, this example loads its layout from a real file on disk via
 `PanoramaDirectoryResourceProvider` instead of an in-memory string — pass a

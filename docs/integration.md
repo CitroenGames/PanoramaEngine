@@ -1,8 +1,45 @@
 # Integration Guide
 
-This expands the README's [Minimal Host Loop](../README.md#minimal-host-loop)
-into the responsibilities a production host actually has, in the order they
-show up in a real per-frame loop.
+This expands the README's [recommended integration](../README.md#recommended-integration)
+and [low-level integration](../README.md#low-level-integration) into a complete
+application setup.
+
+## Recommended: `PanoramaView`
+
+New integrations should normally use `PanoramaView`. It owns a
+`PanoramaDocumentSession`, `PanoramaRuntime`, `PanoramaInputController`, paint
+scratch storage, and the current `PanoramaDrawList`, and it applies the frame
+ordering described below internally.
+
+```cpp
+PanoramaView view;
+view.set_viewport(width, height);
+view.resources().add_provider(
+    std::make_unique<PanoramaDirectoryResourceProvider>(resource_root));
+
+if (!view.load("panorama/layout/app.xml"))
+    return false;
+
+// Every frame:
+view.update_pointer(mouse_x, mouse_y, mouse_down);
+view.update_wheel(mouse_x, mouse_y, wheel_y);
+PanoramaViewUpdateResult changed = view.update(dt_seconds);
+if (changed.visual_changed || redraw_requested)
+    renderer.render(view.draw_list());
+```
+
+The view automatically gives each script its layout-file context panel, wires
+runtime `BLoadLayout`/snippet requests back into the document session, routes
+script focus through its input controller, forwards transition-end events, and
+honors native `PanoramaNode::mark_style_dirty()` propagation. Configure
+`view.runtime()` before `load()` for bootstrap scripts or native actions.
+After setting the active render backend, bind a loaded `PanoramaFontAtlas` with
+`view.set_font_atlas(&atlas)` to have the view perform glyph discovery/upload
+before paint, or supply matching custom text measurement and glyph callbacks with
+`set_text_measure()`/`set_glyph_source()`.
+
+The remainder of this guide documents the lower-level components for custom
+scheduling, partial-cascade threading, or direct geometry-cache submission.
 
 ## 1. Resources
 
@@ -11,19 +48,19 @@ and register it on a `PanoramaResourceManager` (owned by a
 `PanoramaDocumentSession`, or standalone). Three providers ship out of the box:
 
 - `PanoramaMemoryResourceProvider` — in-memory `path -> bytes` map. Useful for
-  tests, for HUD overlays a host authors as C++ string literals instead of
+  tests, for UI authored as C++ string literals instead of
   loading from disk, or as a virtual-path override layer.
 - `PanoramaDirectoryResourceProvider` — reads from a real directory.
 - `PanoramaPackageResourceProvider` — reads from a parsed `.pbin` package.
 
 Providers are checked in ascending `priority` order — the lowest value goes
 first and `read()` returns on the first provider that has the path, so a
-host registers an override layer at a *lower* priority than what it should
-take precedence over (e.g. an in-memory override at priority `-1` in front
-of the real package at the default priority `0`). Ties break by insertion
-order (`add_provider(provider, priority, identifier)`). Only `read()` is
-required; `resolve_file()` (default: unsupported) lets a provider expose a
-real filesystem path when a consumer needs one (e.g. handing a path to a
+application registers an override layer at a *lower* priority than what it
+should take precedence over (e.g. an in-memory override at priority `-1` in
+front of the real package at the default priority `0`). Ties break by
+insertion order (`add_provider(provider, priority, identifier)`). Only `read()`
+is required; `resolve_file()` (default: unsupported) lets a provider expose a
+real filesystem path when the application needs one (e.g. handing a path to a
 system font loader).
 
 ## 2. Loading a document
@@ -41,7 +78,7 @@ definitions for later instantiation.
 If the document has `<scripts>`, boot a `PanoramaRuntime` against the loaded
 root (`initialize` / `initialize_with_script_contexts`, the latter needed when
 sublayouts each need their own `$.GetContextPanel()`). Before calling
-`initialize`, wire the hooks a real host needs:
+`initialize`, wire the hooks the application needs:
 
 - `set_host_action_handler` — routes JS-triggered engine actions (a real
   Panorama script calling into `GameInterfaceAPI`/`LobbyAPI`-style stubs) back
@@ -59,12 +96,10 @@ recompute the cascade after mutating).
 ## 4. Per-frame loop
 
 The shape below is the same one in the README, annotated with why each step
-exists and what marks the tree dirty for the next one. A production host
-tracks the dirty flags themselves (`style dirty`, `layout dirty`, `visual
-dirty`) rather than unconditionally recomputing every stage every frame —
-none of the engine's own state does this bookkeeping for you, because the
-right granularity is host-specific (how you detect "the pointer moved enough
-to matter", how you batch multiple mutations before recomputing, etc).
+exists and what marks the tree dirty for the next one. A custom coordinator
+tracks its own dirty flags (`style dirty`, `layout dirty`, `visual dirty`)
+rather than unconditionally recomputing every stage every frame. This lets the
+application choose how to batch native DOM mutations and input updates.
 
 1. **Input.** `PanoramaInputController::update_pointer`/`update_wheel`
    hit-test the *previous* frame's laid-out tree (one-frame latency, not
@@ -79,12 +114,10 @@ to matter", how you batch multiple mutations before recomputing, etc).
    which nodes changed, so a script-dirty frame should recompute the whole
    cascade, not just an invalidated subset.
 3. **Cascade.** `PanoramaStyleSheet::compute()` (full) — a partial
-   `compute_invalidated()` exists for hosts that track exactly which nodes
-   changed outside the cascade (see the CPUMT-35-style comments in
-   OpenStrike's own `PanoramaNativeView` for the invariant that makes it
-   safe: every touched-or-created node must have called
-   `PanoramaNode::mark_style_dirty()` itself, or the invalidated recompute
-   will silently miss it).
+   `compute_invalidated()` exists for integrations that track exactly which
+   nodes changed outside the cascade. It is safe only when every touched or
+   created node calls `PanoramaNode::mark_style_dirty()`; otherwise the partial
+   recompute can miss a change.
 4. **Animation advance.** `panorama_advance_anim` (transitions),
    `panorama_advance_keyframes` (needs `sheet.keyframes()`), and
    `panorama_advance_scroll_animations` each return a
@@ -156,21 +189,20 @@ header-only implementations of this interface
 (`panorama_d3d12_backend.hpp`, `panorama_vulkan_backend.hpp`) that already
 handle textures, per-blend-mode pipelines, scissor, and the geometry
 compile/render/release path. They are opt-in and SDK-linked (not part of the
-library, which stays graphics-API-free); a host injects its device/queue and
-hands the adapter the command list it records each frame. See
+library, which stays graphics-API-free); the application injects its
+device/queue and hands the adapter the command list it records each frame. See
 [../adapters/README.md](../adapters/README.md) for the per-frame usage and
 limits (notably: backdrop blur is left unimplemented).
 
-## What stays host-specific
+## Application-defined services
 
 PanoramaEngine deliberately does not include: a windowing/input backend (SDL,
-Win32, etc. — a host polls its own input and calls
+Win32, etc. — the application polls input and calls
 `PanoramaInputController`), a thread pool (cascade forking across worker
-threads, if you want it for large trees, is host-owned — see the `CPUMT-49`
-comments in OpenStrike's `PanoramaNativeView::compute_full_cascade_forked()`
-for a worked example of the split points `PanoramaStyleSheet` exposes for
-exactly this), a virtual filesystem/VPK reader, or any specific texture
-decode format beyond what a `PanoramaResourceProvider` + your
+threads can use the split points exposed by
+`PanoramaStyleSheet::compute_root_style()` and `compute_forked_subtree()`), a
+virtual filesystem/VPK reader, or any specific texture decode format beyond
+what a `PanoramaResourceProvider` and
 `PanoramaRenderBackend::generate_texture` choose to support. These are
-intentionally left to the host because they are exactly the pieces that
-differ most between engines.
+intentionally external because they differ most between applications and
+platforms.

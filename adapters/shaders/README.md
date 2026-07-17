@@ -1,8 +1,9 @@
 # Vulkan adapter shaders
 
 The Vulkan adapter (`../panorama_vulkan_backend.hpp`) embeds precompiled SPIR-V so
-it needs no offline shader build step at host build time. This directory holds
-the GLSL sources and the generated SPIR-V that the header `#include`s.
+it needs no offline shader build step when PanoramaEngine is consumed. This
+directory holds the GLSL sources and the generated SPIR-V that the header
+`#include`s.
 
 | File | Purpose |
 | --- | --- |

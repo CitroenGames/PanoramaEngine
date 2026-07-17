@@ -7,11 +7,11 @@ These are **optional and opt-in**. The PanoramaEngine library itself has no
 graphics-API dependency — it produces a renderer-agnostic `PanoramaDrawList` and
 never talks to a GPU (see [../docs/architecture.md](../docs/architecture.md)).
 These adapters therefore live **outside** the `PanoramaEngine` library target and
-are **not compiled into it**. A host that wants one `#include`s the single header
-and links the graphics SDK itself; a host that does not simply never includes it
-and pays nothing (no extra link dependencies, no SDK requirement).
+are **not compiled into it**. Include the selected adapter header and link its
+graphics SDK when needed; otherwise there are no extra link dependencies or SDK
+requirements.
 
-| Header | API | Host links |
+| Header | API | Required links |
 | --- | --- | --- |
 | `panorama_d3d12_backend.hpp` | Direct3D 12 (Windows) | `d3d12.lib`, `d3dcompiler.lib` (declared via `#pragma comment`) |
 | `panorama_vulkan_backend.hpp` | Vulkan 1.0+ | the Vulkan loader (`vulkan-1`) |
@@ -21,7 +21,7 @@ namespace. They are deliberately "basic generic": each owns exactly what it need
 to turn a `PanoramaDrawList` into GPU draw calls — shaders, one pipeline/PSO per
 blend mode, a texture path, per-command vertex/index buffers, an SRV heap
 (D3D12) / descriptor pools (Vulkan), scissor, and blend — and nothing about
-windowing, swapchain, or the frame loop, which the host already owns.
+windowing, swapchain, or the frame loop, which remain application-level concerns.
 
 ## The contract each adapter fills
 
@@ -41,11 +41,11 @@ windowing, swapchain, or the frame loop, which the host already owns.
 `texture == 0` on a draw command means an untextured solid fill; both adapters
 bind an internal 1×1 white texture for it, as the contract specifies.
 
-## Host responsibilities
+## Application responsibilities
 
-The host owns the device, queue, swapchain, and render target; it **injects**
-them once and hands the adapter the command list/buffer it is recording each
-frame:
+The application owns the device, queue, swapchain, and render target. It
+**injects** them once and hands the adapter the command list/buffer being
+recorded each frame:
 
 1. Construct the backend with an init struct (device + present queue + target
    format).
@@ -82,7 +82,7 @@ exact init-struct fields.
 - These are starting points, not tuned production renderers: uploads and buffers
   favor simplicity (UPLOAD-heap buffers on D3D12, staging-per-upload on Vulkan)
   over throughput. They are correct and complete for driving Panorama UI; profile
-  and specialize if a host needs more.
+  and specialize when an application needs more.
 
 ## Regenerating the Vulkan shaders
 

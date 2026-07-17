@@ -1,7 +1,7 @@
 # PanoramaEngine Documentation
 
-This folder holds practical notes for embedding and maintaining
-PanoramaEngine.
+This folder holds the build, integration, architecture, and feature reference
+for PanoramaEngine.
 
 ## Guides
 
@@ -16,11 +16,11 @@ PanoramaEngine.
 
 ## Best Starting Points
 
-Read these in order when embedding the library in a new host:
+Read these in order when integrating the library into an application:
 
 1. [Building](building.md)
 2. [Integration](integration.md)
 3. [Panorama Support](panorama-support.md)
 
-Read [Architecture](architecture.md) when changing internals or moving code
-between this repository and a host.
+Read [Architecture](architecture.md) when changing library internals or adding
+extension points.

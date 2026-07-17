@@ -10,7 +10,7 @@ first for the high-level summary; this file is the more detailed reference.
 - XML documents with `<styles>` (recursive includes), `<scripts>`, `<Frame
   src>` (recursively resolved into one styled tree), and `<snippets>`
   (name -> subtree, instantiated later via `BLoadLayoutSnippet`/
-  `BCreateChildren` or the host's own `instantiate_snippet`).
+  `BCreateChildren` or a native `instantiate_snippet` callback).
 - Comments, CDATA, processing instructions, entities, self-closing tags.
 - Node lifetime observers so long-lived state elsewhere (script contexts,
   input hover/focus, scoped watches over a set of nodes across a handler that
@@ -82,8 +82,8 @@ radio-group exclusivity, dropdown open/select/dismiss, slider drag, and
 scrollbar thumb interaction. Keyboard focus navigation (Tab), text-entry
 caret/selection editing (`panorama_text_edit.hpp`), and IME composed-text
 insertion are supported; the engine does not poll a platform input API
-itself — a host translates its own SDL/Win32/etc. events into calls on the
-controller.
+itself — applications translate SDL, Win32, or other platform events into
+controller calls.
 
 ## Rendering
 
@@ -91,7 +91,7 @@ See [integration.md](integration.md#renderer-responsibilities-recap) for the
 `PanoramaRenderBackend` contract and [architecture.md](architecture.md) for
 where paint and geometry submission sit in the pipeline.
 `PanoramaGeometryCache` (`panorama_geometry_cache.hpp`) is the reference
-incremental-submission implementation; a host does not have to use it, but
+incremental-submission implementation; using it is optional, but
 writing a correct alternative from scratch is nontrivial (see that header's
 own documentation for why).
 
@@ -99,7 +99,7 @@ own documentation for why).
 
 `panorama_converter.hpp` (`convert_panorama_document()`, `convert_panorama_css()`)
 is a separate, best-effort source-to-source converter from Panorama XML/CSS to
-RmlUi's RML/RCSS markup, for hosts that want to render Panorama-authored UI
+RmlUi's RML/RCSS markup for rendering Panorama-authored UI
 through RmlUi's own layout and renderer instead of this engine's native
 pipeline (everything else on this page). It does not sit in the pipeline
 described above and nothing else in the engine depends on it.
@@ -111,8 +111,8 @@ Panorama-only sizing primitives (`fit-children`, `fill-parent-flow`,
 `width-percentage`/`height-percentage`), gradients, `blur`, transforms,
 unresolved `@define`/theme-variable values, and `@keyframes`/`@media` blocks.
 `<scripts>` includes are collected in the result but never translated —
-Panorama JavaScript has no RmlUi equivalent, so a host decides separately
-whether to run them (e.g. against this engine's own `PanoramaRuntime`
+Panorama JavaScript has no RmlUi equivalent, so the application decides
+separately whether to run them (e.g. against this engine's own `PanoramaRuntime`
 alongside the RmlUi-rendered visuals). Expect a reasonable RmlUi rendering of
 the document's structure and styling, not pixel parity with the native
 pipeline.
@@ -122,7 +122,7 @@ pipeline.
 - `.pbin` package reading expects Valve-style stored (uncompressed) zip
   entries with no zip data descriptors — real CS:GO packages satisfy this;
   an arbitrarily-produced zip might not.
-- Text wrapping uses the in-repo WebCore-style ASCII break-opportunity
+- Text wrapping uses the built-in WebCore-style ASCII break-opportunity
   finder. There is no ICU, CJK line breaking, hyphenation, or
   break-anywhere fallback.
 - `box-shadow` falloff is linear, not Gaussian, and ignores `border-radius`
@@ -139,9 +139,8 @@ pipeline.
   in `blur_region`.
 - DOM, runtime, input controller, and node lifetime observer state are
   single-threaded. Cascade computation itself can be forked across worker
-  threads by a host (see `PanoramaStyleSheet::compute_root_style`/
-  `compute_forked_subtree`, the split points used by OpenStrike's own
-  `compute_full_cascade_forked`), but that forking is host-owned — the
-  engine has no thread pool dependency of its own.
-- Unit tests currently live in the host repository's test runner
-  (`OpenStrikeTests.exe --panorama`), not inside this directory.
+  threads through `PanoramaStyleSheet::compute_root_style()` and
+  `compute_forked_subtree()`, but PanoramaEngine intentionally has no thread
+  pool dependency.
+- The CMake build registers a headless scripted `PanoramaView` lifecycle smoke
+  test.
