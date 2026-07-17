@@ -102,13 +102,14 @@ both by installing a log sink instead of using the default stderr sink.
 
 ## 04_window_raster
 
-The same load/cascade/layout/paint pipeline as 02, but blitted into a real
-native window instead of a `.bmp`: `raster_view.hpp` holds the shared
-document-loading, layout, and CPU-rasterization code (including a minimal
-`PanoramaRenderBackend` that stores textures as plain CPU buffers, so glyph
-atlas quads from `PanoramaFontAtlas` rasterize too, not just untextured
-panels); `win32_main.cpp` blits the resulting framebuffer with GDI's
-`StretchDIBits`, `posix_main.cpp` does the same over Xlib with `XPutImage`.
+The same renderer-independent paint output as 02, but driven by the recommended
+`PanoramaView` lifecycle and blitted into a real native window instead of a
+`.bmp`. `raster_view.hpp` holds the shared view, texture store, and optimized
+CPU rasterizer (incremental edge/attribute stepping, opaque writes, scissor
+clipping, and reusable frame storage), so glyph atlas quads from
+`PanoramaFontAtlas` rasterize too, not just untextured panels. `win32_main.cpp`
+uses GDI's 1:1 `SetDIBitsToDevice`; `posix_main.cpp` uses `XPutImage` with a
+reused `XImage` and native pixel buffer.
 Only one of the two compiles into the binary per platform (Windows gets
 `win32_main.cpp`, Linux/macOS get `posix_main.cpp`), matching the platform
 windowing boundary described in
@@ -123,8 +124,20 @@ path as the first argument, or run with none to load the bundled
 $ ./PanoramaExampleWindowRaster [layout.xml]
 ```
 
-Resizing the window re-runs layout and re-rasterizes at the new size.
-Press Escape or close the window to exit.
+Both hosts wake at roughly 60 Hz with real elapsed time so CSS transitions,
+smooth scrolling, and `$.Schedule` callbacks progress even when no input event
+arrives. `PanoramaView` dirty tracking prevents unchanged ticks from rebuilding
+the draw list, clearing/rasterizing the framebuffer, repacking native pixels, or
+presenting. Resizes and visual changes still redraw immediately. Press Escape or
+close the window to exit.
+
+The same executable also has a headless raster benchmark. It loads the layout,
+builds the draw list once, then measures 120 clear-and-raster passes without
+opening Win32 or X11:
+
+```
+$ ./PanoramaExampleWindowRaster --benchmark [layout.xml]
+```
 
 Text needs an actual font file on disk, which the engine itself
 intentionally does not vendor (see

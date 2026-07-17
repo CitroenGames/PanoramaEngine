@@ -3,24 +3,31 @@
 // Loads a Panorama layout from an XML file on disk, lays it out, rasterizes
 // it on the CPU (raster_view.hpp, the same rasterizer as
 // examples/02_software_raster), and blits the result into an X11 window with
-// XPutImage. Feeds mouse, keyboard, and text input to the engine's
-// PanoramaInputController and boots the PanoramaRuntime (QuickJS) so buttons,
-// text entries, and sliders are fully interactive. See win32_main.cpp for the
-// Windows equivalent -- both share raster_view.hpp and differ only in how they
-// open a window, gather input, and get pixels on screen.
+// XPutImage. Feeds mouse, keyboard, and text input to PanoramaView, whose
+// dirty-stage tracking keeps idle frame ticks cheap while QuickJS timers and
+// animations continue to advance. See win32_main.cpp for the Windows equivalent.
 #include "raster_view.hpp"
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 
+#include <poll.h>
+
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
-#include <cstring>
 #include <filesystem>
 #include <vector>
 
 namespace
 {
+constexpr int kInitialWidth = 960;
+constexpr int kInitialHeight = 540;
+constexpr int kFrameIntervalMilliseconds = 16;
+constexpr std::size_t kBenchmarkFrames = 120;
+using FrameClock = std::chrono::steady_clock;
+
 // Packs the engine's straight R,G,B,A framebuffer into whatever channel
 // order the X server's default visual actually wants, derived from its own
 // red/green/blue masks rather than assumed -- almost always B,G,R on a
@@ -59,7 +66,8 @@ private:
     int blue_shift_;
 };
 
-void pack_framebuffer(const panorama_example::Framebuffer& fb, const PixelPacker& packer, std::vector<std::uint32_t>& out)
+void pack_framebuffer(
+    const panorama_example::Framebuffer& fb, const PixelPacker& packer, std::vector<std::uint32_t>& out)
 {
     const std::size_t pixel_count = static_cast<std::size_t>(fb.width) * static_cast<std::size_t>(fb.height);
     out.resize(pixel_count);
@@ -90,49 +98,110 @@ panorama::PanoramaKey keysym_to_panorama_key(KeySym keysym)
     }
 }
 
-// Blit the document's framebuffer to the X11 window.
-void blit(Display* display, Window window, GC gc, int width, int height,
-          const panorama_example::RasterDocument& document, const PixelPacker& packer,
-          std::vector<std::uint32_t>& packed)
+// Reuses one XImage and native-format pixel buffer until the window changes
+// size. XCreateImage/XDestroyImage allocation is kept out of the frame path.
+class X11Surface
 {
-    pack_framebuffer(document.framebuffer(), packer, packed);
-
-    Visual* visual = DefaultVisual(display, DefaultScreen(display));
-    const int depth = DefaultDepth(display, DefaultScreen(display));
-
-    XImage* image = XCreateImage(
-        display, visual, static_cast<unsigned int>(depth), ZPixmap, 0,
-        reinterpret_cast<char*>(packed.data()),
-        static_cast<unsigned int>(width), static_cast<unsigned int>(height),
-        32, 0);
-    if (image == nullptr)
+public:
+    X11Surface(Display* display, Visual* visual, int depth)
+        : display_(display)
+        , visual_(visual)
+        , depth_(depth)
     {
-        return;
     }
-    XPutImage(
-        display, window, gc, image, 0, 0, 0, 0,
-        static_cast<unsigned int>(width), static_cast<unsigned int>(height));
-    image->data = nullptr; // `packed` owns the pixel storage; don't let XDestroyImage free() it
-    XDestroyImage(image);
-}
+
+    ~X11Surface() { reset(); }
+
+    bool update(const panorama_example::Framebuffer& framebuffer, const PixelPacker& packer)
+    {
+        if (!resize(framebuffer.width, framebuffer.height))
+        {
+            return false;
+        }
+        pack_framebuffer(framebuffer, packer, pixels_);
+        return true;
+    }
+
+    void blit(Window window, GC gc) const
+    {
+        if (image_ != nullptr)
+        {
+            XPutImage(
+                display_, window, gc, image_, 0, 0, 0, 0,
+                static_cast<unsigned int>(width_), static_cast<unsigned int>(height_));
+        }
+    }
+
+private:
+    bool resize(int width, int height)
+    {
+        if (image_ != nullptr && width_ == width && height_ == height)
+        {
+            return true;
+        }
+
+        reset();
+        width_ = std::max(width, 1);
+        height_ = std::max(height, 1);
+        pixels_.resize(static_cast<std::size_t>(width_) * static_cast<std::size_t>(height_));
+        image_ = XCreateImage(
+            display_, visual_, static_cast<unsigned int>(depth_), ZPixmap, 0,
+            reinterpret_cast<char*>(pixels_.data()),
+            static_cast<unsigned int>(width_), static_cast<unsigned int>(height_),
+            32, 0);
+        return image_ != nullptr;
+    }
+
+    void reset()
+    {
+        if (image_ != nullptr)
+        {
+            image_->data = nullptr; // pixels_ owns the storage
+            XDestroyImage(image_);
+            image_ = nullptr;
+        }
+    }
+
+    Display* display_;
+    Visual* visual_;
+    int depth_;
+    int width_ = 0;
+    int height_ = 0;
+    std::vector<std::uint32_t> pixels_;
+    XImage* image_ = nullptr;
+};
 }
 
 int main(int argc, char** argv)
 {
-    const std::filesystem::path xml_path = argc > 1
-        ? std::filesystem::path(argv[1])
+    const bool benchmark = argc > 1 && std::string_view(argv[1]) == "--benchmark";
+    const int path_argument = benchmark ? 2 : 1;
+    const std::filesystem::path xml_path = argc > path_argument
+        ? std::filesystem::path(argv[path_argument])
         : std::filesystem::path("../../../examples/04_window_raster/sample/raster.xml");
 
-    if (argc <= 1)
+    if (argc <= path_argument)
     {
-        std::printf("usage: %s <layout.xml>  (no path given, trying %s)\n", argv[0], xml_path.c_str());
+        std::printf(
+            "usage: %s [--benchmark] [layout.xml]  (no path given, trying %s)\n", argv[0], xml_path.c_str());
     }
 
     panorama_example::RasterDocument document;
-    if (!document.load(xml_path))
+    if (!document.load(xml_path, kInitialWidth, kInitialHeight))
     {
         std::fprintf(stderr, "failed to load %s\n", xml_path.c_str());
         return 1;
+    }
+    if (benchmark)
+    {
+        const panorama_example::RasterBenchmarkResult result = document.benchmark_rasterizer(kBenchmarkFrames);
+        std::printf(
+            "CPU raster: %zu frames in %.2f ms, %.3f ms/frame, %.2f MP/s\n",
+            result.frames,
+            result.total_milliseconds,
+            result.average_milliseconds,
+            result.megapixels_per_second);
+        return 0;
     }
 
     Display* display = XOpenDisplay(nullptr);
@@ -152,8 +221,8 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    int width = 960;
-    int height = 540;
+    int width = kInitialWidth;
+    int height = kInitialHeight;
     Window window = XCreateSimpleWindow(
         display, RootWindow(display, screen),
         0, 0, static_cast<unsigned int>(width), static_cast<unsigned int>(height),
@@ -168,176 +237,178 @@ int main(int argc, char** argv)
     XMapWindow(display, window);
 
     const PixelPacker packer(visual);
-    std::vector<std::uint32_t> packed;
+    X11Surface surface(display, visual, depth);
     GC gc = DefaultGC(display, screen);
 
     // Track pointer state across events.
     float mouse_x = 0.0F;
     float mouse_y = 0.0F;
     bool mouse_down = false;
-    bool needs_refresh = false;
-
-    // Helper: run a full update_frame + blit.
-    auto refresh = [&]() {
-        document.update_frame(
-            width, height,
-            mouse_x, mouse_y,
-            mouse_down, 0.0F,
-            nullptr, nullptr);
-        blit(display, window, gc, width, height, document, packer, packed);
-    };
-
-    // Initial layout + rasterize before the runtime exists.
-    document.layout_and_rasterize(width, height);
-    blit(display, window, gc, width, height, document, packer, packed);
-
-    // Boot the JS runtime.
-    if (!document.init_runtime())
+    if (!surface.update(document.framebuffer(), packer))
     {
-        std::fprintf(stderr, "failed to init runtime\n");
+        std::fprintf(stderr, "failed to create X11 image surface\n");
         XCloseDisplay(display);
         return 1;
     }
-
-    // Runtime init may have mutated the DOM; re-layout + rasterize.
-    refresh();
+    surface.blit(window, gc);
 
     // X11 text input context for composed text (IME / dead keys).
+    XIM xim = XOpenIM(display, nullptr, nullptr, nullptr);
     XIC xic = nullptr;
+    if (xim != nullptr)
     {
-        XIM xim = XOpenIM(display, nullptr, nullptr, nullptr);
-        if (xim != nullptr)
+        xic = XCreateIC(xim, XNInputStyle, XIMPreeditNothing | XIMStatusNothing,
+                        XNClientWindow, window, nullptr);
+        if (xic != nullptr)
         {
-            xic = XCreateIC(xim, XNInputStyle, XIMPreeditNothing | XIMStatusNothing,
-                            XNClientWindow, window, nullptr);
+            XSetICFocus(xic);
         }
     }
 
     bool running = true;
+    FrameClock::time_point last_update = FrameClock::now();
     while (running)
     {
-        XEvent event;
-        XNextEvent(display, &event);
-
-        switch (event.type)
+        // Wait for native input or the next 60 Hz runtime tick, whichever comes
+        // first. An idle tick advances schedules/animations but normally skips
+        // draw-list rebuild, CPU rasterization, native packing, and XPutImage.
+        if (XPending(display) == 0)
         {
-        case Expose:
-            if (event.xexpose.count == 0)
-            {
-                blit(display, window, gc, width, height, document, packer, packed);
-            }
-            break;
+            pollfd connection{};
+            connection.fd = ConnectionNumber(display);
+            connection.events = POLLIN;
+            (void)poll(&connection, 1, kFrameIntervalMilliseconds);
+        }
 
-        case ConfigureNotify:
-            if (event.xconfigure.width != width || event.xconfigure.height != height)
-            {
-                width = event.xconfigure.width;
-                height = event.xconfigure.height;
-                refresh();
-            }
-            break;
+        bool update_requested = false;
+        bool blit_requested = false;
+        while (running && XPending(display) > 0)
+        {
+            XEvent event;
+            XNextEvent(display, &event);
 
-        case MotionNotify:
-            mouse_x = static_cast<float>(event.xmotion.x);
-            mouse_y = static_cast<float>(event.xmotion.y);
-            refresh();
-            break;
-
-        case ButtonPress:
-            if (event.xbutton.button == Button1)
+            switch (event.type)
             {
-                mouse_down = true;
+            case Expose:
+                blit_requested |= event.xexpose.count == 0;
+                break;
+
+            case ConfigureNotify:
+                if (event.xconfigure.width != width || event.xconfigure.height != height)
+                {
+                    width = event.xconfigure.width;
+                    height = event.xconfigure.height;
+                    update_requested = true;
+                }
+                break;
+
+            case MotionNotify:
+                mouse_x = static_cast<float>(event.xmotion.x);
+                mouse_y = static_cast<float>(event.xmotion.y);
+                update_requested |= document.update_pointer(mouse_x, mouse_y, mouse_down);
+                break;
+
+            case ButtonPress:
                 mouse_x = static_cast<float>(event.xbutton.x);
                 mouse_y = static_cast<float>(event.xbutton.y);
-                refresh();
-            }
-            else if (event.xbutton.button == Button4 || event.xbutton.button == Button5)
-            {
-                // Scroll wheel: Button4 = up, Button5 = down.
-                const float wheel = (event.xbutton.button == Button4) ? 1.0F : -1.0F;
-                mouse_x = static_cast<float>(event.xbutton.x);
-                mouse_y = static_cast<float>(event.xbutton.y);
-                document.update_frame(
-                    width, height,
-                    mouse_x, mouse_y,
-                    mouse_down, wheel,
-                    nullptr, nullptr);
-                blit(display, window, gc, width, height, document, packer, packed);
-            }
-            break;
+                if (event.xbutton.button == Button1)
+                {
+                    mouse_down = true;
+                    (void)document.update_pointer(mouse_x, mouse_y, mouse_down);
+                    update_requested = true;
+                }
+                else if (event.xbutton.button == Button4 || event.xbutton.button == Button5)
+                {
+                    const float wheel = (event.xbutton.button == Button4) ? 1.0F : -1.0F;
+                    (void)document.update_wheel(mouse_x, mouse_y, wheel);
+                    update_requested = true;
+                }
+                break;
 
-        case ButtonRelease:
-            if (event.xbutton.button == Button1)
-            {
-                mouse_down = false;
-                mouse_x = static_cast<float>(event.xbutton.x);
-                mouse_y = static_cast<float>(event.xbutton.y);
-                refresh();
-            }
-            break;
+            case ButtonRelease:
+                if (event.xbutton.button == Button1)
+                {
+                    mouse_down = false;
+                    mouse_x = static_cast<float>(event.xbutton.x);
+                    mouse_y = static_cast<float>(event.xbutton.y);
+                    (void)document.update_pointer(mouse_x, mouse_y, mouse_down);
+                    update_requested = true;
+                }
+                break;
 
-        case KeyPress: {
-            KeySym keysym = XLookupKeysym(&event.xkey, 0);
+            case KeyPress: {
+                KeySym keysym = XLookupKeysym(&event.xkey, 0);
+                if (keysym == XK_Escape)
+                {
+                    running = false;
+                    break;
+                }
 
-            if (keysym == XK_Escape)
-            {
-                running = false;
+                char buf[32] = {};
+                Status status;
+                const int text_length = xic != nullptr
+                    ? Xutf8LookupString(xic, &event.xkey, buf, sizeof(buf) - 1, &keysym, &status)
+                    : 0;
+                if (text_length > 0 && status != XBufferOverflow)
+                {
+                    (void)document.handle_text_input(std::string_view(buf, static_cast<std::size_t>(text_length)));
+                    update_requested = true;
+                }
+                else
+                {
+                    const panorama::PanoramaKey key = keysym_to_panorama_key(keysym);
+                    if (key != panorama::PanoramaKey::Unknown)
+                    {
+                        panorama::PanoramaKeyEvent event_key;
+                        event_key.key = key;
+                        event_key.shift = (event.xkey.state & ShiftMask) != 0;
+                        event_key.ctrl = (event.xkey.state & ControlMask) != 0;
+                        event_key.alt = (event.xkey.state & Mod1Mask) != 0;
+                        (void)document.handle_key_down(event_key);
+                        update_requested = true;
+                    }
+                }
                 break;
             }
 
-            // Try to get composed text from the input context first.
-            char buf[32] = {};
-            Status status;
-            if (xic != nullptr && Xutf8LookupString(xic, &event.xkey, buf, sizeof(buf) - 1, &keysym, &status) > 0)
-            {
-                // Got composed text -- feed it as text input.
-                document.update_frame(
-                    width, height,
-                    mouse_x, mouse_y,
-                    mouse_down, 0.0F,
-                    nullptr,
-                    std::string_view(buf));
-                blit(display, window, gc, width, height, document, packer, packed);
-            }
-            else
-            {
-                // Non-character key: feed as a key-down event.
-                const panorama::PanoramaKey key = keysym_to_panorama_key(keysym);
-                if (key != panorama::PanoramaKey::Unknown)
+            case ClientMessage:
+                if (static_cast<Atom>(event.xclient.data.l[0]) == wm_delete_window)
                 {
-                    panorama::PanoramaKeyEvent event_key;
-                    event_key.key = key;
-                    event_key.shift = (event.xkey.state & ShiftMask) != 0;
-                    event_key.ctrl = (event.xkey.state & ControlMask) != 0;
-                    event_key.alt = (event.xkey.state & Mod1Mask) != 0;
-                    document.update_frame(
-                        width, height,
-                        mouse_x, mouse_y,
-                        mouse_down, 0.0F,
-                        &event_key, nullptr);
-                    blit(display, window, gc, width, height, document, packer, packed);
+                    running = false;
                 }
+                break;
+
+            default:
+                break;
             }
-            break;
         }
 
-        case ClientMessage:
-            if (static_cast<Atom>(event.xclient.data.l[0]) == wm_delete_window)
+        const FrameClock::time_point now = FrameClock::now();
+        const float dt_seconds = std::clamp(
+            std::chrono::duration<float>(now - last_update).count(), 0.0F, 0.1F);
+        if (running && (update_requested || dt_seconds * 1000.0F >= kFrameIntervalMilliseconds))
+        {
+            last_update = now;
+            if (document.update_frame(width, height, dt_seconds))
             {
-                running = false;
+                blit_requested = surface.update(document.framebuffer(), packer);
             }
-            break;
-
-        default:
-            break;
+        }
+        if (running && blit_requested)
+        {
+            surface.blit(window, gc);
         }
     }
 
     if (xic != nullptr)
     {
+        XUnsetICFocus(xic);
         XDestroyIC(xic);
     }
-    document.shutdown_runtime();
+    if (xim != nullptr)
+    {
+        XCloseIM(xim);
+    }
     XCloseDisplay(display);
     return 0;
 }

@@ -106,7 +106,7 @@ looks like — see [../examples/README.md](../examples/README.md#04_window_raste
 | `PanoramaExampleHelloLayout` | In-memory resource provider, document load, cascade, layout, box-tree dump |
 | `PanoramaExampleSoftwareRaster` | Building a `PanoramaDrawList` and replaying it through a tiny CPU rasterizer to a `.bmp` |
 | `PanoramaExampleScriptedUi` | `PanoramaView` high-level lifecycle + synthetic clicks mutating the DOM through QuickJS |
-| `PanoramaExampleWindowRaster` | Same CPU rasterizer as above, live in a Win32/X11 window, loading its layout from a real XML file on disk |
+| `PanoramaExampleWindowRaster` | Dirty-tracked `PanoramaView` updates, an optimized CPU rasterizer, and paced Win32/X11 presentation from XML on disk |
 
 ## Tests
 

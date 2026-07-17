@@ -20,7 +20,7 @@
             </Panel>
             <Panel id="Card" class="card">
                 <Label class="card-title" text="Interactive Controls" />
-                <Label class="card-text" text="This frame was loaded from raster.xml and rasterized entirely on the CPU. The controls below are fully interactive -- hover, click, type, and drag them." />
+                <Label class="card-text" text="This view was loaded from raster.xml and rasterized entirely on the CPU. PanoramaView skips unchanged rendering work while the controls remain live -- hover, click, type, and drag them." />
 
                 <Label class="section-label" text="Button" />
                 <Button id="ClickButton" class="action-button" onactivate="OnButtonClick()">

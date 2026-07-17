@@ -3,20 +3,18 @@
 // Shared by the Win32 (win32_main.cpp) and POSIX/X11 (posix_main.cpp) window
 // hosts: loads a Panorama layout from a real XML file on disk, lays it out,
 // and rasterizes the resulting draw list into an RGBA framebuffer entirely on
-// the CPU. The rasterizer itself is the same ~60-line triangle fill used by
-// examples/02_software_raster, factored out here so both platform mains blit
-// the same framebuffer instead of each hand-rolling their own.
-#include "ui/panorama/panorama_anim.hpp"
-#include "ui/panorama/panorama_document_session.hpp"
+// the CPU. Its triangle fill is the optimized live-window counterpart to
+// examples/02_software_raster, shared so both platform mains blit the same
+// framebuffer instead of each hand-rolling their own.
 #include "ui/panorama/panorama_font_atlas.hpp"
-#include "ui/panorama/panorama_input.hpp"
-#include "ui/panorama/panorama_layout.hpp"
 #include "ui/panorama/panorama_paint.hpp"
 #include "ui/panorama/panorama_render_backend.hpp"
 #include "ui/panorama/panorama_resource_provider.hpp"
-#include "ui/panorama/panorama_runtime.hpp"
+#include "ui/panorama/panorama_view.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -25,6 +23,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace panorama_example
@@ -41,9 +40,13 @@ struct Framebuffer
 
     void resize(int new_width, int new_height)
     {
+        if (width == new_width && height == new_height)
+        {
+            return;
+        }
         width = new_width;
         height = new_height;
-        rgba.assign(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4, 0);
+        rgba.resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
     }
 
     void clear(std::uint8_t r, std::uint8_t g, std::uint8_t b)
@@ -58,18 +61,35 @@ struct Framebuffer
     }
 
     // Straight-alpha source-over blend, matching the draw list's colour space.
-    void blend(int x, int y, float r, float g, float b, float a)
+    void blend_unchecked(int x, int y, float r, float g, float b, float a)
     {
-        if (x < 0 || y < 0 || x >= width || y >= height || a <= 0.0F)
+        if (a <= 0.0F)
         {
             return;
         }
         std::uint8_t* px =
             &rgba[(static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)) * 4];
+        if (a >= 1.0F)
+        {
+            px[0] = to_byte(r);
+            px[1] = to_byte(g);
+            px[2] = to_byte(b);
+            return;
+        }
         const float inv = 1.0F - a;
-        px[0] = static_cast<std::uint8_t>(r * a + static_cast<float>(px[0]) * inv);
-        px[1] = static_cast<std::uint8_t>(g * a + static_cast<float>(px[1]) * inv);
-        px[2] = static_cast<std::uint8_t>(b * a + static_cast<float>(px[2]) * inv);
+        px[0] = to_byte(r * a + static_cast<float>(px[0]) * inv);
+        px[1] = to_byte(g * a + static_cast<float>(px[1]) * inv);
+        px[2] = to_byte(b * a + static_cast<float>(px[2]) * inv);
+    }
+
+private:
+    static std::uint8_t to_byte(float value)
+    {
+        if (value >= 0.0F && value <= 255.0F)
+        {
+            return static_cast<std::uint8_t>(value);
+        }
+        return value < 0.0F ? 0 : 255;
     }
 };
 
@@ -80,6 +100,22 @@ struct CpuTexture
     int width = 0;
     int height = 0;
     std::vector<std::uint8_t> rgba;
+};
+
+struct RasterClip
+{
+    int left = 0;
+    int top = 0;
+    int right = 0;
+    int bottom = 0;
+};
+
+struct RasterBenchmarkResult
+{
+    std::size_t frames = 0;
+    double total_milliseconds = 0.0;
+    double average_milliseconds = 0.0;
+    double megapixels_per_second = 0.0;
 };
 
 // The minimal PanoramaRenderBackend a CPU rasterizer needs: just enough
@@ -141,60 +177,135 @@ inline void rasterize_triangle(
     const panorama::PanoramaPaintVertex& v0,
     const panorama::PanoramaPaintVertex& v1,
     const panorama::PanoramaPaintVertex& v2,
-    const CpuTexture* texture = nullptr)
+    const CpuTexture* texture,
+    const RasterClip& clip)
 {
     const float min_x = std::min({v0.x, v1.x, v2.x});
     const float max_x = std::max({v0.x, v1.x, v2.x});
     const float min_y = std::min({v0.y, v1.y, v2.y});
     const float max_y = std::max({v0.y, v1.y, v2.y});
 
-    const float denom = (v1.y - v2.y) * (v0.x - v2.x) + (v2.x - v1.x) * (v0.y - v2.y);
+    const float w0_dx_numerator = v1.y - v2.y;
+    const float w0_dy_numerator = v2.x - v1.x;
+    const float w1_dx_numerator = v2.y - v0.y;
+    const float w1_dy_numerator = v0.x - v2.x;
+    const float denom = w0_dx_numerator * (v0.x - v2.x) + w0_dy_numerator * (v0.y - v2.y);
     if (denom == 0.0F)
     {
         return; // degenerate
     }
 
-    const int x0 = std::max(0, static_cast<int>(min_x));
-    const int x1 = std::min(fb.width - 1, static_cast<int>(max_x));
-    const int y0 = std::max(0, static_cast<int>(min_y));
-    const int y1 = std::min(fb.height - 1, static_cast<int>(max_y));
+    const int x0 = std::max(clip.left, static_cast<int>(min_x));
+    const int x1 = std::min(clip.right, static_cast<int>(max_x));
+    const int y0 = std::max(clip.top, static_cast<int>(min_y));
+    const int y1 = std::min(clip.bottom, static_cast<int>(max_y));
+    if (x0 > x1 || y0 > y1)
+    {
+        return;
+    }
+
+    // Edge functions are affine, so calculate their per-pixel increments once
+    // instead of doing two barycentric divisions for every covered pixel.
+    const float inv_denom = 1.0F / denom;
+    const float w0_dx = w0_dx_numerator * inv_denom;
+    const float w0_dy = w0_dy_numerator * inv_denom;
+    const float w1_dx = w1_dx_numerator * inv_denom;
+    const float w1_dy = w1_dy_numerator * inv_denom;
+    const float start_px = static_cast<float>(x0) + 0.5F;
+    const float start_py = static_cast<float>(y0) + 0.5F;
+    float row_w0 = (w0_dx_numerator * (start_px - v2.x) + w0_dy_numerator * (start_py - v2.y)) * inv_denom;
+    float row_w1 = (w1_dx_numerator * (start_px - v2.x) + w1_dy_numerator * (start_py - v2.y)) * inv_denom;
+
+    const bool textured = texture != nullptr && texture->width > 0 && texture->height > 0;
+    const float texture_width = textured ? static_cast<float>(texture->width) : 0.0F;
+    const float texture_height = textured ? static_cast<float>(texture->height) : 0.0F;
+    constexpr float kByteToUnit = 1.0F / 255.0F;
+
+    // Interpolated attributes are affine too. Step colour/alpha/UV alongside
+    // the edge functions rather than rebuilding each value from three weighted
+    // vertices for every pixel.
+    const auto attribute_dx = [w0_dx, w1_dx](float a0, float a1, float a2) {
+        return w0_dx * (a0 - a2) + w1_dx * (a1 - a2);
+    };
+    const auto attribute_dy = [w0_dy, w1_dy](float a0, float a1, float a2) {
+        return w0_dy * (a0 - a2) + w1_dy * (a1 - a2);
+    };
+    const auto attribute_start = [row_w0, row_w1](float a0, float a1, float a2) {
+        return a2 + row_w0 * (a0 - a2) + row_w1 * (a1 - a2);
+    };
+
+    const float r_dx = attribute_dx(v0.color.r, v1.color.r, v2.color.r);
+    const float g_dx = attribute_dx(v0.color.g, v1.color.g, v2.color.g);
+    const float b_dx = attribute_dx(v0.color.b, v1.color.b, v2.color.b);
+    const float a_dx = attribute_dx(v0.color.a, v1.color.a, v2.color.a) * kByteToUnit;
+    const float u_dx = attribute_dx(v0.u, v1.u, v2.u);
+    const float v_dx = attribute_dx(v0.v, v1.v, v2.v);
+    const float r_dy = attribute_dy(v0.color.r, v1.color.r, v2.color.r);
+    const float g_dy = attribute_dy(v0.color.g, v1.color.g, v2.color.g);
+    const float b_dy = attribute_dy(v0.color.b, v1.color.b, v2.color.b);
+    const float a_dy = attribute_dy(v0.color.a, v1.color.a, v2.color.a) * kByteToUnit;
+    const float u_dy = attribute_dy(v0.u, v1.u, v2.u);
+    const float v_dy = attribute_dy(v0.v, v1.v, v2.v);
+    float row_r = attribute_start(v0.color.r, v1.color.r, v2.color.r);
+    float row_g = attribute_start(v0.color.g, v1.color.g, v2.color.g);
+    float row_b = attribute_start(v0.color.b, v1.color.b, v2.color.b);
+    float row_a = attribute_start(v0.color.a, v1.color.a, v2.color.a) * kByteToUnit;
+    float row_u = attribute_start(v0.u, v1.u, v2.u);
+    float row_v = attribute_start(v0.v, v1.v, v2.v);
 
     for (int y = y0; y <= y1; ++y)
     {
+        float w0 = row_w0;
+        float w1 = row_w1;
+        float r = row_r;
+        float g = row_g;
+        float b = row_b;
+        float a = row_a;
+        float u = row_u;
+        float v = row_v;
         for (int x = x0; x <= x1; ++x)
         {
-            const float px = static_cast<float>(x) + 0.5F;
-            const float py = static_cast<float>(y) + 0.5F;
-            const float w0 = ((v1.y - v2.y) * (px - v2.x) + (v2.x - v1.x) * (py - v2.y)) / denom;
-            const float w1 = ((v2.y - v0.y) * (px - v2.x) + (v0.x - v2.x) * (py - v2.y)) / denom;
             const float w2 = 1.0F - w0 - w1;
-            if (w0 < 0.0F || w1 < 0.0F || w2 < 0.0F)
+            if (w0 >= 0.0F && w1 >= 0.0F && w2 >= 0.0F)
             {
-                continue;
-            }
-            float r = w0 * v0.color.r + w1 * v1.color.r + w2 * v2.color.r;
-            float g = w0 * v0.color.g + w1 * v1.color.g + w2 * v2.color.g;
-            float b = w0 * v0.color.b + w1 * v1.color.b + w2 * v2.color.b;
-            float a = (w0 * v0.color.a + w1 * v1.color.a + w2 * v2.color.a) / 255.0F;
+                float sample_r = r;
+                float sample_g = g;
+                float sample_b = b;
+                float sample_a = a;
 
-            if (texture != nullptr && texture->width > 0 && texture->height > 0)
-            {
-                const float u = w0 * v0.u + w1 * v1.u + w2 * v2.u;
-                const float v = w0 * v0.v + w1 * v1.v + w2 * v2.v;
-                const int tx = std::clamp(static_cast<int>(u * static_cast<float>(texture->width)), 0, texture->width - 1);
-                const int ty = std::clamp(static_cast<int>(v * static_cast<float>(texture->height)), 0, texture->height - 1);
-                const std::uint8_t* texel =
-                    &texture->rgba[(static_cast<std::size_t>(ty) * static_cast<std::size_t>(texture->width) +
-                                        static_cast<std::size_t>(tx)) *
-                                    4];
-                r *= static_cast<float>(texel[0]) / 255.0F;
-                g *= static_cast<float>(texel[1]) / 255.0F;
-                b *= static_cast<float>(texel[2]) / 255.0F;
-                a *= static_cast<float>(texel[3]) / 255.0F;
-            }
+                if (textured)
+                {
+                    const int tx = std::clamp(static_cast<int>(u * texture_width), 0, texture->width - 1);
+                    const int ty = std::clamp(static_cast<int>(v * texture_height), 0, texture->height - 1);
+                    const std::uint8_t* texel =
+                        &texture->rgba[(static_cast<std::size_t>(ty) * static_cast<std::size_t>(texture->width) +
+                                            static_cast<std::size_t>(tx)) *
+                                        4];
+                    sample_r *= static_cast<float>(texel[0]) * kByteToUnit;
+                    sample_g *= static_cast<float>(texel[1]) * kByteToUnit;
+                    sample_b *= static_cast<float>(texel[2]) * kByteToUnit;
+                    sample_a *= static_cast<float>(texel[3]) * kByteToUnit;
+                }
 
-            fb.blend(x, y, r, g, b, a);
+                fb.blend_unchecked(x, y, sample_r, sample_g, sample_b, sample_a);
+            }
+            w0 += w0_dx;
+            w1 += w1_dx;
+            r += r_dx;
+            g += g_dx;
+            b += b_dx;
+            a += a_dx;
+            u += u_dx;
+            v += v_dx;
         }
+        row_w0 += w0_dy;
+        row_w1 += w1_dy;
+        row_r += r_dy;
+        row_g += g_dy;
+        row_b += b_dy;
+        row_a += a_dy;
+        row_u += u_dy;
+        row_v += v_dy;
     }
 }
 
@@ -208,6 +319,21 @@ inline void rasterize_draw_list(Framebuffer& fb, const panorama::PanoramaDrawLis
 {
     for (const panorama::PanoramaDrawCommand& command : draw_list.commands)
     {
+        RasterClip clip{0, 0, fb.width - 1, fb.height - 1};
+        if (command.scissor)
+        {
+            clip.left = std::max(clip.left, static_cast<int>(std::floor(command.scissor_x)));
+            clip.top = std::max(clip.top, static_cast<int>(std::floor(command.scissor_y)));
+            clip.right = std::min(
+                clip.right, static_cast<int>(std::ceil(command.scissor_x + command.scissor_width)) - 1);
+            clip.bottom = std::min(
+                clip.bottom, static_cast<int>(std::ceil(command.scissor_y + command.scissor_height)) - 1);
+        }
+        if (clip.left > clip.right || clip.top > clip.bottom)
+        {
+            continue;
+        }
+
         const CpuTexture* texture = command.texture != 0 ? textures.find(command.texture) : nullptr;
         for (std::size_t i = 0; i + 2 < command.indices.size(); i += 3)
         {
@@ -216,18 +342,28 @@ inline void rasterize_draw_list(Framebuffer& fb, const panorama::PanoramaDrawLis
                 command.vertices[static_cast<std::size_t>(command.indices[i + 0])],
                 command.vertices[static_cast<std::size_t>(command.indices[i + 1])],
                 command.vertices[static_cast<std::size_t>(command.indices[i + 2])],
-                texture);
+                texture,
+                clip);
         }
     }
 }
 
-// Owns the loaded document and its current CPU-rasterized frame. Both
-// platform mains construct one, call load() once against a file path on
-// startup, then call layout_and_rasterize() once for the initial window size
-// and again whenever the window is resized.
+// Owns the high-level PanoramaView and its current CPU-rasterized frame. The
+// view performs dirty-stage tracking, so a host can pump scripts and animations
+// at a steady cadence without rebuilding or rasterizing an unchanged surface.
 class RasterDocument
 {
 public:
+    ~RasterDocument()
+    {
+        view_.unload();
+        font_atlas_.clear();
+        if (panorama::panorama_render_backend() == &textures_)
+        {
+            panorama::set_panorama_render_backend(nullptr);
+        }
+    }
+
     // Loads `xml_path` off the real filesystem: the session's resource
     // provider is a PanoramaDirectoryResourceProvider rooted at the file's
     // parent directory, so a `<styles><include src="..."/>` in the document
@@ -235,7 +371,7 @@ public:
     // examples/04_window_raster/sample/ for the layout this loads by
     // default). Returns false and logs to stderr if the document fails to
     // load or parses empty.
-    [[nodiscard]] bool load(const std::filesystem::path& xml_path)
+    [[nodiscard]] bool load(const std::filesystem::path& xml_path, int width, int height)
     {
         std::error_code error;
         const std::filesystem::path absolute = std::filesystem::absolute(xml_path, error);
@@ -245,32 +381,25 @@ public:
             return false;
         }
 
+        width = std::max(width, 1);
+        height = std::max(height, 1);
         const std::filesystem::path resource_root = absolute.parent_path();
-        panorama::PanoramaDocumentSessionOptions options;
-        options.resource_root = resource_root;
-        session_.resources().add_provider(std::make_unique<panorama::PanoramaDirectoryResourceProvider>(resource_root));
-
-        if (!session_.load(absolute.filename().string(), options))
-        {
-            std::fprintf(stderr, "failed to load %s\n", absolute.string().c_str());
-            return false;
-        }
 
         // Text rendering needs an actual font file on disk; the engine
         // itself intentionally does not vendor one (see docs/architecture.md's
         // "Text" extension point), but this example bundles Lato (SIL OFL,
         // see sample/resource/ui/fonts/OFL.txt) under
-        // `<resource_root>/resource/ui/fonts/` (matching CS:GO's own content
-        // layout) so it renders real glyphs out of the box. Point --
+        // `<resource_root>/resource/ui/fonts/` so it renders real glyphs out
+        // of the box. Point
         // load() at a resource_root without a font under that path (e.g. a
         // custom layout.xml elsewhere) and it logs a warning instead. Production
         // callers can use PanoramaFontAtlasLoadOptions to name their own font
-        // folders or weighted face files explicitly;
-        // glyph_source()/text_measure() below then degrade to the same
-        // "panels paint, text is skipped" behaviour as
-        // examples/02_software_raster.
+        // folders or weighted face files explicitly. Leaving the view unbound
+        // from an atlas degrades to the same "panels paint, text is skipped"
+        // behaviour as examples/02_software_raster.
         panorama::set_panorama_render_backend(&textures_);
-        if (!font_atlas_.load(resource_root))
+        const bool font_loaded = font_atlas_.load(resource_root);
+        if (!font_loaded)
         {
             std::fprintf(
                 stderr,
@@ -278,167 +407,90 @@ public:
                 (resource_root / "resource/ui/fonts").string().c_str());
         }
 
-        panorama::PanoramaNode& root = *session_.document().root;
-        session_.style_sheet().compute(root);
-        panorama_apply_visibility_overrides(root);
-        panorama_apply_control_presentation(root);
-        return true;
-    }
+        view_.set_viewport(static_cast<float>(width), static_cast<float>(height));
+        view_.set_font_atlas(font_loaded ? &font_atlas_ : nullptr);
+        view_.resources().add_provider(
+            std::make_unique<panorama::PanoramaDirectoryResourceProvider>(resource_root));
 
-    // Boots the Panorama JS runtime against the loaded tree. Call once after
-    // load() and the first layout_and_rasterize(). Returns false if the
-    // QuickJS interpreter could not be created.
-    [[nodiscard]] bool init_runtime()
-    {
-        if (runtime_initialized_)
+        panorama::PanoramaViewLoadOptions options;
+        options.document.resource_root = resource_root;
+        if (!view_.load(absolute.filename().string(), std::move(options)))
         {
-            return true;
-        }
-
-        panorama::PanoramaNode& root = *session_.document().root;
-        if (!runtime_.initialize(root, session_.resources(), session_.document().script_includes))
-        {
-            std::fprintf(stderr, "failed to initialize Panorama JS runtime\n");
+            std::fprintf(stderr, "failed to load %s\n", absolute.string().c_str());
             return false;
         }
 
-        // Script init-time execution may have mutated the DOM.
-        if (runtime_.consume_dirty())
-        {
-            session_.style_sheet().compute(root);
-            panorama_apply_visibility_overrides(root);
-            panorama_apply_control_presentation(root);
-        }
-        panorama_capture_anim_targets(root);
-
-        runtime_initialized_ = true;
+        rasterize(width, height);
         return true;
     }
 
-    // Tears down the JS runtime. Call before destroying RasterDocument.
-    void shutdown_runtime()
+    bool update_pointer(float mouse_x, float mouse_y, bool mouse_down)
     {
-        if (runtime_initialized_)
-        {
-            runtime_.shutdown();
-            runtime_initialized_ = false;
-        }
+        return view_.update_pointer(mouse_x, mouse_y, mouse_down);
     }
 
-    // Re-runs layout at the given viewport size and rasterizes the resulting
-    // draw list into framebuffer(). Cheap enough to call on every resize
-    // event -- this is a CPU rasterizer over one static document, not an
-    // animated per-frame loop, so there is no geometry cache to keep warm.
-    void layout_and_rasterize(int width, int height)
+    bool update_wheel(float mouse_x, float mouse_y, float wheel_ticks_y)
+    {
+        return view_.update_wheel(mouse_x, mouse_y, wheel_ticks_y);
+    }
+
+    bool handle_key_down(const panorama::PanoramaKeyEvent& event) { return view_.handle_key_down(event); }
+
+    bool handle_text_input(std::string_view text) { return view_.handle_text_input(text); }
+
+    // Pump runtime work every host frame, but only rebuild the CPU surface when
+    // PanoramaView reports that style/layout/animation changed the draw list.
+    [[nodiscard]] bool update_frame(int width, int height, float dt_seconds)
     {
         width = std::max(width, 1);
         height = std::max(height, 1);
-
-        panorama::PanoramaNode& root = *session_.document().root;
-        layout_panorama_tree(root, static_cast<float>(width), static_cast<float>(height), font_atlas_.text_measure());
-
-        font_atlas_.ensure_tree_text(root);
-        font_atlas_.upload_if_dirty();
-        const panorama::PanoramaDrawList draw_list = build_panorama_draw_list(root, font_atlas_.glyph_source());
-
-        framebuffer_.resize(width, height);
-        framebuffer_.clear(24, 27, 32);
-        rasterize_draw_list(framebuffer_, draw_list, textures_);
-    }
-
-    // Per-frame update: feeds input, pumps the JS runtime, recomputes styles
-    // when dirty, advances animations, re-layouts, and re-rasterizes. Call
-    // once per frame with the current pointer/keyboard state.
-    void update_frame(
-        int width,
-        int height,
-        float mouse_x,
-        float mouse_y,
-        bool mouse_down,
-        float wheel_ticks_y,
-        const panorama::PanoramaKeyEvent* key_down_event,
-        std::string_view text_input)
-    {
-        width = std::max(width, 1);
-        height = std::max(height, 1);
-
-        panorama::PanoramaNode& root = *session_.document().root;
-        const float design_w = static_cast<float>(width);
-        const float design_h = static_cast<float>(height);
-        bool dirty = false;
-
-        // Input.
-        if (runtime_initialized_)
+        view_.set_viewport(static_cast<float>(width), static_cast<float>(height));
+        const panorama::PanoramaViewUpdateResult result = view_.update(dt_seconds);
+        if (!result.draw_list_rebuilt && framebuffer_.width == width && framebuffer_.height == height)
         {
-            dirty |= input_.update_pointer(root, mouse_x, mouse_y, mouse_down, &runtime_);
-            if (wheel_ticks_y != 0.0F)
-            {
-                dirty |= input_.update_wheel(root, mouse_x, mouse_y, wheel_ticks_y, &runtime_);
-            }
-            if (key_down_event != nullptr)
-            {
-                dirty |= input_.handle_key_down(root, *key_down_event, &runtime_);
-            }
-            if (!text_input.empty())
-            {
-                dirty |= input_.handle_text_input(root, text_input, &runtime_);
-            }
-
-            // Script pump.
-            runtime_.update(1.0 / 60.0);
-            dirty |= runtime_.consume_dirty();
+            return false;
         }
 
-        // Cascade.
-        if (dirty)
-        {
-            session_.style_sheet().compute(root);
-            panorama_apply_visibility_overrides(root);
-            panorama_apply_control_presentation(root);
-            panorama_capture_anim_targets(root);
-        }
-
-        // Animation advance.
-        auto transitions = panorama_advance_anim(root, 1.0f / 60.0f);
-        for (const auto& ended : transitions.transition_ends)
-        {
-            if (ended.node != nullptr && ended.property != nullptr)
-            {
-                runtime_.dispatch_property_transition_end(*ended.node, ended.property);
-            }
-        }
-        auto keyframes = panorama_advance_keyframes(
-            root, session_.style_sheet().keyframes(), 1.0f / 60.0f);
-        auto scrolls = panorama_advance_scroll_animations(root, 1.0f / 60.0f);
-
-        const bool layout_needed =
-            dirty || transitions.layout_changed || keyframes.layout_changed || scrolls.layout_changed;
-
-        // Layout.
-        if (layout_needed)
-        {
-            layout_panorama_tree(root, design_w, design_h, font_atlas_.text_measure());
-        }
-
-        // Text + paint + rasterize.
-        font_atlas_.ensure_tree_text(root);
-        font_atlas_.upload_if_dirty();
-        const panorama::PanoramaDrawList draw_list = build_panorama_draw_list(root, font_atlas_.glyph_source());
-
-        framebuffer_.resize(width, height);
-        framebuffer_.clear(24, 27, 32);
-        rasterize_draw_list(framebuffer_, draw_list, textures_);
+        rasterize(width, height);
+        return true;
     }
 
     [[nodiscard]] const Framebuffer& framebuffer() const noexcept { return framebuffer_; }
 
+    // Headless, deterministic measurement for the example's CPU hot path. It
+    // replays the already-built draw list so results cover clear + raster only,
+    // independent of native window presentation and event-loop timing.
+    [[nodiscard]] RasterBenchmarkResult benchmark_rasterizer(std::size_t frames)
+    {
+        frames = std::max<std::size_t>(frames, 1);
+        const auto start = std::chrono::steady_clock::now();
+        for (std::size_t frame = 0; frame < frames; ++frame)
+        {
+            rasterize(framebuffer_.width, framebuffer_.height);
+        }
+        const auto end = std::chrono::steady_clock::now();
+        const double total_ms = std::chrono::duration<double, std::milli>(end - start).count();
+        const double pixels = static_cast<double>(framebuffer_.width) * static_cast<double>(framebuffer_.height) *
+            static_cast<double>(frames);
+        return RasterBenchmarkResult{
+            frames,
+            total_ms,
+            total_ms / static_cast<double>(frames),
+            total_ms > 0.0 ? pixels / (total_ms * 1000.0) : 0.0,
+        };
+    }
+
 private:
-    panorama::PanoramaDocumentSession session_;
-    panorama::PanoramaFontAtlas font_atlas_;
+    void rasterize(int width, int height)
+    {
+        framebuffer_.resize(width, height);
+        framebuffer_.clear(24, 27, 32);
+        rasterize_draw_list(framebuffer_, view_.draw_list(), textures_);
+    }
+
     CpuTextureStore textures_;
+    panorama::PanoramaFontAtlas font_atlas_;
+    panorama::PanoramaView view_;
     Framebuffer framebuffer_;
-    panorama::PanoramaRuntime runtime_;
-    panorama::PanoramaInputController input_;
-    bool runtime_initialized_ = false;
 };
 }

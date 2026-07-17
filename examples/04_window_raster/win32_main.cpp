@@ -3,16 +3,16 @@
 // Loads a Panorama layout from an XML file on disk, lays it out, rasterizes
 // it on the CPU (raster_view.hpp, the same rasterizer as
 // examples/02_software_raster), and blits the result into a Win32 window
-// with StretchDIBits. Feeds mouse, keyboard, and text input to the engine's
-// PanoramaInputController and boots the PanoramaRuntime (QuickJS) so buttons,
-// text entries, and sliders are fully interactive. See posix_main.cpp for the
-// X11 equivalent -- both share raster_view.hpp and differ only in how they
-// open a window, gather input, and get pixels on screen.
+// with SetDIBitsToDevice. Feeds mouse, keyboard, and text input to PanoramaView,
+// whose dirty-stage tracking keeps idle frame ticks cheap while QuickJS timers
+// and animations continue to advance. See posix_main.cpp for the X11 equivalent.
 #include "raster_view.hpp"
 
 #include <windows.h>
 #include <windowsx.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <vector>
@@ -20,21 +20,29 @@
 namespace
 {
 constexpr wchar_t kWindowClassName[] = L"PanoramaExampleWindowRaster";
+constexpr int kInitialWidth = 960;
+constexpr int kInitialHeight = 540;
+constexpr UINT_PTR kFrameTimerId = 1;
+constexpr UINT kFrameIntervalMilliseconds = 16;
+constexpr std::size_t kBenchmarkFrames = 120;
+using FrameClock = std::chrono::steady_clock;
 
 struct AppState
 {
     panorama_example::RasterDocument document;
-    std::vector<std::uint8_t> bgra; // repacked from document.framebuffer() for StretchDIBits
+    std::vector<std::uint8_t> bgra; // repacked from document.framebuffer() for SetDIBitsToDevice
     int width = 0;
     int height = 0;
     bool mouse_down = false;
+    bool tracking_mouse_leave = false;
     float mouse_x = 0.0F;
     float mouse_y = 0.0F;
+    FrameClock::time_point last_update = FrameClock::now();
 };
 
-// StretchDIBits expects each pixel as B,G,R,X in memory (little-endian
+// SetDIBitsToDevice expects each pixel as B,G,R,X in memory (little-endian
 // 0x00RRGGBB); the engine's draw list -- and our Framebuffer -- use straight
-// R,G,B,A, so swap channels once per resize instead of once per WM_PAINT.
+// R,G,B,A, so swap channels after a changed frame instead of in WM_PAINT.
 void repack_bgra(const panorama_example::Framebuffer& fb, std::vector<std::uint8_t>& out)
 {
     out.resize(fb.rgba.size());
@@ -47,17 +55,19 @@ void repack_bgra(const panorama_example::Framebuffer& fb, std::vector<std::uint8
     }
 }
 
-// Helper: run a full update_frame + repack + invalidate.
-void refresh(HWND hwnd, AppState& state, float wheel = 0.0F,
-             const panorama::PanoramaKeyEvent* key = nullptr, std::string_view text = {})
+// Pump the view with real elapsed time. PanoramaView reports whether its draw
+// list changed; only then do we rasterize, repack, and invalidate the window.
+void refresh(HWND hwnd, AppState& state)
 {
-    state.document.update_frame(
-        state.width, state.height,
-        state.mouse_x, state.mouse_y,
-        state.mouse_down, wheel,
-        key, text);
-    repack_bgra(state.document.framebuffer(), state.bgra);
-    InvalidateRect(hwnd, nullptr, FALSE);
+    const FrameClock::time_point now = FrameClock::now();
+    const float dt_seconds = std::clamp(
+        std::chrono::duration<float>(now - state.last_update).count(), 0.0F, 0.1F);
+    state.last_update = now;
+    if (state.document.update_frame(state.width, state.height, dt_seconds))
+    {
+        repack_bgra(state.document.framebuffer(), state.bgra);
+        InvalidateRect(hwnd, nullptr, FALSE);
+    }
 }
 
 // Map Win32 virtual-key codes to the engine's PanoramaKey enum.
@@ -140,11 +150,11 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             bmi.bmiHeader.biBitCount = 32;
             bmi.bmiHeader.biCompression = BI_RGB;
 
-            StretchDIBits(
+            SetDIBitsToDevice(
                 hdc,
                 0, 0, state->width, state->height,
-                0, 0, state->width, state->height,
-                state->bgra.data(), &bmi, DIB_RGB_COLORS, SRCCOPY);
+                0, 0, 0, state->height,
+                state->bgra.data(), &bmi, DIB_RGB_COLORS);
         }
         EndPaint(hwnd, &ps);
         return 0;
@@ -155,7 +165,18 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
         {
             state->mouse_x = static_cast<float>(GET_X_LPARAM(lparam));
             state->mouse_y = static_cast<float>(GET_Y_LPARAM(lparam));
-            refresh(hwnd, *state);
+            if (!state->tracking_mouse_leave)
+            {
+                TRACKMOUSEEVENT tracking{};
+                tracking.cbSize = sizeof(tracking);
+                tracking.dwFlags = TME_LEAVE;
+                tracking.hwndTrack = hwnd;
+                state->tracking_mouse_leave = TrackMouseEvent(&tracking) != FALSE;
+            }
+            if (state->document.update_pointer(state->mouse_x, state->mouse_y, state->mouse_down))
+            {
+                refresh(hwnd, *state);
+            }
         }
         return 0;
 
@@ -166,6 +187,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             state->mouse_down = true;
             state->mouse_x = static_cast<float>(GET_X_LPARAM(lparam));
             state->mouse_y = static_cast<float>(GET_Y_LPARAM(lparam));
+            (void)state->document.update_pointer(state->mouse_x, state->mouse_y, state->mouse_down);
             refresh(hwnd, *state);
         }
         return 0;
@@ -177,6 +199,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             state->mouse_down = false;
             state->mouse_x = static_cast<float>(GET_X_LPARAM(lparam));
             state->mouse_y = static_cast<float>(GET_Y_LPARAM(lparam));
+            (void)state->document.update_pointer(state->mouse_x, state->mouse_y, state->mouse_down);
             refresh(hwnd, *state);
         }
         return 0;
@@ -194,7 +217,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
 
             const float wheel_ticks =
                 static_cast<float>(GET_WHEEL_DELTA_WPARAM(wparam)) / static_cast<float>(WHEEL_DELTA);
-            refresh(hwnd, *state, wheel_ticks);
+            (void)state->document.update_wheel(state->mouse_x, state->mouse_y, wheel_ticks);
+            refresh(hwnd, *state);
         }
         return 0;
 
@@ -215,7 +239,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
                 event.shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
                 event.ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
                 event.alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
-                refresh(hwnd, *state, 0.0F, &event);
+                (void)state->document.handle_key_down(event);
+                refresh(hwnd, *state);
             }
         }
         return 0;
@@ -235,20 +260,33 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
 
             char utf8[4] = {};
             const int len = wchar_to_utf8(ch, utf8);
-            refresh(hwnd, *state, 0.0F, nullptr, std::string_view(utf8, len));
+            (void)state->document.handle_text_input(std::string_view(utf8, len));
+            refresh(hwnd, *state);
         }
         break;
 
     case WM_MOUSELEAVE:
         if (state != nullptr)
         {
+            state->tracking_mouse_leave = false;
             state->mouse_x = -1.0F;
             state->mouse_y = -1.0F;
+            if (state->document.update_pointer(state->mouse_x, state->mouse_y, state->mouse_down))
+            {
+                refresh(hwnd, *state);
+            }
+        }
+        return 0;
+
+    case WM_TIMER:
+        if (state != nullptr && wparam == kFrameTimerId)
+        {
             refresh(hwnd, *state);
         }
         return 0;
 
     case WM_DESTROY:
+        KillTimer(hwnd, kFrameTimerId);
         PostQuitMessage(0);
         return 0;
 
@@ -261,20 +299,34 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
 
 int main(int argc, char** argv)
 {
-    const std::filesystem::path xml_path = argc > 1
-        ? std::filesystem::path(argv[1])
+    const bool benchmark = argc > 1 && std::string_view(argv[1]) == "--benchmark";
+    const int path_argument = benchmark ? 2 : 1;
+    const std::filesystem::path xml_path = argc > path_argument
+        ? std::filesystem::path(argv[path_argument])
         : std::filesystem::path("../../../examples/04_window_raster/sample/raster.xml");
 
-    if (argc <= 1)
+    if (argc <= path_argument)
     {
-        std::printf("usage: %s <layout.xml>  (no path given, trying %ls)\n", argv[0], xml_path.c_str());
+        std::printf(
+            "usage: %s [--benchmark] [layout.xml]  (no path given, trying %ls)\n", argv[0], xml_path.c_str());
     }
 
     AppState state;
-    if (!state.document.load(xml_path))
+    if (!state.document.load(xml_path, kInitialWidth, kInitialHeight))
     {
         std::fprintf(stderr, "failed to load %ls\n", xml_path.wstring().c_str());
         return 1;
+    }
+    if (benchmark)
+    {
+        const panorama_example::RasterBenchmarkResult result = state.document.benchmark_rasterizer(kBenchmarkFrames);
+        std::printf(
+            "CPU raster: %zu frames in %.2f ms, %.3f ms/frame, %.2f MP/s\n",
+            result.frames,
+            result.total_milliseconds,
+            result.average_milliseconds,
+            result.megapixels_per_second);
+        return 0;
     }
 
     HINSTANCE instance = GetModuleHandleW(nullptr);
@@ -287,9 +339,6 @@ int main(int argc, char** argv)
     window_class.hbrBackground = nullptr; // WM_ERASEBKGND handles this
     window_class.lpszClassName = kWindowClassName;
     RegisterClassExW(&window_class);
-
-    constexpr int kInitialWidth = 960;
-    constexpr int kInitialHeight = 540;
 
     RECT window_rect{0, 0, kInitialWidth, kInitialHeight};
     AdjustWindowRect(&window_rect, WS_OVERLAPPEDWINDOW, FALSE);
@@ -313,27 +362,15 @@ int main(int argc, char** argv)
     state.width = client_rect.right - client_rect.left;
     state.height = client_rect.bottom - client_rect.top;
 
-    // Initial layout + rasterize before the runtime exists.
-    state.document.layout_and_rasterize(state.width, state.height);
+    // load() produced the first frame at the requested initial size. If native
+    // window sizing adjusted the client area, one zero-delta update relayouts it.
+    (void)state.document.update_frame(state.width, state.height, 0.0F);
     repack_bgra(state.document.framebuffer(), state.bgra);
-
-    // Boot the JS runtime against the already-laid-out tree.
-    if (!state.document.init_runtime())
-    {
-        std::fprintf(stderr, "failed to init runtime\n");
-        return 1;
-    }
-
-    // Runtime init may have mutated the DOM; re-layout + rasterize.
-    state.document.update_frame(
-        state.width, state.height,
-        state.mouse_x, state.mouse_y,
-        state.mouse_down, 0.0F,
-        nullptr, nullptr);
-    repack_bgra(state.document.framebuffer(), state.bgra);
+    state.last_update = FrameClock::now();
 
     ShowWindow(hwnd, SW_SHOWDEFAULT);
     UpdateWindow(hwnd);
+    SetTimer(hwnd, kFrameTimerId, kFrameIntervalMilliseconds, nullptr);
 
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0)
@@ -342,6 +379,5 @@ int main(int argc, char** argv)
         DispatchMessageW(&msg);
     }
 
-    state.document.shutdown_runtime();
     return static_cast<int>(msg.wParam);
 }
