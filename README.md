@@ -26,6 +26,9 @@ the vendored `Thirdparty/freetype/` library.
   scheduling, sublayout loading hooks, and a native-action callback.
 - Pointer and wheel input over the laid-out tree, including hover, active,
   focus, activation bubbling, radio groups, dropdowns, sliders, and scrollbars.
+- Keyboard/IME text editing with UTF-8 caret and selection semantics, including
+  host-injected clipboard paste with selection replacement, single-line
+  normalization, and `maxchars` enforcement.
 - CSS transitions, `@keyframes`, smooth scroll animations, and transition-end
   delivery hooks.
 - A FreeType-backed text atlas that supplies matching layout measurements and
@@ -101,6 +104,11 @@ if (!view.load("panorama/layout/mainmenu.xml"))
 {
     return;
 }
+
+// Platform events remain host-owned. Send composed text directly; for a paste
+// shortcut/command, read the platform clipboard and inject its UTF-8 payload.
+view.handle_text_input(composed_utf8);
+view.handle_paste(read_platform_clipboard_utf8());
 
 for (;;)
 {

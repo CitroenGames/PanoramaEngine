@@ -38,6 +38,12 @@ After setting the active render backend, bind a loaded `PanoramaFontAtlas` with
 before paint, or supply matching custom text measurement and glyph callbacks with
 `set_text_measure()`/`set_glyph_source()`.
 
+Keyboard commands and composed text enter through `handle_key_down()` and
+`handle_text_input()`. On the host's paste shortcut or command, read the
+platform clipboard and call `handle_paste(utf8)`. The engine intentionally
+accepts the payload instead of reading a global clipboard API, so the same path
+works with SDL/Win32 and with asynchronous X11/browser clipboard delivery.
+
 For a relocatable standalone application, configure font files explicitly (or
 provide explicit search directories) rather than relying on discovery:
 
@@ -125,7 +131,9 @@ application choose how to batch native DOM mutations and input updates.
    hit-test the *previous* frame's laid-out tree (one-frame latency, not
    perceptible) and update hover/active/focus state, firing
    `onmouseover`/`onmouseout`/`onactivate` and radio-group/dropdown/scrollbar
-   internals. A return of `true` means something changed — style-dirty the
+   internals. Keyboard, composed text, and host-acquired clipboard payloads use
+   `handle_key_down`, `handle_text_input`, and `handle_paste` respectively. A
+   return of `true` means something changed — style-dirty the
    tree.
 2. **Script pump.** `PanoramaRuntime::update(dt)` runs scheduled callbacks and
    the JS microtask queue, then `consume_dirty()` reports whether a script
@@ -218,7 +226,8 @@ limits (notably: backdrop blur is left unimplemented).
 
 PanoramaEngine deliberately does not include: a windowing/input backend (SDL,
 Win32, etc. — the application polls input and calls
-`PanoramaInputController`), a thread pool (cascade forking across worker
+`PanoramaInputController`), a clipboard backend (the application reads text and
+calls `handle_paste`), a thread pool (cascade forking across worker
 threads can use the split points exposed by
 `PanoramaStyleSheet::compute_root_style()` and `compute_forked_subtree()`), a
 virtual filesystem/VPK reader, or any specific texture decode format beyond

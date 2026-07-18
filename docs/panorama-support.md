@@ -85,6 +85,13 @@ insertion are supported; the engine does not poll a platform input API
 itself — applications translate SDL, Win32, or other platform events into
 controller calls.
 
+Clipboard paste enters through `PanoramaInputController::handle_paste`:
+applications acquire the UTF-8 clipboard payload and inject it, after which the
+engine replaces the current selection, normalizes line endings for the
+single-line field, honors `maxchars`, and fires `ontextentrychanged`. Keeping
+clipboard acquisition outside the engine supports synchronous SDL/Win32 hosts
+as well as asynchronous X11 and browser clipboard APIs.
+
 ## Rendering
 
 See [integration.md](integration.md#renderer-responsibilities-recap) for the

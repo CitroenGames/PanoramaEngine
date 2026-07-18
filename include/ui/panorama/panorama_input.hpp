@@ -127,6 +127,14 @@ public:
     // when a field changed.
     bool handle_text_input(PanoramaNode& root, std::string_view utf8, PanoramaRuntime* runtime);
 
+    // Inserts UTF-8 text supplied by the host clipboard into the focused
+    // TextEntry. Paste deliberately takes the clipboard payload instead of
+    // reading a platform API: SDL, Win32, X11, browser, and asynchronous hosts
+    // retain ownership of clipboard access. The edit uses the same single-line,
+    // selection-replacement, maxchars, dirty-state, and ontextentrychanged path
+    // as composed text input. Returns true when the field value changed.
+    bool handle_paste(PanoramaNode& root, std::string_view utf8, PanoramaRuntime* runtime);
+
     // Moves keyboard focus to `node` (null clears focus): blurs the old focus
     // (onblur), focuses the new (onfocus), updates :focus / :focus-within, and seeds
     // a TextEntry's caret at its value end (WebCore setFocusedElement order). Safe to

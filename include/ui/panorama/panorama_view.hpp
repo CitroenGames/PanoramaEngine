@@ -94,6 +94,10 @@ public:
     bool update_wheel(float x, float y, float wheel_ticks_y);
     bool handle_key_down(const PanoramaKeyEvent& event);
     bool handle_text_input(std::string_view utf8);
+    // Clipboard access remains host-owned. Read the platform clipboard in
+    // response to the host's paste shortcut/command, then pass its UTF-8 payload
+    // here. The focused TextEntry applies normal selection/maxchars semantics.
+    bool handle_paste(std::string_view utf8);
     void set_focus(PanoramaNode* node);
 
     // Pumps scripts and animations, then conditionally recomputes styles,

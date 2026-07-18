@@ -940,6 +940,15 @@ bool PanoramaInputController::handle_text_input(PanoramaNode& root, std::string_
     return true;
 }
 
+bool PanoramaInputController::handle_paste(PanoramaNode& root, std::string_view utf8, PanoramaRuntime* runtime)
+{
+    // Clipboard acquisition is a host responsibility, but once acquired it is
+    // an ordinary insertion edit. Keeping this route shared is important: paste
+    // must replace selections, respect maxchars, normalize line endings, dirty
+    // the field, and fire exactly one change event just like typed/IME text.
+    return handle_text_input(root, utf8, runtime);
+}
+
 bool PanoramaInputController::handle_key_down(PanoramaNode& root, const PanoramaKeyEvent& event, PanoramaRuntime* runtime)
 {
     // Tab advances focus (EventHandler::defaultTabEventHandler — ignored when a

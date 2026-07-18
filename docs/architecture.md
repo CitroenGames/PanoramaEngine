@@ -92,7 +92,7 @@ sequencing used by `PanoramaView` and custom coordinators.
 
 ## Extension points
 
-PanoramaEngine exposes four customization seams, each an interface or a
+PanoramaEngine exposes five customization seams, each an interface or a
 plain `std::function` field rather than a subclass hierarchy to walk:
 
 1. **Rendering** — implement `PanoramaRenderBackend` (5 required methods:
@@ -111,7 +111,11 @@ plain `std::function` field rather than a subclass hierarchy to walk:
    measured and painted text line up. The built-in atlas accepts explicit
    weighted faces and search directories through `PanoramaFontAtlasLoadOptions`,
    so reusable applications do not need a game-specific filesystem layout.
-4. **Engine actions / sublayout loading** — `PanoramaRuntime::set_host_action_handler`,
+4. **Clipboard input** — the platform reads clipboard text and passes its UTF-8
+   payload to `PanoramaInputController::handle_paste` (or the corresponding
+   `PanoramaView` method). The core never links a synchronous platform clipboard
+   API, which also lets asynchronous hosts deliver the payload later.
+5. **Engine actions / sublayout loading** — `PanoramaRuntime::set_host_action_handler`,
    `set_layout_loaders`, and `set_focus_request_handler` are the bridge
    points for application services such as matchmaking, native controls, and
    console commands. A minimal integration can leave all three unset and run

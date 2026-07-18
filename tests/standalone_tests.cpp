@@ -1,6 +1,8 @@
 #include "ui/panorama/panorama_diagnostics.hpp"
 #include "ui/panorama/panorama_dom.hpp"
 #include "ui/panorama/panorama_font_atlas.hpp"
+#include "ui/panorama/panorama_input.hpp"
+#include "ui/panorama/panorama_text_edit.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -16,11 +18,57 @@ bool expect(bool condition, const char* message)
     }
     return condition;
 }
+
+bool test_clipboard_paste_api()
+{
+    using namespace panorama;
+
+    PanoramaNode root;
+    root.tag = "Panel";
+    root.tag_lower = "panel";
+
+    PanoramaNode field;
+    field.tag = "TextEntry";
+    field.tag_lower = "textentry";
+
+    PanoramaInputController input;
+    input.set_focus(root, &field, nullptr);
+    panorama_text_entry_set_value(field, "start finish");
+    panorama_text_entry_set_selection(field, 6, 12);
+
+    const std::string pasted = "\xE2\x9C\x93\r\nok"; // U+2713 + CRLF + "ok"
+    if (!expect(input.handle_paste(root, pasted, nullptr), "paste did not edit the focused TextEntry") ||
+        !expect(field.text == "start \xE2\x9C\x93 ok", "paste did not replace selection/normalize CRLF") ||
+        !expect(field.text_caret == static_cast<int>(field.text.size()), "paste did not collapse the caret after UTF-8 text") ||
+        !expect(!panorama_text_entry_has_selection(field), "paste left a stale selection"))
+    {
+        return false;
+    }
+
+    field.attributes["maxchars"] = "8";
+    panorama_text_entry_set_value(field, "12xxxx78");
+    panorama_text_entry_set_selection(field, 2, 6);
+    const std::string accents = "\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9"; // four U+00E9 codepoints
+    if (!expect(input.handle_paste(root, accents, nullptr), "UTF-8 paste did not replace the selection") ||
+        !expect(field.text == "12" + accents + "78", "maxchars counted UTF-8 paste bytes instead of codepoints") ||
+        !expect(!input.handle_paste(root, {}, nullptr), "empty clipboard payload reported an edit"))
+    {
+        return false;
+    }
+
+    input.reset();
+    return expect(!input.handle_paste(root, "ignored", nullptr), "paste edited a field without focus");
+}
 }
 
 int main()
 {
     using namespace panorama;
+
+    if (!test_clipboard_paste_api())
+    {
+        return 1;
+    }
 
     const PanoramaDiagnostics previous_diagnostics = panorama_diagnostics();
     set_panorama_diagnostics(PanoramaDiagnostics{
@@ -77,6 +125,6 @@ int main()
         return 1;
     }
 
-    std::puts("Panorama standalone diagnostics and font configuration passed");
+    std::puts("Panorama standalone input, diagnostics, and font configuration passed");
     return 0;
 }

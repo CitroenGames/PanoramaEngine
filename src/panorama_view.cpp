@@ -256,6 +256,22 @@ bool PanoramaView::handle_text_input(std::string_view utf8)
     return changed;
 }
 
+bool PanoramaView::handle_paste(std::string_view utf8)
+{
+    PanoramaNode* document_root = root();
+    if (document_root == nullptr || utf8.empty())
+    {
+        return false;
+    }
+    const bool changed = input_.handle_paste(
+        *document_root, utf8, runtime_.active() ? &runtime_ : nullptr);
+    if (changed)
+    {
+        invalidate_style();
+    }
+    return changed;
+}
+
 void PanoramaView::set_focus(PanoramaNode* node)
 {
     PanoramaNode* document_root = root();
