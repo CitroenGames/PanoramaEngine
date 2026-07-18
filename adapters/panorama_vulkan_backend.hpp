@@ -270,7 +270,22 @@ public:
         return handle;
     }
 
-    void render_geometry(panorama::PanoramaCompiledGeometryHandle geometry, panorama::PanoramaTextureId texture) override
+    // `constants` (see panorama_paint.hpp's PanoramaDrawConstants) is accepted
+    // for PanoramaRenderBackend conformance but not yet applied: this backend's
+    // vertex shader is precompiled SPIR-V (adapters/shaders/panorama_ui.vert,
+    // see adapters/shaders/README.md) that this header cannot regenerate, so
+    // wiring a per-draw transform/opacity into it would require extending the
+    // GLSL source AND re-running glslc, out of scope for a host-side-only
+    // change. The painter now emits a non-identity value for any transformed
+    // or partially-opaque command (see DrawListBuilder::paint's layer-context
+    // comment in panorama_paint.cpp) rather than only ever identity, so THIS
+    // ADAPTER RENDERS SUCH CONTENT WRONG (untransformed, undimmed) until it is
+    // wired up -- a future change that wants this adapter to honor a
+    // non-identity value must extend the push-constant range (see
+    // create_pipeline_layout) and the GLSL together, then regenerate the
+    // .spv.inl files.
+    void render_geometry(panorama::PanoramaCompiledGeometryHandle geometry, panorama::PanoramaTextureId texture,
+        const panorama::PanoramaDrawConstants& /*constants*/) override
     {
         if (current_cmd_ == VK_NULL_HANDLE)
         {

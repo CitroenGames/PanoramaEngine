@@ -294,13 +294,35 @@ int main()
         {
             continue;
         }
+        // Fully-faded (opacity <= 0, e.g. an animating-to-zero subtree the
+        // painter keeps emitting so the draw list's shape holds steady across
+        // the fade) draws nothing -- skip it instead of rasterizing invisible
+        // triangles.
+        if (command.constants.opacity <= 0.0F)
+        {
+            continue;
+        }
+        // No PanoramaRenderBackend here (see the file header comment) -- this
+        // walks command.vertices directly, so it must apply PanoramaDrawConstants
+        // itself. Identity (an untransformed, fully-opaque command, or one that
+        // went through the painter's legacy-bake fallback) is fast-pathed to
+        // avoid a per-vertex transform on every frame.
+        const bool identity_constants = command.constants.is_identity();
         for (std::size_t i = 0; i + 2 < command.indices.size(); i += 3)
         {
-            rasterize_triangle(
-                fb,
-                command.vertices[static_cast<std::size_t>(command.indices[i + 0])],
-                command.vertices[static_cast<std::size_t>(command.indices[i + 1])],
-                command.vertices[static_cast<std::size_t>(command.indices[i + 2])]);
+            const PanoramaPaintVertex& v0 = command.vertices[static_cast<std::size_t>(command.indices[i + 0])];
+            const PanoramaPaintVertex& v1 = command.vertices[static_cast<std::size_t>(command.indices[i + 1])];
+            const PanoramaPaintVertex& v2 = command.vertices[static_cast<std::size_t>(command.indices[i + 2])];
+            if (identity_constants)
+            {
+                rasterize_triangle(fb, v0, v1, v2);
+            }
+            else
+            {
+                rasterize_triangle(fb, panorama_apply_draw_constants(v0, command.constants),
+                    panorama_apply_draw_constants(v1, command.constants),
+                    panorama_apply_draw_constants(v2, command.constants));
+            }
         }
     }
 

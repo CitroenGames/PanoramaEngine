@@ -3829,14 +3829,26 @@ float PanoramaEasing::evaluate(float t) const
 
     // Solve the cubic-bezier for the parametric value u where X(u) == t, then return
     // Y(u). Implicit endpoints (0,0) and (1,1). Newton-Raphson with a bisection
-    // fallback — ported from WebKit's UnitBezier (Apple, BSD-licensed).
+    // fallback — ported from WebKit's UnitBezier (Apple, BSD-licensed). The
+    // polynomial coefficients depend only on the control points (immutable after
+    // construction), so they are derived once and cached for later evaluates.
+    if (!coeffs_valid)
+    {
+        coeff_cx = 3.0 * static_cast<double>(x1);
+        coeff_bx = 3.0 * static_cast<double>(x2 - x1) - coeff_cx;
+        coeff_ax = 1.0 - coeff_cx - coeff_bx;
+        coeff_cy = 3.0 * static_cast<double>(y1);
+        coeff_by = 3.0 * static_cast<double>(y2 - y1) - coeff_cy;
+        coeff_ay = 1.0 - coeff_cy - coeff_by;
+        coeffs_valid = true;
+    }
     const double x = clamped;
-    const double cx = 3.0 * static_cast<double>(x1);
-    const double bx = 3.0 * static_cast<double>(x2 - x1) - cx;
-    const double ax = 1.0 - cx - bx;
-    const double cy = 3.0 * static_cast<double>(y1);
-    const double by = 3.0 * static_cast<double>(y2 - y1) - cy;
-    const double ay = 1.0 - cy - by;
+    const double cx = coeff_cx;
+    const double bx = coeff_bx;
+    const double ax = coeff_ax;
+    const double cy = coeff_cy;
+    const double by = coeff_by;
+    const double ay = coeff_ay;
 
     const auto sample_x = [&](double u) { return ((ax * u + bx) * u + cx) * u; };
     const auto sample_dx = [&](double u) { return (3.0 * ax * u + 2.0 * bx) * u + cx; };

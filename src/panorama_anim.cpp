@@ -1,4 +1,5 @@
 #include "ui/panorama/panorama_anim.hpp"
+#include "ui/panorama/panorama_paint.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -20,7 +21,7 @@ std::uint8_t lerp_channel(std::uint8_t from, std::uint8_t to, float e)
 
 // Defined in the keyframe section below; both anonymous-namespace blocks share the
 // translation unit's unnamed namespace, so this forward declaration is sufficient.
-PanoramaTransform lerp_transform(const PanoramaTransform& from, const PanoramaTransform& to, float e);
+bool lerp_transform_into(PanoramaTransform& out, const PanoramaTransform& from, const PanoramaTransform& to, float e);
 
 bool transform_equal(const PanoramaTransform& a, const PanoramaTransform& b)
 {
@@ -299,6 +300,21 @@ void advance_box_shadow(PanoramaBoxShadow& cur, PanoramaBoxShadow tgt, PanoramaB
 bool blur_equal(const PanoramaBlur& a, const PanoramaBlur& b)
 {
     return a.present == b.present && a.std_x == b.std_x && a.std_y == b.std_y && a.passes == b.passes;
+}
+
+// Whether `blur` currently paints a visible backdrop-blur command (mirrors
+// paint()'s own blur-emission condition in panorama_paint.cpp exactly, so this
+// can never disagree with what the draw list actually contains). Used by both
+// advance_node and apply_keyframes_at below to classify a blur value change:
+// visible on BOTH sides of the change means the command already exists and
+// only its std/passes parameters move (recomposite-class, patchable entry
+// state -- see PanoramaGeometryCache::patch_blur); visible on only one side
+// means the command itself is being added or removed (a structural,
+// visual_changed-class draw-list change the recomposite fast path cannot
+// represent).
+bool blur_visible(const PanoramaBlur& blur)
+{
+    return blur.present && (blur.std_x > 0.0F || blur.std_y > 0.0F);
 }
 
 // WebCore filter blur interpolation: the missing endpoint is the identity
@@ -765,16 +781,21 @@ void capture_node(PanoramaNode& node)
 // Untouched nodes hold the per-frame INTERPOLATED value in node.computed (the
 // advance pass writes it back), which a re-capture would mistake for a new
 // cascade target and cancel the in-flight transition at its current value.
-void capture_recomputed_node(PanoramaNode& node)
+void capture_recomputed_node(PanoramaNode& node, PanoramaAnimCaptureResult& result)
 {
     if (node.style_fresh)
     {
         node.style_fresh = false;
         capture_node_values(node);
+        result.any_transition_animating = result.any_transition_animating || node.anim.any_channel_animating();
+        // A node whose animation-name was just cleared counts too: the keyframe
+        // advance must still run once to revert its runtime state.
+        result.any_keyframe_candidate = result.any_keyframe_candidate || !node.computed.animation_name.empty() ||
+            !node.keyframe_anim.active_name.empty();
     }
     for (const auto& child : node.children)
     {
-        capture_recomputed_node(*child);
+        capture_recomputed_node(*child, result);
     }
 }
 
@@ -782,18 +803,60 @@ void merge_result(PanoramaAnimationAdvanceResult& dst, const PanoramaAnimationAd
 {
     dst.visual_changed = dst.visual_changed || src.visual_changed;
     dst.layout_changed = dst.layout_changed || src.layout_changed;
+    dst.recomposite_changed = dst.recomposite_changed || src.recomposite_changed;
     dst.active = dst.active || src.active;
+}
+
+// Records `node` in the per-advance recomposite-dirty list, deduplicated
+// against the tracker's current generation (see PanoramaRecompositeDirtyTracker's
+// doc comment). No-op with a null tracker (or a tracker whose `nodes` is
+// null), so a caller that passes nullptr (the default) pays nothing extra.
+void mark_recomposite_dirty(PanoramaNode& node, PanoramaRecompositeDirtyTracker* tracker)
+{
+    if (tracker == nullptr || tracker->nodes == nullptr || node.recomposite_dirty_stamp == tracker->generation)
+    {
+        return;
+    }
+    node.recomposite_dirty_stamp = tracker->generation;
+    tracker->nodes->push_back(&node);
 }
 
 // `ends` accumulates transitions that completed during this advance (the
 // `animating` flag flipped false because the active time reached the duration —
 // advance_progress applies the end value in the same step). Retargets/snaps in
 // the capture pass replace the PanoramaPropAnim without ever completing, so they
-// never report here (WebCore: transitioncancel, not transitionend).
-PanoramaAnimationAdvanceResult advance_node(PanoramaNode& node, float dt, std::vector<PanoramaTransitionEnd>& ends)
+// never report here (WebCore: transitioncancel, not transitionend). `dirty_tracker`:
+// see PanoramaRecompositeDirtyTracker (null is fine -- mark_recomposite_dirty no-ops).
+// `ancestor_unreachable`: true when `node` itself or an ancestor is
+// paint()-unreachable this frame (see panorama_node_paint_unreachable) --
+// threaded down the recursion exactly like paint()'s own recursive
+// short-circuit, so a node paint() would skip (and everything below it)
+// still advances its timelines/values normally but reports no dirt (see the
+// suppression block below).
+PanoramaAnimationAdvanceResult advance_node(PanoramaNode& node, float dt, std::vector<PanoramaTransitionEnd>& ends,
+    PanoramaRecompositeDirtyTracker* dirty_tracker, bool ancestor_unreachable)
 {
     PanoramaAnimState& a = node.anim;
     PanoramaAnimationAdvanceResult result;
+
+    // Idle nodes skip every channel advance: for a non-animating channel the
+    // body below is a pure writeback (cur = tgt, computed = cur — the capture/
+    // snap paths and completed advances all keep cur == tgt == computed), so
+    // only the tree walk remains. A channel that completes this frame still has
+    // `animating` set on entry, so completion events can never be skipped.
+    // Values @keyframes wrote into `computed` are owned by advance_keyframe_node
+    // (which reverts them itself when its timeline stops applying), so not
+    // rewriting them here is deliberate. Uninitialized nodes (advanced before
+    // any capture) keep the old write-the-defaults behavior.
+    if (a.initialized && !a.any_channel_animating())
+    {
+        const bool unreachable = ancestor_unreachable || panorama_node_paint_unreachable(node);
+        for (const auto& child : node.children)
+        {
+            merge_result(result, advance_node(*child, dt, ends, dirty_tracker, unreachable));
+        }
+        return result;
+    }
 
     const bool opacity_was_animating = a.opacity.animating;
     const bool pos_was_animating = a.pos.animating;
@@ -875,7 +938,7 @@ PanoramaAnimationAdvanceResult advance_node(PanoramaNode& node, float dt, std::v
         }
         else
         {
-            a.transform_cur = lerp_transform(a.transform_from, a.transform_tgt, e);
+            lerp_transform_into(a.transform_cur, a.transform_from, a.transform_tgt, e);
         }
     }
     else
@@ -896,6 +959,9 @@ PanoramaAnimationAdvanceResult advance_node(PanoramaNode& node, float dt, std::v
 
     advance_box_shadow(a.box_shadow_cur, a.box_shadow_tgt, a.box_shadow_from, a.box_shadow, dt);
     node.computed.box_shadow = a.box_shadow_cur;
+    // Captured before advance_blur overwrites a.blur_cur -- classification
+    // below needs both the pre- and post-advance value (see blur_visible).
+    const PanoramaBlur blur_before = a.blur_cur;
     advance_blur(a.blur_cur, a.blur_tgt, a.blur_from, a.blur, dt);
     node.computed.blur = a.blur_cur;
     advance_clip(a.clip_cur, a.clip_tgt, a.clip_from, a.clip, dt);
@@ -946,15 +1012,45 @@ PanoramaAnimationAdvanceResult advance_node(PanoramaNode& node, float dt, std::v
     ended(clip_was_animating, a.clip, "clip");
     ended(pre_scale_was_animating, a.pre_scale, "pre-transform-scale2d");
 
-    result.visual_changed = opacity_was_animating || a.opacity.animating || pos_was_animating || a.pos.animating ||
-        color_was_animating || a.color.animating || bg_was_animating || a.bg.animating || wash_was_animating ||
-        a.wash.animating || background_image_opacity_was_animating || a.background_image_opacity.animating ||
-        brightness_was_animating || a.brightness.animating || transform_was_animating || a.transform.animating ||
-        width_was_animating || a.width.animating || height_was_animating || a.height.animating ||
-        border_width_was_animating || a.border_width.animating || border_color_was_animating ||
-        a.border_color.animating || box_shadow_was_animating || a.box_shadow.animating || blur_was_animating ||
-        a.blur.animating || clip_was_animating || a.clip.animating || pre_scale_was_animating ||
-        a.pre_scale.animating;
+    // Slice 3 classification: opacity/transform/pre-transform-scale2d only
+    // ever move the layer-context PanoramaDrawConstants a command carries, so
+    // they are recomposite-class instead of visual_changed (see
+    // PanoramaAnimationAdvanceResult::recomposite_changed). Blur splits on
+    // whether the backdrop-blur command's existence is stable across this
+    // step (see blur_visible) -- a 0-crossing is a structural draw-list
+    // change and must still force a full repaint. Every other channel keeps
+    // its pre-Slice-3 class unchanged, including position/width/height's
+    // existing dual membership in both visual_changed and layout_changed
+    // (harmless: a caller that honors layout_changed already repaints for
+    // them regardless of visual_changed's value, but PanoramaView -- which
+    // does not implement a fast path -- relies on the redundancy).
+    const bool opacity_changed = opacity_was_animating || a.opacity.animating;
+    const bool transform_changed = transform_was_animating || a.transform.animating;
+    const bool pre_scale_changed = pre_scale_was_animating || a.pre_scale.animating;
+    const bool blur_changed = blur_was_animating || a.blur.animating;
+    const bool blur_command_stable = blur_visible(blur_before) && blur_visible(a.blur_cur);
+    // The opacity transition COMPLETING this frame (was animating, now isn't)
+    // at a dead value: the fast path would patch the geometry's constants to
+    // opacity 0 (a harmless no-op draw) but leave any backdrop-blur command
+    // in its subtree blurring forever (blur has no opacity concept of its
+    // own -- see PanoramaGeometryCache::submit/replay's opacity<=0 gate,
+    // which this frame's constants need to actually CARRY). Classing it
+    // visual_changed instead of recomposite forces one real repaint, which
+    // both prunes the now-invisible subtree (paint()'s own opacity<=0
+    // early-out, see panorama_paint.cpp) and stamps the dead opacity onto any
+    // blur command that DIDN'T get pruned. A mid-fade frame (still animating
+    // on at least one side) keeps the recomposite-only classification.
+    const bool opacity_dead_on_completion = opacity_was_animating && !a.opacity.animating && a.opacity_cur <= 0.0F;
+
+    result.recomposite_changed = (opacity_changed && !opacity_dead_on_completion) || transform_changed ||
+        pre_scale_changed || (blur_changed && blur_command_stable);
+    result.visual_changed = pos_was_animating || a.pos.animating || color_was_animating || a.color.animating ||
+        bg_was_animating || a.bg.animating || wash_was_animating || a.wash.animating ||
+        background_image_opacity_was_animating || a.background_image_opacity.animating || brightness_was_animating ||
+        a.brightness.animating || width_was_animating || a.width.animating || height_was_animating ||
+        a.height.animating || border_width_was_animating || a.border_width.animating || border_color_was_animating ||
+        a.border_color.animating || box_shadow_was_animating || a.box_shadow.animating ||
+        (blur_changed && !blur_command_stable) || clip_was_animating || a.clip.animating || opacity_dead_on_completion;
     result.layout_changed = pos_was_animating || a.pos.animating || width_was_animating || a.width.animating ||
         height_was_animating || a.height.animating;
     result.active = a.opacity.animating || a.pos.animating || a.color.animating || a.bg.animating || a.wash.animating ||
@@ -962,9 +1058,36 @@ PanoramaAnimationAdvanceResult advance_node(PanoramaNode& node, float dt, std::v
         a.height.animating || a.border_width.animating || a.border_color.animating || a.box_shadow.animating ||
         a.blur.animating || a.clip.animating || a.pre_scale.animating;
 
+    // Dirt suppression for a subtree paint() will skip anyway (see
+    // panorama_node_paint_unreachable): the channel values above are already
+    // advanced correctly (so becoming reachable again resumes mid-animation),
+    // only the REPORTED dirt and the recomposite-dirty-list membership are
+    // withheld. `result.active` is left untouched -- the host must keep
+    // calling advance every frame for state to stay correct while hidden.
+    const bool unreachable = ancestor_unreachable || panorama_node_paint_unreachable(node);
+    if (unreachable)
+    {
+        // Exception: THIS node's own opacity_dead_on_completion is exactly
+        // the frame `unreachable` (for this node specifically) turned true --
+        // paint() skipping it from now on does not mean there is nothing to
+        // fix, it means the STALE geometry (and any blur command) from
+        // before this frame, still sitting in the cache, needs exactly one
+        // repaint to be pruned. Does not apply when an ANCESTOR was already
+        // unreachable BEFORE this frame (ancestor_unreachable): that subtree
+        // was already pruned by whatever repaint made the ancestor
+        // unreachable, so this node's own completion has nothing left to fix.
+        result.visual_changed = opacity_dead_on_completion && !ancestor_unreachable;
+        result.recomposite_changed = false;
+        result.layout_changed = false;
+    }
+    else if (result.recomposite_changed)
+    {
+        mark_recomposite_dirty(node, dirty_tracker);
+    }
+
     for (const auto& child : node.children)
     {
-        merge_result(result, advance_node(*child, dt, ends));
+        merge_result(result, advance_node(*child, dt, ends, dirty_tracker, unreachable));
     }
 
     return result;
@@ -976,9 +1099,11 @@ void panorama_capture_anim_targets(PanoramaNode& root)
     capture_node(root);
 }
 
-void panorama_capture_anim_targets_recomputed(PanoramaNode& root)
+PanoramaAnimCaptureResult panorama_capture_anim_targets_recomputed(PanoramaNode& root)
 {
-    capture_recomputed_node(root);
+    PanoramaAnimCaptureResult result;
+    capture_recomputed_node(root, result);
+    return result;
 }
 
 void panorama_sync_anim_dimensions(PanoramaNode& node)
@@ -992,10 +1117,10 @@ void panorama_sync_anim_dimensions(PanoramaNode& node)
     a.height = PanoramaPropAnim{};
 }
 
-PanoramaAnimationAdvanceResult panorama_advance_anim(PanoramaNode& root, float dt)
+PanoramaAnimationAdvanceResult panorama_advance_anim(PanoramaNode& root, float dt, PanoramaRecompositeDirtyTracker* dirty_tracker)
 {
     std::vector<PanoramaTransitionEnd> ends;
-    PanoramaAnimationAdvanceResult result = advance_node(root, dt, ends);
+    PanoramaAnimationAdvanceResult result = advance_node(root, dt, ends, dirty_tracker, false);
     result.transition_ends = std::move(ends);
     return result;
 }
@@ -1013,29 +1138,49 @@ PanoramaColor lerp_color(PanoramaColor from, PanoramaColor to, float e)
     return out;
 }
 
-// Interpolates two transform op-lists. When the lists have the same shape (same
-// length and matching per-index op types) the components lerp; otherwise there is
-// no meaningful correspondence, so we snap to the nearer endpoint.
-PanoramaTransform lerp_transform(const PanoramaTransform& from, const PanoramaTransform& to, float e)
+// Interpolates two transform op-lists into `out` (which must not alias `from`
+// or `to`), reusing its capacity so steady-state transform animation allocates
+// nothing. When the lists have the same shape (same length and matching
+// per-index op types) the components lerp; otherwise there is no meaningful
+// correspondence, so we snap to the nearer endpoint. Returns true when `out`'s
+// value actually changed (the keyframe delta gate keys repaints off it).
+bool lerp_transform_into(PanoramaTransform& out, const PanoramaTransform& from, const PanoramaTransform& to, float e)
 {
-    if (from.ops.size() != to.ops.size())
+    const PanoramaTransform* snap = from.ops.size() != to.ops.size() ? (e < 0.5F ? &from : &to) : nullptr;
+    if (snap == nullptr)
     {
-        return e < 0.5F ? from : to;
+        for (std::size_t i = 0; i < from.ops.size(); ++i)
+        {
+            if (from.ops[i].type != to.ops[i].type)
+            {
+                snap = e < 0.5F ? &from : &to;
+                break;
+            }
+        }
     }
-    PanoramaTransform out;
-    out.ops.reserve(from.ops.size());
+    if (snap != nullptr)
+    {
+        if (transform_equal(out, *snap))
+        {
+            return false;
+        }
+        out = *snap;
+        return true;
+    }
+    bool changed = out.ops.size() != from.ops.size();
+    out.ops.resize(from.ops.size());
     for (std::size_t i = 0; i < from.ops.size(); ++i)
     {
-        if (from.ops[i].type != to.ops[i].type)
-        {
-            return e < 0.5F ? from : to;
-        }
-        PanoramaTransformOp op = from.ops[i];
-        op.x = from.ops[i].x + (to.ops[i].x - from.ops[i].x) * e;
-        op.y = from.ops[i].y + (to.ops[i].y - from.ops[i].y) * e;
-        out.ops.push_back(op);
+        PanoramaTransformOp& op = out.ops[i];
+        const float x = from.ops[i].x + (to.ops[i].x - from.ops[i].x) * e;
+        const float y = from.ops[i].y + (to.ops[i].y - from.ops[i].y) * e;
+        changed = changed || op.type != from.ops[i].type || op.x != x || op.y != y ||
+            op.x_percent != from.ops[i].x_percent || op.y_percent != from.ops[i].y_percent;
+        op = from.ops[i];
+        op.x = x;
+        op.y = y;
     }
-    return out;
+    return changed;
 }
 
 // The keyframe-timeline position [0,1] for a given iteration index and intra-
@@ -1101,12 +1246,31 @@ ChannelSegment channel_segment(const PanoramaKeyframes& keyframes, std::uint32_t
     return seg;
 }
 
+// Slice 3 classification (mirrors advance_node's transition-side split, see
+// PanoramaAnimationAdvanceResult::recomposite_changed): each channel's own
+// Phase-1 value-delta gate (unchanged from before Slice 3 -- a delay/hold
+// frame re-deriving the same value must not repaint) now feeds exactly ONE of
+// these three, never `visual_changed` for a recomposite-class channel.
+// `position_changed` is folded into both `visual_changed` AND `layout_changed`
+// below, same dual membership advance_node's position channel has always had.
+struct KeyframeApplyResult
+{
+    bool visual_changed = false;
+    bool recomposite_changed = false;
+    bool layout_changed = false; // the position channel — the only layout input — moved
+};
+
 // Writes every animated channel of `keyframes` at timeline position `t` into the
 // node's computed style. `default_easing` is the animation-level timing function,
-// overridden per segment by a stop's own animation-timing-function.
-void apply_keyframes_at(PanoramaNode& node, const PanoramaKeyframes& keyframes, float t, PanoramaEasing default_easing)
+// overridden per segment by a stop's own animation-timing-function. Reports
+// whether any written value actually differed from what `computed` already held:
+// delay/hold frames re-derive bit-identical values (same timeline position, same
+// lerp) and must not repaint the whole UI.
+KeyframeApplyResult apply_keyframes_at(
+    PanoramaNode& node, const PanoramaKeyframes& keyframes, float t, const PanoramaEasing& default_easing)
 {
     PanoramaComputedStyle& computed = node.computed;
+    KeyframeApplyResult result;
     const auto eval = [&](std::uint32_t channel, auto&& writer) {
         if ((keyframes.channels & channel) == 0)
         {
@@ -1117,79 +1281,157 @@ void apply_keyframes_at(PanoramaNode& node, const PanoramaKeyframes& keyframes, 
         {
             return;
         }
-        const PanoramaEasing easing = seg.lo->has_easing ? seg.lo->easing : default_easing;
+        // By reference: evaluate() caches the solved bezier coefficients on the
+        // (persistent) stop/style easing, which a per-call copy would discard.
+        const PanoramaEasing& easing = seg.lo->has_easing ? seg.lo->easing : default_easing;
         const float e = seg.lo == seg.hi ? 0.0F : ease(easing, seg.frac);
         writer(seg.lo->resolved, seg.hi->resolved, e);
     };
 
     eval(PanoramaAnimOpacity, [&](const PanoramaComputedStyle& a, const PanoramaComputedStyle& b, float e) {
-        computed.opacity = std::clamp(a.opacity + (b.opacity - a.opacity) * e, 0.0F, 1.0F);
+        const float opacity = std::clamp(a.opacity + (b.opacity - a.opacity) * e, 0.0F, 1.0F);
+        result.recomposite_changed = result.recomposite_changed || computed.opacity != opacity;
+        computed.opacity = opacity;
     });
     eval(PanoramaAnimBrightness, [&](const PanoramaComputedStyle& a, const PanoramaComputedStyle& b, float e) {
-        computed.brightness = std::max(0.0F, a.brightness + (b.brightness - a.brightness) * e);
+        const float brightness = std::max(0.0F, a.brightness + (b.brightness - a.brightness) * e);
+        result.visual_changed = result.visual_changed || computed.brightness != brightness;
+        computed.brightness = brightness;
     });
     eval(PanoramaAnimBackgroundColor, [&](const PanoramaComputedStyle& a, const PanoramaComputedStyle& b, float e) {
-        computed.background_color = lerp_color(a.background_color, b.background_color, e);
+        const PanoramaColor background_color = lerp_color(a.background_color, b.background_color, e);
+        result.visual_changed = result.visual_changed || !color_equal(computed.background_color, background_color);
+        computed.background_color = background_color;
     });
     eval(PanoramaAnimBackgroundImageOpacity, [&](const PanoramaComputedStyle& a, const PanoramaComputedStyle& b, float e) {
         const float opacity = a.background_image_opacity + (b.background_image_opacity - a.background_image_opacity) * e;
-        computed.background_image_opacity = std::clamp(opacity, 0.0F, 1.0F);
+        const float clamped = std::clamp(opacity, 0.0F, 1.0F);
+        result.visual_changed = result.visual_changed || computed.background_image_opacity != clamped;
+        computed.background_image_opacity = clamped;
     });
     eval(PanoramaAnimColor, [&](const PanoramaComputedStyle& a, const PanoramaComputedStyle& b, float e) {
-        computed.color = lerp_color(a.color, b.color, e);
+        const PanoramaColor color = lerp_color(a.color, b.color, e);
+        result.visual_changed = result.visual_changed || !color_equal(computed.color, color);
+        computed.color = color;
     });
     eval(PanoramaAnimWashColor, [&](const PanoramaComputedStyle& a, const PanoramaComputedStyle& b, float e) {
-        computed.wash_color = lerp_color(a.wash_color, b.wash_color, e);
+        const PanoramaColor wash_color = lerp_color(a.wash_color, b.wash_color, e);
+        result.visual_changed = result.visual_changed || !color_equal(computed.wash_color, wash_color);
+        computed.wash_color = wash_color;
     });
     eval(PanoramaAnimTransform, [&](const PanoramaComputedStyle& a, const PanoramaComputedStyle& b, float e) {
-        computed.transform = lerp_transform(a.transform, b.transform, e);
+        const bool transform_changed = lerp_transform_into(computed.transform, a.transform, b.transform, e);
+        result.recomposite_changed = result.recomposite_changed || transform_changed;
     });
     eval(PanoramaAnimPosition, [&](const PanoramaComputedStyle& a, const PanoramaComputedStyle& b, float e) {
+        const float pos_x = a.pos_x + (b.pos_x - a.pos_x) * e;
+        const float pos_y = a.pos_y + (b.pos_y - a.pos_y) * e;
+        const float pos_z = a.pos_z + (b.pos_z - a.pos_z) * e;
+        const bool changed = !computed.has_position || computed.pos_x != pos_x || computed.pos_y != pos_y ||
+            computed.pos_z != pos_z || computed.pos_x_percent != a.pos_x_percent ||
+            computed.pos_y_percent != a.pos_y_percent;
         computed.has_position = true;
-        computed.pos_x = a.pos_x + (b.pos_x - a.pos_x) * e;
-        computed.pos_y = a.pos_y + (b.pos_y - a.pos_y) * e;
-        computed.pos_z = a.pos_z + (b.pos_z - a.pos_z) * e;
+        computed.pos_x = pos_x;
+        computed.pos_y = pos_y;
+        computed.pos_z = pos_z;
         computed.pos_x_percent = a.pos_x_percent;
         computed.pos_y_percent = a.pos_y_percent;
+        // Dual-classed like advance_node's position channel (see
+        // KeyframeApplyResult's doc comment).
+        result.visual_changed = result.visual_changed || changed;
+        result.layout_changed = result.layout_changed || changed;
     });
     eval(PanoramaAnimBoxShadow, [&](const PanoramaComputedStyle& a, const PanoramaComputedStyle& b, float e) {
-        computed.box_shadow = lerp_box_shadow(a.box_shadow, b.box_shadow, e);
+        const PanoramaBoxShadow box_shadow = lerp_box_shadow(a.box_shadow, b.box_shadow, e);
+        result.visual_changed = result.visual_changed || !box_shadow_equal(computed.box_shadow, box_shadow);
+        computed.box_shadow = box_shadow;
     });
     eval(PanoramaAnimBlur, [&](const PanoramaComputedStyle& a, const PanoramaComputedStyle& b, float e) {
-        computed.blur = lerp_blur(a.blur, b.blur, e);
+        const PanoramaBlur blur = lerp_blur(a.blur, b.blur, e);
+        const bool changed = !blur_equal(computed.blur, blur);
+        // Stable existence (see blur_visible) -> recomposite (a mutable
+        // entry-state patch, see PanoramaGeometryCache::patch_blur); a
+        // 0-crossing adds/removes the backdrop-blur command -> visual.
+        const bool stable = blur_visible(computed.blur) && blur_visible(blur);
+        result.recomposite_changed = result.recomposite_changed || (changed && stable);
+        result.visual_changed = result.visual_changed || (changed && !stable);
+        computed.blur = blur;
     });
     eval(PanoramaAnimClip, [&](const PanoramaComputedStyle& a, const PanoramaComputedStyle& b, float e) {
-        computed.clip = lerp_clip(a.clip, b.clip, e);
+        const PanoramaClip clip = lerp_clip(a.clip, b.clip, e);
+        result.visual_changed = result.visual_changed || !clip_equal(computed.clip, clip);
+        computed.clip = clip;
     });
+    return result;
 }
 
-PanoramaAnimationAdvanceResult advance_keyframe_node(
-    PanoramaNode& node, const std::unordered_map<std::string, PanoramaKeyframes>& registry, float dt)
+// `sheet_instance`/`sheet_generation` identify the sheet owning `registry` so
+// each node's resolution caches (see PanoramaKeyframeRuntime); instance 0 means
+// no identity was supplied (the raw-registry overload) — resolve fresh each call.
+// `dirty_tracker`: see PanoramaRecompositeDirtyTracker (null is fine).
+// `ancestor_unreachable`: see advance_node's identical parameter above -- the
+// same inherited paint()-unreachable flag, threaded independently through
+// this (separate) recursion so the transition and keyframe advances agree
+// without needing to share call state.
+PanoramaAnimationAdvanceResult advance_keyframe_node(PanoramaNode& node,
+    const std::unordered_map<std::string, PanoramaKeyframes>& registry, float dt, std::uint64_t sheet_instance,
+    std::uint64_t sheet_generation, PanoramaRecompositeDirtyTracker* dirty_tracker, bool ancestor_unreachable)
 {
     PanoramaAnimationAdvanceResult result;
     PanoramaNode::PanoramaKeyframeRuntime& runtime = node.keyframe_anim;
     const PanoramaComputedStyle& style = node.computed;
     const std::string& name = style.animation_name;
 
+    // Idle nodes (no animation-name and no runtime state left to revert) skip
+    // the whole per-node body; only the tree walk remains.
+    if (name.empty() && runtime.active_name.empty())
+    {
+        const bool unreachable = ancestor_unreachable || panorama_node_paint_unreachable(node);
+        for (const auto& child : node.children)
+        {
+            merge_result(result, advance_keyframe_node(
+                *child, registry, dt, sheet_instance, sheet_generation, dirty_tracker, unreachable));
+        }
+        return result;
+    }
+
+    // Set inside the opacity-completion branch below; read by the
+    // unreachable-suppression block at the end (see advance_node's identical
+    // exception for why this must survive suppression).
+    bool opacity_dead_on_completion = false;
+
     if (name.empty())
     {
-        if (!runtime.active_name.empty())
-        {
-            runtime = PanoramaNode::PanoramaKeyframeRuntime{};
-            result.visual_changed = true; // the node reverts to its static cascade value
-        }
+        runtime = PanoramaNode::PanoramaKeyframeRuntime{};
+        result.visual_changed = true; // the node reverts to its static cascade value
     }
     else
     {
-        const auto it = registry.find(name);
-        if (it != registry.end() && !it->second.stops.empty())
+        const PanoramaKeyframes* keyframes = nullptr;
+        if (sheet_instance != 0 && runtime.sheet_instance == sheet_instance &&
+            runtime.sheet_generation == sheet_generation && runtime.active_name == name)
         {
-            const PanoramaKeyframes& keyframes = it->second;
+            keyframes = runtime.keyframes;
+        }
+        else
+        {
+            const auto it = registry.find(name);
+            keyframes = it != registry.end() && !it->second.stops.empty() ? &it->second : nullptr;
+            if (sheet_instance != 0)
+            {
+                runtime.keyframes = keyframes;
+                runtime.sheet_instance = sheet_instance;
+                runtime.sheet_generation = sheet_generation;
+            }
+        }
+        if (keyframes != nullptr)
+        {
             if (runtime.active_name != name)
             {
                 runtime.active_name = name;
                 runtime.elapsed = 0.0F;
                 runtime.finished = false;
+                runtime.applied = false;
             }
             runtime.elapsed += dt;
 
@@ -1256,12 +1498,81 @@ PanoramaAnimationAdvanceResult advance_keyframe_node(
 
             if (apply)
             {
-                apply_keyframes_at(node, keyframes, timeline, style.animation_easing);
-                result.visual_changed = true;
-                if ((keyframes.channels & PanoramaAnimPosition) != 0)
+                const float opacity_before_apply = node.computed.opacity;
+                const KeyframeApplyResult written =
+                    apply_keyframes_at(node, *keyframes, timeline, style.animation_easing);
+                runtime.applied = true;
+                if (written.visual_changed)
+                {
+                    result.visual_changed = true;
+                }
+                if (written.recomposite_changed)
+                {
+                    // Mirrors advance_node's opacity_dead_on_completion (see
+                    // its comment): the opacity channel actually CHANGING
+                    // (guards the every-frame hold case, which re-derives the
+                    // identical value and must not repeatedly repaint) and
+                    // landing at <= 0 on a frame the timeline is no longer
+                    // progressing (finished-and-held, or a zero-duration
+                    // snap -- `active` above) is a completion edge, not an
+                    // ordinary mid-run frame: classify visual_changed so one
+                    // repaint prunes the dead subtree and stamps the dead
+                    // opacity onto any blur command in it (see
+                    // panorama_geometry_cache.cpp's opacity<=0 gate) instead
+                    // of leaving it patched at opacity 0 forever. Not
+                    // per-channel (a simultaneous transform-channel move on
+                    // this SAME completion frame also gets swept into
+                    // visual_changed rather than recomposite_changed) -- a
+                    // conservative simplification: visual_changed forces a
+                    // strict superset of what recomposite_changed would have,
+                    // so nothing renders wrong, it just costs one extra full
+                    // repaint on an already-expensive completion frame.
+                    opacity_dead_on_completion = !active && node.computed.opacity <= 0.0F &&
+                        node.computed.opacity != opacity_before_apply;
+                    if (opacity_dead_on_completion)
+                    {
+                        result.visual_changed = true;
+                    }
+                    else
+                    {
+                        result.recomposite_changed = true;
+                    }
+                    // mark_recomposite_dirty is deferred to the unreachable-
+                    // suppression block below (it must not fire for a node
+                    // paint() will skip anyway).
+                }
+                if (written.layout_changed)
                 {
                     result.layout_changed = true;
                 }
+            }
+            else if (runtime.applied && node.anim.initialized)
+            {
+                // The timeline stopped applying (a finished run without a
+                // forwards fill): put back the transition-state values the
+                // unconditional advance_node rewrite used to restore every
+                // frame before its idle-node early-out — the node reverts to
+                // its cascade value silently, exactly as before (the old
+                // rewrite reported no change either). pos_z stays: the
+                // transition advance never wrote it. Skipped while the anim
+                // state is uninitialized (no transition advance ever ran).
+                const PanoramaAnimState& a = node.anim;
+                node.computed.opacity = a.opacity_cur;
+                node.computed.brightness = a.brightness_cur;
+                node.computed.background_color = a.bg_cur;
+                node.computed.background_image_opacity = a.background_image_opacity_cur;
+                node.computed.color = a.color_cur;
+                node.computed.wash_color = a.wash_cur;
+                node.computed.transform = a.transform_cur;
+                node.computed.has_position = a.pos_has;
+                node.computed.pos_x = a.pos_x_cur;
+                node.computed.pos_y = a.pos_y_cur;
+                node.computed.pos_x_percent = a.pos_x_percent;
+                node.computed.pos_y_percent = a.pos_y_percent;
+                node.computed.box_shadow = a.box_shadow_cur;
+                node.computed.blur = a.blur_cur;
+                node.computed.clip = a.clip_cur;
+                runtime.applied = false;
             }
             result.active = active;
         }
@@ -1271,18 +1582,51 @@ PanoramaAnimationAdvanceResult advance_keyframe_node(
         }
     }
 
+    // Dirt suppression for a subtree paint() will skip anyway -- see
+    // advance_node's identical block (same shared predicate,
+    // panorama_node_paint_unreachable, so the two advance passes can never
+    // disagree about which nodes paint() would have skipped). Also where
+    // mark_recomposite_dirty finally fires for the `apply` branch above (it
+    // must not fire for a node paint() will skip anyway).
+    const bool unreachable = ancestor_unreachable || panorama_node_paint_unreachable(node);
+    if (unreachable)
+    {
+        // Exception: see advance_node's identical opacity_dead_on_completion
+        // carve-out -- THIS node's own completion-to-dead-value is exactly
+        // the frame `unreachable` (for this node) turned true, so one more
+        // repaint is still needed to prune the STALE geometry (and any blur)
+        // from before this frame. Suppressed instead when an ANCESTOR was
+        // already unreachable before this frame (ancestor_unreachable).
+        result.visual_changed = opacity_dead_on_completion && !ancestor_unreachable;
+        result.recomposite_changed = false;
+        result.layout_changed = false;
+    }
+    else if (result.recomposite_changed)
+    {
+        mark_recomposite_dirty(node, dirty_tracker);
+    }
+
     for (const auto& child : node.children)
     {
-        merge_result(result, advance_keyframe_node(*child, registry, dt));
+        merge_result(result, advance_keyframe_node(
+            *child, registry, dt, sheet_instance, sheet_generation, dirty_tracker, unreachable));
     }
     return result;
 }
 }
 
-PanoramaAnimationAdvanceResult panorama_advance_keyframes(
-    PanoramaNode& root, const std::unordered_map<std::string, PanoramaKeyframes>& keyframes, float dt)
+PanoramaAnimationAdvanceResult panorama_advance_keyframes(PanoramaNode& root,
+    const std::unordered_map<std::string, PanoramaKeyframes>& keyframes, float dt,
+    PanoramaRecompositeDirtyTracker* dirty_tracker)
 {
-    return advance_keyframe_node(root, keyframes, dt);
+    return advance_keyframe_node(root, keyframes, dt, 0, 0, dirty_tracker, false);
+}
+
+PanoramaAnimationAdvanceResult panorama_advance_keyframes(
+    PanoramaNode& root, const PanoramaStyleSheet& sheet, float dt, PanoramaRecompositeDirtyTracker* dirty_tracker)
+{
+    return advance_keyframe_node(
+        root, sheet.keyframes(), dt, sheet.instance_id(), sheet.generation(), dirty_tracker, false);
 }
 
 namespace

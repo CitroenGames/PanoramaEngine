@@ -215,6 +215,10 @@ public:
         std::span<const int> indices,
         float ui_scale) override
     {
+        // render_geometry() is never told ui_scale directly; remember it here so
+        // it can scale a PanoramaDrawConstants translation (design px) the same
+        // way vertex positions are about to be scaled below.
+        ui_scale_ = ui_scale;
         if (vertices.empty() || indices.empty())
         {
             return 0;
@@ -250,9 +254,32 @@ public:
         return handle;
     }
 
-    void render_geometry(panorama::PanoramaCompiledGeometryHandle geometry, panorama::PanoramaTextureId texture) override
+    void render_geometry(panorama::PanoramaCompiledGeometryHandle geometry, panorama::PanoramaTextureId texture,
+        const panorama::PanoramaDrawConstants& constants) override
     {
         if (current_cmd_ == nullptr)
+        {
+            return;
+        }
+        // Mirrors RhiUiRenderInterface::render_geometry's opacity<=0 skip and
+        // the geometry-cache software-raster examples: a fully-transparent
+        // draw (a fading-to-0 node kept in the draw list so the recomposite
+        // fast path can patch its constants through zero, see paint()'s
+        // opacity<=0 early-out) contributes nothing to the framebuffer, so
+        // skip the draw call entirely instead of submitting a no-op blend.
+        // TODO: for the Screen/Multiply/Opaque blend states below, `opacity`
+        // only ever scales alpha in the shader (uTranslateOpacity.z multiplies
+        // output.col.a, see the HLSL below) over STRAIGHT (non-premultiplied)
+        // vertex colors; those three states' color equations never reference
+        // source alpha (Screen = ONE/INV_SRC_COLOR, Multiply = DEST_COLOR/ZERO,
+        // Opaque = ONE/ZERO, all ignoring src alpha), so for any opacity in
+        // (0, 1) -- not just the <= 0 case handled here -- the draw is fully
+        // visible RGB-wise instead of fading; this adapter is a reference/
+        // example (not part of the OpenStrike build graph -- the game's
+        // RhiUiRenderInterface path is unaffected, see its own premultiplied
+        // whole-rgba multiply), so it is left as a documented gap rather than
+        // fixed here.
+        if (constants.opacity <= 0.0F)
         {
             return;
         }
@@ -278,6 +305,17 @@ public:
         current_cmd_->SetGraphicsRootSignature(root_signature_.Get());
         current_cmd_->SetPipelineState(pipeline_for(current_blend_));
         current_cmd_->SetGraphicsRoot32BitConstants(0, 16, projection_.data(), 0);
+        // Per-draw PanoramaDrawConstants, appended after the frame-constant
+        // projection in the same root parameter (see create_root_signature).
+        // a,b,c,d pass through unscaled; e,f are design px, scaled to
+        // framebuffer px like the vertex positions compile_geometry already
+        // scaled (see PanoramaDrawConstants's own comment on why only the
+        // translation is scaled).
+        const std::array<float, 8> draw_constants{
+            constants.a, constants.b, constants.c, constants.d,
+            constants.e * ui_scale_, constants.f * ui_scale_, constants.opacity, 0.0F,
+        };
+        current_cmd_->SetGraphicsRoot32BitConstants(0, 8, draw_constants.data(), 16);
         current_cmd_->SetGraphicsRootDescriptorTable(1, srv);
         current_cmd_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
@@ -486,7 +524,10 @@ private:
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants.ShaderRegister = 0; // b0
         params[0].Constants.RegisterSpace = 0;
-        params[0].Constants.Num32BitValues = 16; // mat4 projection
+        // mat4 projection (16) + per-draw PanoramaDrawConstants: uLinearAB
+        // (a,b,c,d, 4) + uTranslateOpacity (e,f,opacity,pad, 4) -- see
+        // render_geometry()'s SetGraphicsRoot32BitConstants calls below.
+        params[0].Constants.Num32BitValues = 16 + 4 + 4;
         params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[1].DescriptorTable.NumDescriptorRanges = 1;
@@ -533,7 +574,15 @@ private:
     [[nodiscard]] static Microsoft::WRL::ComPtr<ID3DBlob> compile_shader(const char* entry, const char* target)
     {
         static const char* kHlsl = R"HLSL(
-cbuffer Constants : register(b0) { row_major float4x4 uProj; };
+cbuffer Constants : register(b0)
+{
+    row_major float4x4 uProj;
+    // Per-draw PanoramaDrawConstants (panorama_paint.hpp), applied before uProj.
+    // uLinearAB = (a, b, c, d); uTranslateOpacity = (e, f, opacity, unused).
+    // e,f are already ui_scale-multiplied by the host, like input.pos.
+    float4 uLinearAB;
+    float4 uTranslateOpacity;
+};
 
 struct VSInput { float2 pos : POSITION; float2 uv : TEXCOORD0; float4 col : COLOR0; };
 struct PSInput { float4 pos : SV_Position; float2 uv : TEXCOORD0; float4 col : COLOR0; };
@@ -541,9 +590,17 @@ struct PSInput { float4 pos : SV_Position; float2 uv : TEXCOORD0; float4 col : C
 PSInput VSMain(VSInput input)
 {
     PSInput output;
-    output.pos = mul(uProj, float4(input.pos, 0.0f, 1.0f));
+    // CSS matrix(a,b,c,d,e,f) convention: x' = a*x + c*y + e, y' = b*x + d*y + f.
+    const float2 local = float2(
+        uLinearAB.x * input.pos.x + uLinearAB.z * input.pos.y + uTranslateOpacity.x,
+        uLinearAB.y * input.pos.x + uLinearAB.w * input.pos.y + uTranslateOpacity.y);
+    output.pos = mul(uProj, float4(local, 0.0f, 1.0f));
     output.uv = input.uv;
     output.col = input.col;
+    // Vertex colour is straight (non-premultiplied) alpha here (see the blend
+    // states below), so opacity scales alpha only -- scaling RGB too would
+    // incorrectly darken it.
+    output.col.a *= uTranslateOpacity.z;
     return output;
 }
 
@@ -897,6 +954,8 @@ float4 PSMain(PSInput input) : SV_Target
     Texture white_;
     panorama::PanoramaTextureId next_texture_id_ = 1;
     panorama::PanoramaCompiledGeometryHandle next_geometry_id_ = 1;
+    // ui_scale from the most recent compile_geometry() call (see its comment).
+    float ui_scale_ = 1.0F;
 
     // Per-frame state set by new_frame().
     ID3D12GraphicsCommandList* current_cmd_ = nullptr;

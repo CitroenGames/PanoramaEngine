@@ -306,7 +306,14 @@ PanoramaViewUpdateResult PanoramaView::update(float dt_seconds)
 
     result.animation_active = transitions.active || keyframes.active || scrolls.active;
     layout_dirty_ = transitions.layout_changed || keyframes.layout_changed || scrolls.layout_changed || layout_dirty_;
-    visual_dirty_ = transitions.visual_changed || keyframes.visual_changed || visual_dirty_;
+    // PanoramaView does not implement the recomposite-only fast path (see
+    // PanoramaNativeView for that): a transform/opacity-class change
+    // (recomposite_changed, Slice 3) still requires this simpler host to
+    // rebuild its draw list, exactly as it did before that class existed --
+    // fold it into visual_dirty_ alongside visual_changed.
+    visual_dirty_ =
+        transitions.visual_changed || keyframes.visual_changed || transitions.recomposite_changed ||
+        keyframes.recomposite_changed || visual_dirty_;
 
     if (layout_dirty_)
     {

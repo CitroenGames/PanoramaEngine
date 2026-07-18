@@ -328,6 +328,60 @@ Matrix2D node_transform_matrix(const PanoramaNode& node, const Matrix2D& parent)
     return multiply(parent, local);
 }
 
+// Whether `node` itself introduces a local 2D transform (CSS `transform`, or
+// pre-transform-scale2d/ui-scale/pre-transform-rotate2d) -- exactly mirrors
+// node_transform_matrix's `has_pre`-or-non-empty-transform check above. Every
+// term here composes into node_transform_matrix's `local` as a plain matrix
+// factor (translation(origin) * ops * pre_scale * ui_scale * pre_rotate *
+// translation(-origin)), so this is a clean per-node matrix contribution with
+// nothing left over to bake separately -- the condition a layer context opens
+// on (see DrawListBuilder::paint's layer-context comment).
+bool node_has_local_transform(const PanoramaNode& node)
+{
+    const PanoramaComputedStyle& s = node.computed;
+    return !s.transform.empty() || s.pre_scale_x != 1.0F || s.pre_scale_y != 1.0F || s.ui_scale_x != 1.0F ||
+        s.ui_scale_y != 1.0F || s.pre_rotate != 0.0F;
+}
+
+// Whether `node`'s own opacity is currently mid-animation: a running CSS
+// transition on `opacity`, or an @keyframes run that just wrote an
+// interpolated value because it declares an opacity channel. Used by
+// DrawListBuilder::paint's opacity<=0 early-out (layer-context design item
+// 6): an animating node must keep emitting (at constants.opacity == 0)
+// instead of vanishing from the draw list, so the command list's shape holds
+// steady across the whole fade and a later slice can patch just the opacity
+// constant without repainting.
+bool node_opacity_animating(const PanoramaNode& node)
+{
+    if (node.anim.opacity.animating)
+    {
+        return true;
+    }
+    const PanoramaNode::PanoramaKeyframeRuntime& kf = node.keyframe_anim;
+    return kf.applied && kf.keyframes != nullptr && (kf.keyframes->channels & PanoramaAnimOpacity) != 0;
+}
+
+// Transform twin of node_opacity_animating above: whether `node`'s own local
+// transform is currently mid-animation -- a running CSS transition on
+// `transform` or `pre-transform-scale2d` (both feed node_transform_matrix's
+// `local` factor, see its has_pre branch), or an @keyframes run that just
+// wrote an interpolated value because it declares a Transform channel.
+// `ui-scale`/`pre-transform-rotate2d` have no transition/keyframe support in
+// this engine (no PanoramaPropAnim exists for them in PanoramaAnimState, and
+// apply_keyframes_at has no channel for them either -- see panorama_anim.cpp)
+// so they can only change at a style-recompute boundary, which always
+// rebuilds anyway; nothing to check here for them. Used by
+// panorama_node_opens_layer_context's promotion-on-animate rule below.
+bool node_transform_animating(const PanoramaNode& node)
+{
+    if (node.anim.transform.animating || node.anim.pre_scale.animating)
+    {
+        return true;
+    }
+    const PanoramaNode::PanoramaKeyframeRuntime& kf = node.keyframe_anim;
+    return kf.applied && kf.keyframes != nullptr && (kf.keyframes->channels & PanoramaAnimTransform) != 0;
+}
+
 // Dest rectangle + texture coordinates for a background image, computed from
 // background-size / background-position and the texture's natural aspect. `cover`
 // (image larger than the box on an axis) crops via the uv range; `contain`/small
@@ -504,6 +558,14 @@ BackgroundAxisTiles compute_background_axis_tiles(PanoramaBackgroundRepeat mode,
 }
 
 // An axis-aligned clip rectangle in design space; `active == false` means unclipped.
+// `patchable` is FALSE once any contributing constraint was computed while
+// painting inside a non-root layer context (see PanoramaDrawCommand's
+// constants_patchable comment): such a rect depends on a matrix that a later
+// slice may want to patch without repainting, so it can never be treated as
+// fixed. intersect_clip/intersect_axis_clip only ever CARRY this flag forward
+// from `current` -- the caller (DrawListBuilder) downgrades it at the point a
+// new constraint is actually added, since only it knows which layer context is
+// current.
 struct ClipRect
 {
     bool active = false;
@@ -511,6 +573,7 @@ struct ClipRect
     float y0 = 0.0F;
     float x1 = 0.0F;
     float y1 = 0.0F;
+    bool patchable = true;
 };
 
 constexpr float kClipInfinity = 1000000.0F;
@@ -519,9 +582,10 @@ ClipRect intersect_clip(const ClipRect& current, float x0, float y0, float x1, f
 {
     if (!current.active)
     {
-        return {true, x0, y0, x1, y1};
+        return {true, x0, y0, x1, y1, current.patchable};
     }
-    return {true, std::max(current.x0, x0), std::max(current.y0, y0), std::min(current.x1, x1), std::min(current.y1, y1)};
+    return {true, std::max(current.x0, x0), std::max(current.y0, y0), std::min(current.x1, x1), std::min(current.y1, y1),
+        current.patchable};
 }
 
 ClipRect intersect_axis_clip(const ClipRect& current, float x0, float y0, float x1, float y1, bool clip_x, bool clip_y)
@@ -544,7 +608,13 @@ ClipRect intersect_axis_clip(const ClipRect& current, float x0, float y0, float 
     return intersect_clip(current, x0, y0, x1, y1);
 }
 
-ClipRect overflow_content_clip(const PanoramaNode& node, const ClipRect& current, const Matrix2D& matrix)
+// `patchable_context` is whether the calling node's own layer context is the
+// root one (see DrawListBuilder::clip_narrowing_is_patchable) -- when this
+// node's overflow actually narrows the clip (clip_x || clip_y) outside the
+// root context, the result is no longer patchable (it depends on THIS node's
+// matrix, which a non-root context means may change).
+ClipRect overflow_content_clip(
+    const PanoramaNode& node, const ClipRect& current, const Matrix2D& matrix, bool patchable_context)
 {
     const PanoramaLayoutBox& box = node.layout;
     const PanoramaComputedStyle& style = node.computed;
@@ -561,7 +631,12 @@ ClipRect overflow_content_clip(const PanoramaNode& node, const ClipRect& current
         // cropped at its untransformed position.
         map_rect_through(matrix, x0, y0, x1, y1);
     }
-    return intersect_axis_clip(current, x0, y0, x1, y1, clip_x, clip_y);
+    ClipRect out = intersect_axis_clip(current, x0, y0, x1, y1, clip_x, clip_y);
+    if ((clip_x || clip_y) && !patchable_context)
+    {
+        out.patchable = false;
+    }
+    return out;
 }
 
 // Per-corner border radii in CSS corner order (WebCore FloatRoundedRect::Radii).
@@ -745,6 +820,52 @@ bool paints_in_normal_dropdown_flow(const PanoramaNode& parent, const PanoramaNo
     const PanoramaNode* header = open_dropdown_header_child(parent);
     return header == nullptr || &child == header;
 }
+
+// ---- Layer contexts (PanoramaDrawConstants emission) --------------------------
+//
+// One entry in DrawListBuilder::contexts_: a node's FULLY accumulated 2D
+// transform + opacity -- the exact same values node_transform_matrix's return
+// and `opacity * s.opacity` compute today (see DrawListBuilder::paint), just
+// captured once as a distinct, identifiable entry instead of being baked into
+// every descendant vertex. Entry 0 (contexts_[0], the default-constructed
+// value here) is always the root: identity matrix, opacity 1.
+struct LayerContext
+{
+    Matrix2D matrix;
+    float opacity = 1.0F;
+};
+
+PanoramaDrawConstants as_draw_constants(const LayerContext& ctx)
+{
+    return {ctx.matrix.a, ctx.matrix.b, ctx.matrix.c, ctx.matrix.d, ctx.matrix.e, ctx.matrix.f, ctx.opacity};
+}
+
+// Threaded down paint()'s recursion alongside `opacity`/`parent_transform` --
+// a plain value restored for free when a recursive call returns, not a stack
+// the caller must push/pop:
+//  - context_id: index into DrawListBuilder::contexts_ that new commands
+//    attach as PanoramaDrawConstants (0 = root = identity, see above).
+//  - legacy_bake: once a node's own clip:radial (or another vertex-generation-
+//    depends-on-the-final-matrix case) trips this, it and every descendant
+//    paint in the pre-layer-context baked mode (constants stay identity,
+//    transform/opacity go straight into vertex data) -- see paint()'s
+//    legacy-bake comment. Sticky: never turns back off within a subtree.
+//  - local_transform/local_opacity: the STATIC (non-promoted) baked
+//    accumulator below the nearest enclosing context root -- identity/1.0
+//    immediately below a promoted context (or the document root), composed
+//    with each STATIC non-identity node's own local transform/opacity as the
+//    walk descends through them, and reset to identity/1.0 again the instant
+//    a node promotes to its OWN new context (that node's subtree starts
+//    fresh relative to it). This is exactly the pre-layer-context painter's
+//    vertex-baking math, just relative to the nearest context instead of the
+//    world root -- see paint()'s promotion-on-animate paragraph.
+struct PaintLayerState
+{
+    std::size_t context_id = 0;
+    bool legacy_bake = false;
+    Matrix2D local_transform;
+    float local_opacity = 1.0F;
+};
 
 class DrawListBuilder
 {
@@ -1340,7 +1461,12 @@ public:
                 return;
             }
             const ClipRect saved = clip_;
-            set_clip(intersect_clip(saved, box.x, box.y, box.x + box.width, box.y + box.height));
+            ClipRect inset_clip = intersect_clip(saved, box.x, box.y, box.x + box.width, box.y + box.height);
+            if (!clip_narrowing_is_patchable())
+            {
+                inset_clip.patchable = false;
+            }
+            set_clip(inset_clip);
             // side: 0 = top, 1 = bottom, 2 = left, 3 = right.
             const auto edge = [&](float dist, int side) {
                 const float solid = std::max(0.0F, dist - b);
@@ -1487,10 +1613,14 @@ public:
         };
         for (const auto& region : regions)
         {
-            const ClipRect region_clip = intersect_clip(saved, region.x0, region.y0, region.x1, region.y1);
+            ClipRect region_clip = intersect_clip(saved, region.x0, region.y0, region.x1, region.y1);
             if (region_clip.x1 <= region_clip.x0 || region_clip.y1 <= region_clip.y0)
             {
                 continue;
+            }
+            if (!clip_narrowing_is_patchable())
+            {
+                region_clip.patchable = false;
             }
             set_clip(region_clip);
             emit_core_and_falloff();
@@ -1498,7 +1628,8 @@ public:
         set_clip(saved);
     }
 
-    void paint(const PanoramaNode& node, float opacity, const Matrix2D& parent_transform, const ClipRect& clip)
+    void paint(const PanoramaNode& node, float opacity, const Matrix2D& parent_transform, const ClipRect& clip,
+        const PaintLayerState& layer)
     {
         const PanoramaComputedStyle& s = node.computed;
         if (!s.visible)
@@ -1506,12 +1637,123 @@ public:
             return;
         }
         const float node_opacity = opacity * s.opacity;
-        if (node_opacity <= 0.0F)
+        // Opacity<=0 normally early-outs the whole subtree (nothing to paint).
+        // But when THIS NODE'S OWN opacity is mid-animation (its own
+        // transition/keyframe), the subtree must keep emitting at
+        // constants.opacity == 0 instead: the draw list's command shape then
+        // holds steady across the whole fade, so a later slice can patch just
+        // the opacity constant through zero and back without ever repainting
+        // (layer-context design item 6). This checks `s.opacity` (this
+        // node's OWN factor), not `node_opacity` (the full accumulated
+        // value), and does NOT consider an ANCESTOR's opacity_animating state
+        // -- a node whose own static factor is already 0 contributes nothing
+        // at ANY point of an ancestor's fade, so there is nothing for it to
+        // keep emitting for; omitting it keeps the draw list's shape stable
+        // regardless (see node_opacity_animating's own comment).
+        if (s.opacity <= 0.0F && !node_opacity_animating(node))
         {
             return;
         }
         const PanoramaLayoutBox& box = node.layout;
         const Matrix2D transform = node_transform_matrix(node, parent_transform);
+
+        // clip:radial's wedge clipper post-processes already-transformed
+        // vertices (see apply_radial_clip below), so its output shape
+        // genuinely depends on the final matrix -- this node and its whole
+        // subtree fall back to the pre-layer-context baked mode
+        // (legacy_bake_here below). Resolved before any clip narrowing so
+        // self_clip/content_clip's `patchable` flag reflects the context they
+        // are actually computed inside. rect() and radial() are mutually
+        // exclusive (PanoramaClipType), so hoisting this ahead of the rect()
+        // handling below does not change which early-return fires for either.
+        const bool radial_clip = s.clip.type == PanoramaClipType::Radial && s.clip.radial_sweep > 0.0F;
+        if (radial_clip && s.clip.radial_sweep >= 360.0F)
+        {
+            return; // the hidden wedge covers the full circle
+        }
+
+        // Layer contexts (see LayerContext/PaintLayerState above and
+        // PanoramaDrawCommand::constants): under the legacy-bake fallback,
+        // transform/opacity bake straight into vertex data exactly as the
+        // pre-layer-context painter always did, so no context is opened at
+        // all. Otherwise, promotion-on-animate: a node with an ACTIVELY
+        // ANIMATING recomposite-class channel of its own (see
+        // panorama_node_opens_layer_context) opens a NEW context -- covering
+        // this node's own geometry below and its descendants until a nested
+        // context takes over -- carrying `transform`/`node_opacity` (the
+        // exact same FULL accumulated-from-root values as always) as that
+        // context's matrix/opacity; this is unaffected by any STATIC
+        // intervening ancestor's own local contribution, since `transform`/
+        // `node_opacity` already compose through every ancestor unconditionally
+        // (see node_transform_matrix's associativity, threaded via
+        // `parent_transform`/`opacity` regardless of context/bake state).
+        // A node with a STATIC (non-animating) non-identity local transform
+        // or opacity < 1 does NOT open a context -- it bakes into its own
+        // vertices/colours instead, exactly like the pre-layer-context
+        // painter, but RELATIVE TO THE ENCLOSING CONTEXT (layer.local_transform/
+        // local_opacity) instead of the world root, so a context's constants
+        // applied on top at render/patch time are not double-counted. A node
+        // with neither just inherits its parent's context AND local bake
+        // state unchanged.
+        const bool legacy_bake_here = layer.legacy_bake || radial_clip;
+        std::size_t node_context = layer.context_id;
+        Matrix2D node_local_transform = layer.local_transform;
+        float node_local_opacity = layer.local_opacity;
+        if (!legacy_bake_here)
+        {
+            if (panorama_node_opens_layer_context(node))
+            {
+                contexts_.push_back(LayerContext{transform, node_opacity});
+                node_context = contexts_.size() - 1;
+                // Mirror into the output table (PanoramaLayerContextEntry) in
+                // lockstep with contexts_ above, so list_.contexts.size() ==
+                // contexts_.size() - 1 always holds (contexts_[0] is the
+                // implicit root, never mirrored) and this entry lands at table
+                // index node_context - 1 -- exactly what current_command()'s
+                // context_index mapping below expects.
+                list_.contexts.push_back(PanoramaLayerContextEntry{
+                    &node, layer.context_id == 0 ? -1 : static_cast<int>(layer.context_id) - 1});
+                // Fresh context root: the local baked accumulator restarts at
+                // identity immediately below it (see PaintLayerState's comment).
+                node_local_transform = Matrix2D{};
+                node_local_opacity = 1.0F;
+            }
+            else if (node_has_local_transform(node) || s.opacity < 1.0F)
+            {
+                // Static bake, relative to the enclosing context: compose
+                // this node's own local delta onto whatever was already
+                // accumulated since the nearest context root (exactly
+                // node_transform_matrix's ordinary composition, just with
+                // `layer.local_transform` in place of the world-root-relative
+                // `parent_transform` -- see node_transform_matrix's
+                // associativity argument, which holds identically here).
+                node_local_transform = node_transform_matrix(node, layer.local_transform);
+                node_local_opacity = layer.local_opacity * s.opacity;
+            }
+        }
+        current_context_id_ = node_context;
+        legacy_bake_ = legacy_bake_here;
+
+        // What to bake directly into vertex positions/colours below: the
+        // legacy-bake fallback bakes the FULL accumulated (world-root-
+        // relative) transform/opacity, same as ever; a promoted node bakes
+        // NEITHER (node_local_transform/opacity reset to identity/1.0 just
+        // above) -- it emits raw layout-space vertices with straight
+        // node-local colour and lets `node_context`'s PanoramaDrawConstants
+        // (see current_command()) carry the rest; a static node (or a plain
+        // descendant inheriting a static ancestor's accumulator) bakes the
+        // CONTEXT-RELATIVE local accumulator computed above. Node-local
+        // colour filters (wash/brightness/saturation, applied via
+        // apply_color_filter/texture_tint below) stay baked either way --
+        // only the transform/INHERITED-opacity factor a context or the local
+        // accumulator carries ever moves out of the vertex data.
+        const Matrix2D bake_matrix = legacy_bake_here ? transform : node_local_transform;
+        const float bake_opacity = legacy_bake_here ? node_opacity : node_local_opacity;
+        // Whether a clip narrowed below (this node's own clip:rect, or its
+        // overflow further down) may be marked ClipRect::patchable -- only
+        // when this node's own layer context is the root and it is not itself
+        // legacy-baked (see clip_narrowing_is_patchable's comment).
+        const bool clip_narrowing_patchable = clip_narrowing_is_patchable();
 
         // Panorama `clip:` — a render-time clip on the panel AND its subtree (does
         // not affect layout or hit testing). rect() narrows the scissor; radial()
@@ -1534,11 +1776,10 @@ public:
                 map_rect_through(transform, rx0, ry0, rx1, ry1);
             }
             self_clip = intersect_clip(self_clip, rx0, ry0, rx1, ry1);
-        }
-        const bool radial_clip = s.clip.type == PanoramaClipType::Radial && s.clip.radial_sweep > 0.0F;
-        if (radial_clip && s.clip.radial_sweep >= 360.0F)
-        {
-            return; // the hidden wedge covers the full circle
+            if (!clip_narrowing_patchable)
+            {
+                self_clip.patchable = false;
+            }
         }
         std::size_t radial_cmd_start = 0;
         std::size_t radial_back_index_start = 0;
@@ -1581,7 +1822,7 @@ public:
             (bw_bottom > 0.0F && s.border_bottom_color().visible()) ||
             (bw_left > 0.0F && s.border_left_color().visible());
         // Outset box-shadow paints behind the background/border.
-        emit_box_shadow(node, box, radii, node_opacity, transform, false);
+        emit_box_shadow(node, box, radii, bake_opacity, bake_matrix, false);
 
         // WebCore paint order (BackgroundPainter then BorderPainter): the
         // background fills the WHOLE border box first (background-clip:
@@ -1589,10 +1830,10 @@ public:
         // outer and inner rounded rects (paintBorderSides clips out the inner
         // border). Painting the border as a full backdrop instead would tint
         // every translucent background with the border colour.
-        emit_background_fill(s, box.x, box.y, box.width, box.height, radii, node_opacity, transform);
+        emit_background_fill(s, box.x, box.y, box.width, box.height, radii, bake_opacity, bake_matrix);
         if (node.background_texture != 0)
         {
-            const PanoramaColor tint = texture_tint(s, node_opacity * s.background_image_opacity);
+            const PanoramaColor tint = texture_tint(s, bake_opacity * s.background_image_opacity);
             // WebCore default background-origin: padding-box — the image is sized
             // and positioned within the padding box (border-box minus borders), not
             // the border box, so a border does not shift a centered icon. (Clip stays
@@ -1602,7 +1843,7 @@ public:
             const float pad_y = box.y + s.border_top();
             const float pad_w = box.width - s.border_left() - s.border_right();
             const float pad_h = box.height - s.border_top() - s.border_bottom();
-            emit_background_image(node, pad_x, pad_y, pad_w, pad_h, radii, tint, transform);
+            emit_background_image(node, pad_x, pad_y, pad_w, pad_h, radii, tint, bake_matrix);
         }
 
         if (has_border && rounded)
@@ -1618,18 +1859,18 @@ public:
                 bc = s.border_bottom_color().visible() ? s.border_bottom_color()
                     : s.border_left_color().visible() ? s.border_left_color() : s.border_right_color();
             }
-            bc = scale_alpha(apply_color_filter(bc, s), node_opacity);
+            bc = scale_alpha(apply_color_filter(bc, s), bake_opacity);
             const float inner_w = box.width - 2.0F * bw;
             const float inner_h = box.height - 2.0F * bw;
             if (inner_w <= 0.0F || inner_h <= 0.0F)
             {
                 // The border swallows the whole box.
-                add_rounded_rect(box.x, box.y, box.width, box.height, radii, bc, 0, transform);
+                add_rounded_rect(box.x, box.y, box.width, box.height, radii, bc, 0, bake_matrix);
             }
             else
             {
                 add_rounded_ring(box.x + bw, box.y + bw, inner_w, inner_h, radii.shrunk(bw), bc,
-                    box.x, box.y, box.width, box.height, radii, bc, transform);
+                    box.x, box.y, box.width, box.height, radii, bc, bake_matrix);
             }
         }
         else if (has_border)
@@ -1641,7 +1882,7 @@ public:
             const auto side = [&](float x, float y, float w, float h, PanoramaColor color) {
                 if (w > 0.0F && h > 0.0F && color.visible())
                 {
-                    add_rect(x, y, w, h, scale_alpha(apply_color_filter(color, s), node_opacity), 0, transform);
+                    add_rect(x, y, w, h, scale_alpha(apply_color_filter(color, s), bake_opacity), 0, bake_matrix);
                 }
             };
             side(box.x, box.y, box.width, bw_top, s.border_top_color());
@@ -1652,13 +1893,13 @@ public:
         }
 
         // Inset box-shadow paints over the background/border (clipped to the box).
-        emit_box_shadow(node, box, radii, node_opacity, transform, true);
+        emit_box_shadow(node, box, radii, bake_opacity, bake_matrix, true);
 
         // WebCore clips contents after painting the background/border (see
         // RenderBox::pushContentsClip / overflowClipRect). Apply the same content
         // clip to this node's image/text and descendants, but not to its own box
         // decorations.
-        const ClipRect content_clip = overflow_content_clip(node, self_clip, transform);
+        const ClipRect content_clip = overflow_content_clip(node, self_clip, transform, clip_narrowing_patchable);
 
         // Image content (e.g. a rasterized SVG icon) fills the content box. CS:GO
         // icons are white masks tinted by the (inherited) wash-color and brightness,
@@ -1725,13 +1966,13 @@ public:
                 // As with text-shadow: strength may exceed 1, scale_alpha clamps.
                 PanoramaColor silhouette = s.img_shadow.color;
                 silhouette.a = static_cast<std::uint8_t>(std::clamp(
-                    static_cast<float>(silhouette.a) * std::clamp(node_opacity, 0.0F, 1.0F) * s.img_shadow.strength,
+                    static_cast<float>(silhouette.a) * std::clamp(bake_opacity, 0.0F, 1.0F) * s.img_shadow.strength,
                     0.0F, 255.0F) + 0.5F);
                 if (silhouette.a != 0)
                 {
                     const auto draw_silhouette = [&](float dx, float dy, PanoramaColor c) {
                         add_rect(img_x + s.img_shadow.offset_x + dx, img_y + s.img_shadow.offset_y + dy,
-                            img_w, img_h, c, node.paint_texture, transform);
+                            img_w, img_h, c, node.paint_texture, bake_matrix);
                     };
                     const float blur_radius = 0.5F * s.img_shadow.blur;
                     if (blur_radius > 0.25F)
@@ -1748,8 +1989,8 @@ public:
                     draw_silhouette(0.0F, 0.0F, silhouette);
                 }
             }
-            const PanoramaColor tint = texture_tint(s, node_opacity);
-            add_rect(img_x, img_y, img_w, img_h, tint, node.paint_texture, transform);
+            const PanoramaColor tint = texture_tint(s, bake_opacity);
+            add_rect(img_x, img_y, img_w, img_h, tint, node.paint_texture, bake_matrix);
         }
 
         // A focused TextEntry paints even when empty so its caret still shows.
@@ -1759,7 +2000,7 @@ public:
             // Toggle/radio buttons render their text via the internal control
             // label child (ensure_panorama_selection_control_internals).
             set_clip(content_clip);
-            paint_text(node, node_opacity, transform);
+            paint_text(node, bake_opacity, bake_matrix);
         }
 
         // overflow clips descendants to the padding box. A single-axis clip uses a
@@ -1771,6 +2012,7 @@ public:
         // keeping DOM order for equal z. z-index ordering is applied among direct
         // siblings only (no full CSS stacking contexts); this covers Panorama's use of
         // z-index to layer popups/tooltips/dropdowns over their siblings.
+        const PaintLayerState child_layer{node_context, legacy_bake_here, node_local_transform, node_local_opacity};
         bool needs_sort = false;
         for (const auto& child : node.children)
         {
@@ -1788,7 +2030,7 @@ public:
                 {
                     continue;
                 }
-                paint(*child, node_opacity, transform, child_clip);
+                paint(*child, node_opacity, transform, child_clip, child_layer);
             }
         }
         else
@@ -1807,7 +2049,7 @@ public:
                 {
                     continue;
                 }
-                paint(*child, node_opacity, transform, child_clip);
+                paint(*child, node_opacity, transform, child_clip, child_layer);
             }
         }
 
@@ -1850,6 +2092,42 @@ public:
                 cmd.blur_std_x = std::max(0.0F, s.blur.std_x);
                 cmd.blur_std_y = std::max(0.0F, s.blur.std_y);
                 cmd.blur_passes = std::max(1, static_cast<int>(s.blur.passes + 0.5F));
+                cmd.blur_source_node = &node;
+                // Stamp this node's own layer context onto the blur command
+                // exactly like current_command() does (see PanoramaGeometryCache
+                // review notes: without this, a subtree that fades to opacity 0
+                // via the recomposite fast path keeps blurring forever, since
+                // replay()/submit() gate blur_region on constants.opacity <= 0
+                // -- see PanoramaGeometryCache::submit/replay). Reads the LOCAL
+                // `node_context`/`legacy_bake_here` captured earlier in THIS
+                // paint() call, NOT the current_context_id_/legacy_bake_ member
+                // fields -- those were already overwritten by whichever
+                // descendant painted last (this code runs AFTER the children
+                // loop above), so only the stack-local values are still this
+                // node's own. constants_patchable mirrors self_clip (this
+                // node's own resolved clip, same reasoning) rather than the
+                // now-stale clip_ member -- AND `legacy_bake_here`, exactly
+                // like current_command()'s own formula just below in this
+                // file (`!legacy_bake_ && (!clip_.active || clip_.patchable)`):
+                // without that term, a blur command painted while
+                // legacy_bake_here is true (this node sits under a clip:
+                // radial subtree or a dropdown popup) got context_index -1
+                // AND could still read back constants_patchable == true
+                // whenever self_clip carried no active/non-patchable clip of
+                // its own -- exactly the entry_context_index < 0 &&
+                // !entry_constants_patchable predicate PanoramaNativeView::
+                // try_recomposite_fast_path's precondition 4 relies on to
+                // catch legacy-baked entries (see its "legacy-baked entry
+                // bail" comment) would silently NOT catch this blur command,
+                // so a fast-path frame could patch the enclosing (legacy-
+                // baked-past) context while this blur's cached constants.opacity
+                // -- frozen identity, never the real ancestor opacity -- never
+                // reflects it.
+                cmd.constants =
+                    legacy_bake_here ? PanoramaDrawConstants{} : as_draw_constants(contexts_[node_context]);
+                cmd.constants_patchable = !legacy_bake_here && (!self_clip.active || self_clip.patchable);
+                cmd.context_index =
+                    (legacy_bake_here || node_context == 0) ? -1 : static_cast<int>(node_context) - 1;
                 list_.commands.push_back(std::move(cmd));
             };
 
@@ -1929,6 +2207,15 @@ private:
         const PanoramaLayoutBox& box = dropdown.popup_layout;
         set_clip(ClipRect{});
         set_blend(PanoramaBlendMode::Normal);
+        // Popups escape their (possibly transformed/animating) container to
+        // paint in screen space with their own explicit Matrix2D{} baking
+        // below -- reset the builder's layer-context state so a stale
+        // non-root context left over from the main tree walk's last node
+        // cannot leak into this command (mirrors the set_clip/set_blend reset
+        // above). The recursive paint() call further down re-establishes this
+        // for its own subtree regardless, via the PaintLayerState passed in.
+        legacy_bake_ = true;
+        current_context_id_ = 0;
 
         // CS:GO's DropDownMenu uses contextMenuBackground rgba(44,44,44,0.98).
         add_rounded_rect(box.x, box.y, box.width, box.height, 2.0F, scale_alpha({44, 44, 44, 250}, opacity), 0, Matrix2D{});
@@ -1969,7 +2256,14 @@ private:
             {
                 popup_node.computed.background_color = {80, 80, 80, 255};
             }
-            paint(popup_node, opacity, Matrix2D{}, ClipRect{});
+            // Legacy-bake: popups are a rare, secondary path (not part of the
+            // continuously-animating menu chrome layer contexts optimize
+            // for), so painting them fully baked -- exactly as before layer
+            // contexts existed -- sidesteps needing a synthetic parent
+            // context for `opacity` (which, unlike the main tree walk, is
+            // already pre-accumulated across the dropdown's OWN ancestor
+            // chain here, not just this popup_node's).
+            paint(popup_node, opacity, Matrix2D{}, ClipRect{}, PaintLayerState{0, true});
         }
     }
 
@@ -2086,7 +2380,26 @@ private:
         {
             return false;
         }
-        if (cmd.texture != texture || cmd.blend_mode != blend_ || cmd.scissor != clip_.active)
+        // Two commands may only share a batch when they were emitted under the
+        // SAME layer context object (compared by id, not by matrix/opacity
+        // equality) -- otherwise two independently-animated subtrees whose
+        // matrices happen to be momentarily equal would merge and could never
+        // be told apart again once one of them animates. Patchability must
+        // ALSO match (same formula current_command() uses to SET
+        // constants_patchable below): two geometries can reach identical
+        // texture/blend/scissor/context-id despite one being non-patchable --
+        // e.g. legacy-baked geometry and plain root-context geometry both
+        // carry identity constants and effective_context_id() 0, or a
+        // narrowed child clip that happens to numerically equal its parent's
+        // (see map_rect_through's own comment) -- so command_matches (not
+        // just current_command()'s creation formula) must compare it too, or
+        // merging them would silently downgrade the command's real
+        // non-patchable dependency without updating its `constants_patchable`
+        // flag, letting a later patched frame move the command's constants
+        // while part of its geometry's scissor dependency goes stale.
+        const bool would_be_patchable = !legacy_bake_ && (!clip_.active || clip_.patchable);
+        if (cmd.texture != texture || cmd.blend_mode != blend_ || cmd.scissor != clip_.active ||
+            last_command_context_id_ != effective_context_id() || cmd.constants_patchable != would_be_patchable)
         {
             return false;
         }
@@ -2114,7 +2427,21 @@ private:
                 cmd.scissor_width = std::max(0.0F, clip_.x1 - clip_.x0);
                 cmd.scissor_height = std::max(0.0F, clip_.y1 - clip_.y0);
             }
+            // PanoramaDrawConstants (see PaintLayerState/LayerContext above):
+            // legacy-bake mode never opens a context -- transform/opacity are
+            // baked into the vertices below instead -- so it always leaves this
+            // identity; the fast path attaches the current context's
+            // accumulated matrix+opacity instead of baking them in.
+            cmd.constants = legacy_bake_ ? PanoramaDrawConstants{} : as_draw_constants(contexts_[current_context_id_]);
+            cmd.constants_patchable = !legacy_bake_ && (!clip_.active || clip_.patchable);
+            // Table-index mapping mirrors the list_.contexts.push_back above:
+            // internal contexts_ id 0 is the implicit root (table index -1);
+            // id N>=1 is table index N-1.
+            cmd.context_index = (legacy_bake_ || current_context_id_ == 0)
+                ? -1
+                : static_cast<int>(current_context_id_) - 1;
             list_.commands.push_back(std::move(cmd));
+            last_command_context_id_ = effective_context_id();
         }
         return list_.commands.back();
     }
@@ -2130,6 +2457,22 @@ private:
             cmd.blur_std_x = 0.0F;
             cmd.blur_std_y = 0.0F;
             cmd.blur_passes = 0;
+            // Defensive resets (review_cache_lifetime / review_transform_math
+            // "acquire_command leaks stale fields" findings): both creation
+            // paths (current_command() and emit_blur_rect's lambda above)
+            // already overwrite constants/constants_patchable/context_index
+            // unconditionally, so this is currently a no-op for those three --
+            // but blur_source_node is only ever SET (by the blur path), never
+            // CLEARED (by the geometry path), so without this a geometry
+            // command recycled from a slot a PREVIOUS frame used for a blur
+            // command would carry forward a dangling blur_source_node pointer
+            // once that node is destroyed. Reset all four together so this
+            // stays correct if a future change ever reads one of them before
+            // it is (re)written.
+            cmd.constants = PanoramaDrawConstants{};
+            cmd.constants_patchable = true;
+            cmd.context_index = -1;
+            cmd.blur_source_node = nullptr;
         }
         return cmd;
     }
@@ -2494,7 +2837,107 @@ private:
     ClipRect clip_;
     PanoramaBlendMode blend_ = PanoramaBlendMode::Normal;
     const PanoramaNode* document_root_ = nullptr;
+
+    // Layer-context state for whatever node's own paint() frame is currently
+    // emitting (see the PaintLayerState/LayerContext comments above and
+    // paint()'s layer-context paragraph) -- set at the top of paint() /
+    // paint_dropdown_popup() like clip_/blend_ above, and read by
+    // current_command() when a new PanoramaDrawCommand is created.
+    std::vector<LayerContext> contexts_{LayerContext{}}; // [0] = root: identity, opacity 1
+    std::size_t current_context_id_ = 0;
+    bool legacy_bake_ = false;
+    // Context id that created list_.commands.back(), so command_matches() can
+    // require the SAME context object (not merely equal matrix/opacity floats
+    // -- two independently-animated subtrees must never batch together even
+    // when momentarily equal, see PaintLayerState's comment).
+    std::size_t last_command_context_id_ = 0;
+
+    // The context id new commands should batch/compare against right now:
+    // legacy-bake mode never opens a context (see current_command()), so it
+    // always collapses to the root id -- which is exactly correct, since a
+    // legacy-baked command's vertices are already in final space, same as an
+    // actual root-context command's (both carry identity constants).
+    [[nodiscard]] std::size_t effective_context_id() const { return legacy_bake_ ? 0 : current_context_id_; }
+
+    // Whether a clip constraint added RIGHT NOW would be safe to mark
+    // `patchable` (see ClipRect's comment): only when this node's own layer
+    // context is the root AND it is not inside the legacy-bake fallback (which
+    // forces constants_patchable false unconditionally regardless of clip, see
+    // current_command()).
+    [[nodiscard]] bool clip_narrowing_is_patchable() const { return !legacy_bake_ && current_context_id_ == 0; }
 };
+}
+
+PanoramaPaintVertex panorama_apply_draw_constants(const PanoramaPaintVertex& vertex, const PanoramaDrawConstants& constants)
+{
+    if (constants.is_identity())
+    {
+        return vertex;
+    }
+    return {
+        constants.a * vertex.x + constants.c * vertex.y + constants.e,
+        constants.b * vertex.x + constants.d * vertex.y + constants.f,
+        vertex.u,
+        vertex.v,
+        scale_alpha(vertex.color, constants.opacity),
+    };
+}
+
+bool panorama_node_paint_unreachable(const PanoramaNode& node)
+{
+    if (!node.computed.visible)
+    {
+        return true;
+    }
+    return node.computed.opacity <= 0.0F && !node_opacity_animating(node);
+}
+
+bool panorama_node_opens_layer_context(const PanoramaNode& node)
+{
+    return node_transform_animating(node) || node_opacity_animating(node);
+}
+
+namespace
+{
+// Composes every ancestor's own local transform/opacity from
+// `parent_source_node` (EXCLUSIVE) down to and INCLUDING `node`, on top of
+// `matrix`/`opacity` (the nearest ancestor context's already-accumulated
+// value). Recurses UP via PanoramaNode::parent before applying anything, so
+// the OUTERMOST skipped ancestor composes first when the recursion unwinds --
+// the same order paint()'s own top-down recursion threads
+// `parent_transform`/`opacity` through (see node_transform_matrix's
+// associativity argument above). Ancestors strictly between
+// `parent_source_node` and `node` cannot themselves have opened a layer
+// context (a promoted ancestor would BE `parent_source_node`, or a nearer
+// one -- PanoramaNativeView::try_recomposite_fast_path's precondition 3
+// guarantees no node crosses INTO promotion without a repaint first), so
+// under promotion-on-animate they can still carry a STATIC non-identity
+// local transform/opacity that paint()'s local baked-accumulator absorbed
+// into `node`'s vertices (see paint()'s layer-context paragraph) -- this
+// exactly replays that composition instead of jumping straight from
+// `parent_source_node` to `node` the way a single node_transform_matrix call
+// could before promotion-on-animate (when every in-between node was
+// necessarily identity).
+void recompute_layer_context_chain(
+    const PanoramaNode& node, const PanoramaNode* parent_source_node, Matrix2D& matrix, float& opacity)
+{
+    if (node.parent != nullptr && node.parent != parent_source_node)
+    {
+        recompute_layer_context_chain(*node.parent, parent_source_node, matrix, opacity);
+    }
+    matrix = node_transform_matrix(node, matrix);
+    opacity *= node.computed.opacity;
+}
+}
+
+PanoramaDrawConstants panorama_recompute_layer_context(
+    const PanoramaNode& node, const PanoramaNode* parent_source_node, const PanoramaDrawConstants& parent_context)
+{
+    Matrix2D matrix{
+        parent_context.a, parent_context.b, parent_context.c, parent_context.d, parent_context.e, parent_context.f};
+    float opacity = parent_context.opacity;
+    recompute_layer_context_chain(node, parent_source_node, matrix, opacity);
+    return {matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f, opacity};
 }
 
 std::size_t PanoramaDrawList::total_vertices() const
@@ -2533,10 +2976,11 @@ void build_panorama_draw_list(
     {
         out.commands.clear();
     }
+    out.contexts.clear(); // capacity retained across frames, same as out.commands above
 
     DrawListBuilder builder(out, glyphs, scratch);
     builder.set_document_root(&root);
-    builder.paint(root, 1.0F, Matrix2D{}, ClipRect{});
+    builder.paint(root, 1.0F, Matrix2D{}, ClipRect{}, PaintLayerState{});
     builder.paint_dropdown_popups(root, 1.0F);
 }
 

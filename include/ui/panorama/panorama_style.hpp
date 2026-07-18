@@ -122,6 +122,20 @@ struct PanoramaEasing
     float y2 = 1.0F;
     bool linear = true;
 
+    // Cubic coefficients derived from the control points, cached on the first
+    // non-linear evaluate so per-frame evaluates only run the solve. Safe: the
+    // control points are never mutated after construction, and evaluate() runs
+    // on the single-threaded animation advance only. Mutable so evaluate()
+    // stays const; keep these AFTER `linear` — aggregate initializers list the
+    // five control-point members positionally.
+    mutable bool coeffs_valid = false;
+    mutable double coeff_ax = 0.0;
+    mutable double coeff_bx = 0.0;
+    mutable double coeff_cx = 0.0;
+    mutable double coeff_ay = 0.0;
+    mutable double coeff_by = 0.0;
+    mutable double coeff_cy = 0.0;
+
     [[nodiscard]] float evaluate(float t) const;
 };
 
@@ -792,6 +806,13 @@ public:
     {
         return keyframes_;
     }
+
+    // Cache-revalidation identity: the never-reused sheet instance id (never 0)
+    // plus the content generation bumped by add_source/add_source_scope/clear.
+    // External caches holding pointers into this sheet (a node's keyframe-
+    // resolution cache) are valid only while both match.
+    [[nodiscard]] std::uint64_t instance_id() const noexcept { return instance_id_; }
+    [[nodiscard]] std::uint64_t generation() const noexcept { return generation_; }
 
     // Substitutes `@define`d variables referenced as bare identifiers in a value
     // (e.g. `blurBackgroundColor` -> `rgba(40, 40, 40, 0.3)`), recursively. Public

@@ -171,6 +171,17 @@ struct PanoramaAnimState
     float pre_scale_x_reversing_start = 1.0F;
     float pre_scale_y_reversing_start = 1.0F;
     PanoramaPropAnim pre_scale;
+
+    // True when any channel's transition is running. A stateless OR over the
+    // `animating` flags (a maintained counter could drift out of sync); the
+    // per-frame advance early-outs idle nodes with it.
+    [[nodiscard]] bool any_channel_animating() const noexcept
+    {
+        return opacity.animating || pos.animating || color.animating || bg.animating ||
+            background_image_opacity.animating || wash.animating || brightness.animating || transform.animating ||
+            width.animating || height.animating || border_width.animating || border_color.animating ||
+            box_shadow.animating || blur.animating || clip.animating || pre_scale.animating;
+    }
 };
 
 // Cache of a node's parsed `inline_style` declarations, owned by the node and
@@ -365,6 +376,16 @@ struct PanoramaNode
     // advance writes back into `computed` each frame.
     bool style_fresh = true;
 
+    // Slice 3 (PanoramaDrawConstants campaign): dedup stamp for the per-advance
+    // recomposite-dirty node list (see PanoramaRecompositeDirtyTracker /
+    // PanoramaAnimationAdvanceResult::recomposite_changed in panorama_anim.hpp).
+    // Set to the tracker's current `generation` the first time this node is
+    // recorded during that generation, so a node touched by multiple channels
+    // (or by both the transitions and @keyframes advance passes in the same
+    // frame, when the caller reuses one tracker across both calls) is recorded
+    // once. Sibling to `style_fresh` above but independent of it.
+    std::uint32_t recomposite_dirty_stamp = 0;
+
     // Marks this subtree for recompute and flags the ancestor chain so
     // compute_invalidated can find it. Call after mutating anything the cascade
     // reads (classes, attributes, inline style, pseudo state).
@@ -381,6 +402,17 @@ struct PanoramaNode
         std::string active_name;
         float elapsed = 0.0F;
         bool finished = false;
+        // True once the timeline has written computed values that a later
+        // non-applying frame must revert (see advance_keyframe_node).
+        bool applied = false;
+        // Registry resolution for active_name, valid only for the exact sheet
+        // (instance id, generation) pair it was resolved against — the registry
+        // is only mutated by add_source/clear, which bump the generation, so a
+        // validated pointer cannot dangle. Instance ids are never 0; nullptr
+        // with a non-zero instance records "no usable keyframes" for the name.
+        const PanoramaKeyframes* keyframes = nullptr;
+        std::uint64_t sheet_instance = 0;
+        std::uint64_t sheet_generation = 0;
     };
     PanoramaKeyframeRuntime keyframe_anim;
 

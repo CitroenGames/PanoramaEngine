@@ -66,7 +66,30 @@ public:
         std::span<const PanoramaPaintVertex> vertices,
         std::span<const int> indices,
         float ui_scale) = 0;
-    virtual void render_geometry(PanoramaCompiledGeometryHandle geometry, PanoramaTextureId texture) = 0;
+    // `constants` is the issuing command's PanoramaDrawConstants (see
+    // panorama_paint.hpp): a 2x3 affine transform (design px) + opacity the
+    // backend must apply on top of `geometry`'s already-compiled vertices,
+    // instead of the painter baking it in. Identity for an untransformed,
+    // fully-opaque command (or one that went through the painter's
+    // legacy-bake fallback, which still bakes), so an implementer that
+    // ignores it renders those unchanged but WILL render animated
+    // transform/opacity content wrong; a GPU backend folds it into per-draw
+    // shader state (see RhiUiRenderInterface::render_geometry), a CPU
+    // rasterizer applies it to vertex positions/colour before rasterizing
+    // (see panorama_apply_draw_constants).
+    virtual void render_geometry(
+        PanoramaCompiledGeometryHandle geometry, PanoramaTextureId texture, const PanoramaDrawConstants& constants) = 0;
+    // Releases a handle previously returned by compile_geometry. Must tolerate
+    // being called for a handle whose draw was already recorded into the
+    // CURRENT frame's command list (PanoramaGeometryCache::submit() does this
+    // on a partial-failure rollback -- see its `release()` call -- and a
+    // normal submit() releases geometry that fell out of this frame's list
+    // right after recording whatever DID stay in it): an implementation must
+    // defer the actual GPU free (a retire/reclaim ring, fence, or similar)
+    // rather than destroying the resource synchronously, or an
+    // already-recorded-but-not-yet-submitted draw will read freed memory. See
+    // RhiUiRenderInterface's kReclaimFrames ring for a reference
+    // implementation of this contract.
     virtual void release_geometry(PanoramaCompiledGeometryHandle geometry) = 0;
 };
 
