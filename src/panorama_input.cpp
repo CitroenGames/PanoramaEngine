@@ -927,9 +927,15 @@ bool PanoramaInputController::handle_text_input(PanoramaNode& root, std::string_
     {
         // Valve's shipped Panorama layouts use `ontextentrychange` (for example
         // context_menu_inventory_search.xml). Keep the older engine-specific
-        // `ontextentrychanged` spelling as a compatibility alias.
+        // `ontextentrychanged` spelling as a compatibility alias. The first
+        // handler may delete this TextEntry or an ancestor, so watch it before
+        // invoking the alias.
+        PanoramaScopedNodeWatch watch({field});
         runtime->run_node_handler(*field, "ontextentrychange");
-        runtime->run_node_handler(*field, "ontextentrychanged");
+        if (PanoramaNode* live_field = watch.nodes()[0])
+        {
+            runtime->run_node_handler(*live_field, "ontextentrychanged");
+        }
     }
     return true;
 }
@@ -1003,8 +1009,12 @@ bool PanoramaInputController::handle_key_down(PanoramaNode& root, const Panorama
             field->mark_style_dirty();
             if (runtime != nullptr)
             {
+                PanoramaScopedNodeWatch watch({field});
                 runtime->run_node_handler(*field, "ontextentrychange");
-                runtime->run_node_handler(*field, "ontextentrychanged");
+                if (PanoramaNode* live_field = watch.nodes()[0])
+                {
+                    runtime->run_node_handler(*live_field, "ontextentrychanged");
+                }
             }
             return true;
         }
