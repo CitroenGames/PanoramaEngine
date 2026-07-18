@@ -20,7 +20,7 @@
 // bare caret when they coincide (WebCore selectionStart == selectionEnd). Offsets
 // are always kept on UTF-8 codepoint boundaries. Every mutator returns true when
 // the value or selection actually changed, so the caller can recompute styles and
-// fire `ontextentrychanged`.
+// fire `ontextentrychange` plus the legacy `ontextentrychanged` alias.
 namespace panorama
 {
 // WebCore TextGranularity, restricted to the units a single line needs.

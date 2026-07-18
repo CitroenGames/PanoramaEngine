@@ -123,7 +123,8 @@ public:
 
     // Feeds composed printable text (the platform's textInput/IME event) into the
     // focused TextEntry, inserting it at the caret (replacing any selection). Fires
-    // ontextentrychanged. Returns true when a field changed.
+    // ontextentrychange (plus the legacy ontextentrychanged alias). Returns true
+    // when a field changed.
     bool handle_text_input(PanoramaNode& root, std::string_view utf8, PanoramaRuntime* runtime);
 
     // Moves keyboard focus to `node` (null clears focus): blurs the old focus

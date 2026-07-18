@@ -925,6 +925,10 @@ bool PanoramaInputController::handle_text_input(PanoramaNode& root, std::string_
     field->mark_style_dirty();
     if (runtime != nullptr)
     {
+        // Valve's shipped Panorama layouts use `ontextentrychange` (for example
+        // context_menu_inventory_search.xml). Keep the older engine-specific
+        // `ontextentrychanged` spelling as a compatibility alias.
+        runtime->run_node_handler(*field, "ontextentrychange");
         runtime->run_node_handler(*field, "ontextentrychanged");
     }
     return true;
@@ -952,7 +956,7 @@ bool PanoramaInputController::handle_key_down(PanoramaNode& root, const Panorama
         const PanoramaTextGranularity granularity =
             event.ctrl ? PanoramaTextGranularity::Word : PanoramaTextGranularity::Character;
         bool selection_changed = false; // caret/selection moved -> repaint only
-        bool value_changed = false;     // text edited -> relayout + ontextentrychanged
+        bool value_changed = false;     // text edited -> relayout + text-entry change handlers
         switch (event.key)
         {
         case PanoramaKey::ArrowLeft:
@@ -999,6 +1003,7 @@ bool PanoramaInputController::handle_key_down(PanoramaNode& root, const Panorama
             field->mark_style_dirty();
             if (runtime != nullptr)
             {
+                runtime->run_node_handler(*field, "ontextentrychange");
                 runtime->run_node_handler(*field, "ontextentrychanged");
             }
             return true;
