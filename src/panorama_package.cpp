@@ -99,9 +99,6 @@ std::string normalize_panorama_entry_path(std::string_view entry_path)
 
 bool PanoramaPackage::open(const std::filesystem::path& path, std::string* error_message)
 {
-    clear();
-    path_ = path;
-
     try
     {
         std::ifstream file(path, std::ios::binary);
@@ -109,8 +106,30 @@ bool PanoramaPackage::open(const std::filesystem::path& path, std::string* error
         {
             throw std::runtime_error("failed to open panorama package '" + path.string() + "'");
         }
+        const std::vector<unsigned char> bytes{
+            std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+        return open_bytes(bytes, path, error_message);
+    }
+    catch (const std::exception& error)
+    {
+        if (error_message != nullptr)
+        {
+            *error_message = error.what();
+        }
+        clear();
+        path_ = path;
+        return false;
+    }
+}
 
-        bytes_ = std::vector<unsigned char>(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+bool PanoramaPackage::open_bytes(std::span<const unsigned char> bytes,
+    std::filesystem::path source_path, std::string* error_message)
+{
+    clear();
+    path_ = source_path;
+    try
+    {
+        bytes_.assign(bytes.begin(), bytes.end());
         const std::size_t first_header = find_first_local_file_header(bytes_);
         if (first_header == std::string::npos)
         {
@@ -169,7 +188,50 @@ bool PanoramaPackage::open(const std::filesystem::path& path, std::string* error
             *error_message = error.what();
         }
         clear();
-        path_ = path;
+        path_ = source_path;
+        return false;
+    }
+}
+
+bool PanoramaPackage::open_resources(
+    const std::vector<std::pair<std::string, std::vector<unsigned char>>>& resources,
+    std::filesystem::path source_path, std::string* error_message)
+{
+    clear();
+    path_ = source_path;
+    try
+    {
+        for (const auto& [resource_path, resource_bytes] : resources)
+        {
+            const std::string key = normalize_panorama_entry_path(resource_path);
+            if (key.empty() || entries_.contains(key))
+            {
+                throw std::runtime_error("Panorama resources contain an empty or duplicate path: " + key);
+            }
+            const std::size_t offset = bytes_.size();
+            bytes_.insert(bytes_.end(), resource_bytes.begin(), resource_bytes.end());
+            entries_.emplace(key, Entry{
+                .name = key,
+                .data_offset = offset,
+                .compressed_size = resource_bytes.size(),
+                .uncompressed_size = resource_bytes.size(),
+                .compression_method = kZipStoredMethod,
+            });
+        }
+        if (entries_.empty())
+        {
+            throw std::runtime_error("Panorama resources contain no entries");
+        }
+        return true;
+    }
+    catch (const std::exception& error)
+    {
+        if (error_message != nullptr)
+        {
+            *error_message = error.what();
+        }
+        clear();
+        path_ = source_path;
         return false;
     }
 }

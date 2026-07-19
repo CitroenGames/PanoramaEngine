@@ -3,9 +3,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 // Reader for `.pbin` packages: Valve-style zip archives containing only
@@ -25,6 +27,15 @@ public:
     // header, or an unsupported entry (e.g. compressed rather than stored);
     // when `error_message` is non-null it receives a human-readable reason.
     [[nodiscard]] bool open(const std::filesystem::path& path, std::string* error_message = nullptr);
+    // Opens an archive already read by a host asset system (VPK, .fasset, network, etc.).
+    // `source_path` is diagnostic identity only; no filesystem access is performed.
+    [[nodiscard]] bool open_bytes(std::span<const unsigned char> bytes,
+        std::filesystem::path source_path = {}, std::string* error_message = nullptr);
+    // Mounts already-decoded resources, used by native host asset containers that
+    // deliberately do not retain ZIP framing.
+    [[nodiscard]] bool open_resources(
+        const std::vector<std::pair<std::string, std::vector<unsigned char>>>& resources,
+        std::filesystem::path source_path = {}, std::string* error_message = nullptr);
     void clear();
 
     [[nodiscard]] const std::filesystem::path& path() const noexcept;
