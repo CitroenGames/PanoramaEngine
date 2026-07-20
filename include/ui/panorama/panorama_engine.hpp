@@ -14,6 +14,7 @@
 #include "ui/panorama/panorama_render_backend.hpp"
 #include "ui/panorama/panorama_resource_provider.hpp"
 #include "ui/panorama/panorama_runtime.hpp"
+#include "ui/panorama/panorama_source_cooker.hpp"
 #include "ui/panorama/panorama_style.hpp"
 #include "ui/panorama/panorama_view.hpp"
 #include "ui/panorama/panorama_xml.hpp"

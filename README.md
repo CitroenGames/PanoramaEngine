@@ -24,6 +24,10 @@ the vendored `Thirdparty/freetype/` library.
   internals.
 - A QuickJS-backed Panorama runtime exposing `$`, `Panel`, event handlers,
   scheduling, sublayout loading hooks, and a native-action callback.
+- A host-neutral source cooker that classifies `.js`, `.xml`, and `.css`, folds
+  a loose `panorama/` tree into deterministic resources, and merges those
+  authoring overrides over an optional `.pbin` base package for native host
+  containers.
 - Pointer and wheel input over the laid-out tree, including hover, active,
   focus, activation bubbling, radio groups, dropdowns, sliders, and scrollbars.
 - Keyboard/IME text editing with UTF-8 caret and selection semantics, including

@@ -2,11 +2,14 @@
 #include "ui/panorama/panorama_dom.hpp"
 #include "ui/panorama/panorama_font_atlas.hpp"
 #include "ui/panorama/panorama_input.hpp"
+#include "ui/panorama/panorama_source_cooker.hpp"
 #include "ui/panorama/panorama_text_edit.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 
 namespace
 {
@@ -59,6 +62,89 @@ bool test_clipboard_paste_api()
     input.reset();
     return expect(!input.handle_paste(root, "ignored", nullptr), "paste edited a field without focus");
 }
+
+bool write_text_file(const std::filesystem::path& path, std::string_view text)
+{
+    std::error_code error;
+    std::filesystem::create_directories(path.parent_path(), error);
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    file.write(text.data(), static_cast<std::streamsize>(text.size()));
+    return static_cast<bool>(file);
+}
+
+bool test_panorama_source_cooker()
+{
+    using namespace panorama;
+
+    if (!expect(classify_panorama_source_path("layout.xml") == PanoramaSourceKind::Xml,
+            "XML source classification failed") ||
+        !expect(classify_panorama_source_path("SCRIPT.JS") == PanoramaSourceKind::JavaScript,
+            "case-insensitive JavaScript source classification failed") ||
+        !expect(classify_panorama_source_path("styles.css") == PanoramaSourceKind::Css,
+            "CSS source classification failed") ||
+        !expect(!is_panorama_source_path("image.png"), "non-source image was classified as cookable") ||
+        !expect(panorama_source_root("csgo/panorama/layout/main.xml") ==
+                std::optional<std::filesystem::path>("csgo/panorama"),
+            "content-relative Panorama source root was not discovered") ||
+        !expect(!panorama_source_root("scripts/game.js"),
+            "non-Panorama JavaScript was claimed by the Panorama cooker"))
+    {
+        return false;
+    }
+
+    const std::filesystem::path scratch =
+        std::filesystem::temp_directory_path() /
+        ("panorama_source_cooker_test_" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::error_code error;
+    std::filesystem::remove_all(scratch, error);
+    const bool wrote_sources =
+        write_text_file(scratch / "layout/main.xml", "<root id=\"cooked\" />") &&
+        write_text_file(scratch / "styles/main.CSS", "#cooked { color: white; }") &&
+        write_text_file(scratch / "scripts/main.js", "globalThis.cooked = true;") &&
+        write_text_file(scratch / "images/not_cooked.png", "not an actual image");
+    if (!expect(wrote_sources, "could not create Panorama source-cooker fixtures"))
+    {
+        std::filesystem::remove_all(scratch, error);
+        return false;
+    }
+
+    PanoramaPackage base;
+    const std::vector<std::pair<std::string, std::vector<unsigned char>>> base_resources{
+        {"panorama/layout/main.xml", {'o', 'l', 'd'}},
+        {"panorama/images/base.bin", {1U, 2U, 3U}},
+    };
+    std::string package_error;
+    if (!expect(base.open_resources(base_resources, "base.pbin", &package_error),
+            "base resource package could not be created"))
+    {
+        std::filesystem::remove_all(scratch, error);
+        return false;
+    }
+
+    PanoramaPackage cooked;
+    PanoramaSourceCookStats stats;
+    const bool cooked_ok =
+        cook_panorama_source_tree(scratch, cooked, &base, &stats, &package_error);
+    const bool valid =
+        expect(cooked_ok, "Panorama JS/XML/CSS source tree did not cook") &&
+        expect(stats.base_resources == 2U, "base resource count is wrong") &&
+        expect(stats.javascript_files == 1U && stats.xml_files == 1U && stats.css_files == 1U,
+            "Panorama source-kind counts are wrong") &&
+        expect(cooked.entries().size() == 4U, "cooked package resource count is wrong") &&
+        expect(cooked.read_text("panorama/layout/main.xml") == "<root id=\"cooked\" />",
+            "loose XML did not override the base package resource") &&
+        expect(cooked.read_text("panorama/styles/main.css") == "#cooked { color: white; }",
+            "CSS source bytes were not retained") &&
+        expect(cooked.read_text("panorama/scripts/main.js") == "globalThis.cooked = true;",
+            "JavaScript source bytes were not retained") &&
+        expect(cooked.contains("panorama/images/base.bin"), "base-only resource was not retained") &&
+        expect(!cooked.contains("panorama/images/not_cooked.png"),
+            "non-source loose resource was unexpectedly folded into the source package");
+
+    std::filesystem::remove_all(scratch, error);
+    return valid;
+}
 }
 
 int main()
@@ -66,6 +152,10 @@ int main()
     using namespace panorama;
 
     if (!test_clipboard_paste_api())
+    {
+        return 1;
+    }
+    if (!test_panorama_source_cooker())
     {
         return 1;
     }
@@ -125,6 +215,6 @@ int main()
         return 1;
     }
 
-    std::puts("Panorama standalone input, diagnostics, and font configuration passed");
+    std::puts("Panorama standalone input, source cooking, diagnostics, and font configuration passed");
     return 0;
 }

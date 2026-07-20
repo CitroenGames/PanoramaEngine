@@ -89,6 +89,22 @@ is required; `resolve_file()` (default: unsupported) lets a provider expose a
 real filesystem path when the application needs one (e.g. handing a path to a
 system font loader).
 
+### Cooking JS/XML/CSS into a host-native package
+
+`panorama_source_cooker.hpp` is the engine-owned packaging boundary. Call
+`cook_panorama_source_tree()` with the real directory corresponding to a
+content-relative `panorama/` root. It recursively collects only `.js`, `.xml`,
+and `.css` (case-insensitive), normalizes their resource identities, preserves
+their source bytes, and returns a deterministic `PanoramaPackage` without ZIP
+framing. Non-Panorama scripts are excluded by `panorama_source_root()`.
+
+An optional opened `.pbin` may be supplied as the base package. Base resources
+are retained, and loose authoring sources replace matching normalized entries.
+The returned package is deliberately storage-neutral: a host can encode it in
+its own cooked asset container and mount it later with
+`PanoramaPackage::open_resources()`. Images, fonts, and videos are not folded by
+this source cook and can remain in a directory provider as the fallback layer.
+
 ## 2. Loading a document
 
 `PanoramaDocumentSession::load()` (or `load_into()` for a sublayout) parses

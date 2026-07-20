@@ -57,6 +57,7 @@ sequencing used by `PanoramaView` and custom coordinators.
 | `panorama_document_session.hpp` | `PanoramaDocumentSession` — owns resources + localization + DOM + stylesheet together, handles `<Frame>`/`<styles>` expansion and layout-scoped cascade |
 | `panorama_view.hpp` | `PanoramaView` — recommended standalone façade over document/runtime/input/frame sequencing and the current draw list |
 | `panorama_package.hpp` | `.pbin` (Valve-style stored zip) package reader |
+| `panorama_source_cooker.hpp` | JS/XML/CSS classifier and deterministic loose-tree/base-package cook boundary for host-native containers |
 | `panorama_localization.hpp` | Dialog-variable token replacement / localization table |
 | `panorama_text_break.hpp` | WebCore-style ASCII line-break opportunity finder used by wrapping |
 | `panorama_text_edit.hpp` | Text-entry caret/selection editing model |
