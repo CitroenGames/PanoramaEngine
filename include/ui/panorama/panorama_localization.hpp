@@ -4,9 +4,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <string>
 #include <string_view>
@@ -26,6 +28,21 @@ namespace panorama
 class PanoramaLocalization
 {
 public:
+    // Consulted immediately before each existing localization file is read, with that file's
+    // path; returning false skips the read. The host installs this to apply its own asset
+    // policy to these reads (OpenStrike routes it into the engine's resolver telemetry and
+    // native-only enforcement); PanoramaEngine itself has no such policy and, with no gate
+    // installed, reads every file it finds exactly as before.
+    using ReadGate = std::function<bool(const std::filesystem::path& file)>;
+
+    // Survives load(): it is host policy, not part of the loaded token set.
+    void set_read_gate(ReadGate gate) { read_gate_ = std::move(gate); }
+
+    // How many localization files the last load() actually read. Zero means the token table is
+    // built-in defaults only -- either nothing was found, or every candidate was refused by the
+    // read gate. Hosts distinguish those two by whether their own gate refused anything.
+    [[nodiscard]] std::size_t loaded_file_count() const noexcept { return loaded_file_count_; }
+
     // Clears all previously loaded tokens (built-in defaults are reloaded),
     // then searches `resource_root` and its two parent directories for
     // `resource/valve_english.txt` and `resource/csgo_english.txt`, loading
@@ -34,6 +51,7 @@ public:
     void load(const std::filesystem::path& resource_root)
     {
         tokens_.clear();
+        loaded_file_count_ = 0;
         load_builtin_defaults();
 
         std::vector<std::filesystem::path> roots;
@@ -57,9 +75,17 @@ public:
                 return;
             }
             std::error_code error;
-            if (std::filesystem::is_regular_file(normalized, error))
+            if (!std::filesystem::is_regular_file(normalized, error))
             {
-                load_file(normalized);
+                return;
+            }
+            if (read_gate_ && !read_gate_(normalized))
+            {
+                return;
+            }
+            if (load_file(normalized))
+            {
+                ++loaded_file_count_;
             }
         };
 
@@ -463,5 +489,7 @@ private:
     }
 
     std::unordered_map<std::string, std::string> tokens_;
+    ReadGate read_gate_;
+    std::size_t loaded_file_count_ = 0;
 };
 }
