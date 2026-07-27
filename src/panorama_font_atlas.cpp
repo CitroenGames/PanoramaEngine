@@ -80,6 +80,19 @@ std::vector<std::filesystem::path> font_roots(const PanoramaFontAtlasLoadOptions
     return roots;
 }
 
+// One resolved face source: either an on-disk path or bytes a host's
+// PanoramaFontBytesProvider supplied. `refused` means the provider handled the face
+// definitively and declined it, which must NOT degrade into an on-disk read.
+struct ResolvedFaceSource
+{
+    std::string identity;
+    std::filesystem::path path;
+    std::vector<unsigned char> bytes;
+    bool refused = false;
+
+    [[nodiscard]] bool valid() const { return !path.empty() || !bytes.empty(); }
+};
+
 std::filesystem::path find_font_file_from_names(
     const std::vector<std::filesystem::path>& roots,
     const char* const* preferred_names,
@@ -130,38 +143,76 @@ std::filesystem::path find_font_file_from_names(
     return {};
 }
 
-std::filesystem::path find_regular_font_file(const std::vector<std::filesystem::path>& roots)
-{
-    static constexpr const char* kPreferredFonts[] = {
-        "Stratum2-Regular.ttf",
-        "Stratum2-Medium.ttf",
-        "NotoSans-Regular.ttf",
-        "LatoLatin-Regular.ttf",
-    };
-    return find_font_file_from_names(
-        roots, kPreferredFonts, sizeof(kPreferredFonts) / sizeof(kPreferredFonts[0]), true);
-}
+// The discovery preference order for each CSS weight bucket, shared by the on-disk probe and
+// the host byte provider so the two can never resolve to different fonts.
+constexpr const char* kRegularFontNames[] = {
+    "Stratum2-Regular.ttf",
+    "Stratum2-Medium.ttf",
+    "NotoSans-Regular.ttf",
+    "LatoLatin-Regular.ttf",
+};
+constexpr const char* kMediumFontNames[] = {
+    "Stratum2-Medium.ttf",
+    "NotoSans-Regular.ttf",
+};
+constexpr const char* kBoldFontNames[] = {
+    "Stratum2-Bold.ttf",
+    "NotoSans-Bold.ttf",
+    "LatoLatin-Bold.ttf",
+    "NotoSerif-Bold.ttf",
+};
 
-std::filesystem::path find_medium_font_file(const std::vector<std::filesystem::path>& roots)
+// Provider-first resolution of one weight's preferred face names. The provider is asked for
+// each preferred name in the SAME preference order the on-disk probe below uses, so a
+// package-served face and a loose file can never resolve to two different fonts.
+//
+// `provider_refused` is sticky for the whole load on purpose: once a host has definitively
+// declined a face (its content policy blocks the compatibility source), the atlas must not
+// reach the very same content through its own conventional-root discovery for a later name --
+// that would silently route around the host's policy.
+ResolvedFaceSource resolve_face_from_names(
+    const PanoramaFontAtlasLoadOptions& options,
+    const std::vector<std::filesystem::path>& roots,
+    const char* const* preferred_names,
+    std::size_t preferred_count,
+    bool allow_fallback,
+    bool& provider_refused)
 {
-    static constexpr const char* kPreferredFonts[] = {
-        "Stratum2-Medium.ttf",
-        "NotoSans-Regular.ttf",
-    };
-    return find_font_file_from_names(
-        roots, kPreferredFonts, sizeof(kPreferredFonts) / sizeof(kPreferredFonts[0]), false);
-}
+    ResolvedFaceSource resolved;
+    if (options.font_bytes_provider)
+    {
+        for (std::size_t i = 0; i < preferred_count; ++i)
+        {
+            std::optional<std::vector<unsigned char>> bytes =
+                options.font_bytes_provider(preferred_names[i]);
+            if (!bytes)
+            {
+                continue; // No opinion: keep looking, then fall through to the disk.
+            }
+            if (bytes->empty())
+            {
+                provider_refused = true;
+                continue;
+            }
+            resolved.identity = preferred_names[i];
+            resolved.bytes = std::move(*bytes);
+            return resolved;
+        }
+    }
+    if (provider_refused)
+    {
+        resolved.refused = true;
+        return resolved;
+    }
 
-std::filesystem::path find_bold_font_file(const std::vector<std::filesystem::path>& roots)
-{
-    static constexpr const char* kPreferredFonts[] = {
-        "Stratum2-Bold.ttf",
-        "NotoSans-Bold.ttf",
-        "LatoLatin-Bold.ttf",
-        "NotoSerif-Bold.ttf",
-    };
-    return find_font_file_from_names(
-        roots, kPreferredFonts, sizeof(kPreferredFonts) / sizeof(kPreferredFonts[0]), false);
+    const std::filesystem::path path =
+        find_font_file_from_names(roots, preferred_names, preferred_count, allow_fallback);
+    if (!path.empty())
+    {
+        resolved.path = path.lexically_normal();
+        resolved.identity = resolved.path.generic_string();
+    }
+    return resolved;
 }
 
 std::filesystem::path resolve_configured_face(
@@ -203,6 +254,58 @@ std::filesystem::path resolve_configured_face(
         }
     }
     return {};
+}
+
+// Provider-first resolution of an EXPLICITLY configured face. The provider sees the configured
+// spelling first and then the bare filename, because a host resolving through a content package
+// keys on a logical resource identity, not on whichever root a loose probe would have hit.
+ResolvedFaceSource resolve_configured_face_source(
+    const PanoramaFontAtlasLoadOptions& options,
+    const std::vector<std::filesystem::path>& roots,
+    const std::filesystem::path& path,
+    bool& provider_refused)
+{
+    ResolvedFaceSource resolved;
+    if (path.empty())
+    {
+        return resolved;
+    }
+    if (options.font_bytes_provider)
+    {
+        const std::string configured = path.generic_string();
+        const std::string filename = path.filename().generic_string();
+        const char* const names[] = {configured.c_str(), filename.c_str()};
+        const std::size_t name_count = configured == filename ? 1U : 2U;
+        for (std::size_t i = 0; i < name_count; ++i)
+        {
+            std::optional<std::vector<unsigned char>> bytes = options.font_bytes_provider(names[i]);
+            if (!bytes)
+            {
+                continue;
+            }
+            if (bytes->empty())
+            {
+                provider_refused = true;
+                continue;
+            }
+            resolved.identity = names[i];
+            resolved.bytes = std::move(*bytes);
+            return resolved;
+        }
+    }
+    if (provider_refused)
+    {
+        resolved.refused = true;
+        return resolved;
+    }
+
+    const std::filesystem::path found = resolve_configured_face(options, roots, path);
+    if (!found.empty())
+    {
+        resolved.path = found;
+        resolved.identity = found.generic_string();
+    }
+    return resolved;
 }
 
 char32_t next_codepoint(std::string_view text, std::size_t& i)
@@ -318,6 +421,14 @@ struct PanoramaFontAtlas::Impl
     {
         FT_Face face = nullptr;
         std::filesystem::path path;
+        // Stable dedupe/log identity: the normalized path for an on-disk face, the provider's
+        // face name for a byte-provided one (which has no path at all).
+        std::string identity;
+        // Non-empty only for a provider-served face. FreeType does NOT copy the buffer passed
+        // to FT_New_Memory_Face, so it has to outlive the FT_Face; owning it here ties the two
+        // lifetimes together (this is the same ownership Unreal gives FFreeTypeFace::Memory,
+        // Engine/Source/Runtime/SlateCore/Private/Fonts/FontCacheFreeType.cpp:445-455).
+        std::vector<unsigned char> memory;
         int weight = 400;
         int current_pixel_size = 0;
         std::unordered_map<int, Metrics> metrics;
@@ -879,45 +990,81 @@ bool PanoramaFontAtlas::load(const PanoramaFontAtlasLoadOptions& options)
     }
 
     const std::vector<std::filesystem::path> roots = font_roots(options);
-    std::vector<PanoramaFontAtlasFace> faces;
+    // Sticky across every face this load resolves -- see resolve_face_from_names.
+    bool provider_refused = false;
+    struct PlannedFace
+    {
+        ResolvedFaceSource source;
+        int weight = 400;
+    };
+    std::vector<PlannedFace> faces;
     if (!options.faces.empty())
     {
         faces.reserve(options.faces.size());
         for (const PanoramaFontAtlasFace& configured : options.faces)
         {
-            const std::filesystem::path resolved = resolve_configured_face(options, roots, configured.path);
-            if (resolved.empty())
+            ResolvedFaceSource resolved = resolve_configured_face_source(
+                options, roots, configured.path, provider_refused);
+            if (!resolved.valid())
             {
-                pano_log_warning(
-                    "Panorama font atlas: configured font '{}' was not found",
-                    configured.path.generic_string());
+                if (resolved.refused)
+                {
+                    pano_log_warning(
+                        "Panorama font atlas: configured font '{}' was refused by the host font "
+                        "provider",
+                        configured.path.generic_string());
+                }
+                else
+                {
+                    pano_log_warning(
+                        "Panorama font atlas: configured font '{}' was not found",
+                        configured.path.generic_string());
+                }
                 continue;
             }
-            faces.push_back(PanoramaFontAtlasFace{resolved, std::clamp(configured.weight, 1, 1000)});
+            faces.push_back(
+                PlannedFace{std::move(resolved), std::clamp(configured.weight, 1, 1000)});
         }
     }
     else
     {
-        const std::filesystem::path regular_path = find_regular_font_file(roots);
-        if (!regular_path.empty())
+        // Same names, same order, same allow_fallback policy the path-only discovery used:
+        // resolve_face_from_names asks the provider first and then runs the identical on-disk
+        // probe over kRegular/kMedium/kBoldFontNames.
+        ResolvedFaceSource regular = resolve_face_from_names(options, roots, kRegularFontNames,
+            sizeof(kRegularFontNames) / sizeof(kRegularFontNames[0]), true, provider_refused);
+        if (regular.valid())
         {
-            faces.push_back(PanoramaFontAtlasFace{regular_path, 400});
+            faces.push_back(PlannedFace{std::move(regular), 400});
         }
-        if (const std::filesystem::path medium_path = find_medium_font_file(roots); !medium_path.empty())
+        ResolvedFaceSource medium = resolve_face_from_names(options, roots, kMediumFontNames,
+            sizeof(kMediumFontNames) / sizeof(kMediumFontNames[0]), false, provider_refused);
+        if (medium.valid())
         {
-            faces.push_back(PanoramaFontAtlasFace{medium_path, 500});
+            faces.push_back(PlannedFace{std::move(medium), 500});
         }
-        if (const std::filesystem::path bold_path = find_bold_font_file(roots); !bold_path.empty())
+        ResolvedFaceSource bold = resolve_face_from_names(options, roots, kBoldFontNames,
+            sizeof(kBoldFontNames) / sizeof(kBoldFontNames[0]), false, provider_refused);
+        if (bold.valid())
         {
-            faces.push_back(PanoramaFontAtlasFace{bold_path, 700});
+            faces.push_back(PlannedFace{std::move(bold), 700});
         }
     }
 
     if (faces.empty())
     {
-        pano_log_warning(
-            "Panorama font atlas: no font found for resource root '{}'",
-            options.resource_root.lexically_normal().generic_string());
+        if (provider_refused)
+        {
+            pano_log_warning(
+                "Panorama font atlas: every candidate face was refused by the host font "
+                "provider; no on-disk fallback was attempted");
+        }
+        else
+        {
+            pano_log_warning(
+                "Panorama font atlas: no font found for resource root '{}'",
+                options.resource_root.lexically_normal().generic_string());
+        }
         return false;
     }
 
@@ -927,41 +1074,60 @@ bool PanoramaFontAtlas::load(const PanoramaFontAtlasLoadOptions& options)
         return false;
     }
 
-    const auto load_face = [&](const std::filesystem::path& path, int weight) {
-        if (path.empty())
+    const auto load_face = [&](ResolvedFaceSource source, int weight) {
+        if (!source.valid())
         {
             return false;
         }
-        const std::filesystem::path normalized = path.lexically_normal();
         for (const PanoramaFontAtlas::Impl::FontFace& font : impl_->faces)
         {
-            if (font.path == normalized && font.weight == weight)
+            if (font.identity == source.identity && font.weight == weight)
             {
                 return true;
             }
         }
 
+        PanoramaFontAtlas::Impl::FontFace font;
+        font.identity = source.identity;
+        font.weight = weight;
         FT_Face face = nullptr;
-        const std::string font_path_string = normalized.string();
-        if (FT_New_Face(impl_->library, font_path_string.c_str(), 0, &face) != 0)
+        if (!source.bytes.empty())
         {
-            pano_log_warning("Panorama font atlas: failed to load '{}'", normalized.generic_string());
-            return false;
+            // Package-served bytes: FreeType borrows the buffer, so the FontFace owns it for
+            // the FT_Face's whole lifetime (mirrors FFreeTypeFace::Memory in Unreal's
+            // FontCacheFreeType.cpp:445-455).
+            font.memory = std::move(source.bytes);
+            if (FT_New_Memory_Face(impl_->library, font.memory.data(),
+                    static_cast<FT_Long>(font.memory.size()), 0, &face) != 0)
+            {
+                pano_log_warning(
+                    "Panorama font atlas: failed to load provided face '{}'", source.identity);
+                return false;
+            }
+        }
+        else
+        {
+            const std::filesystem::path normalized = source.path.lexically_normal();
+            const std::string font_path_string = normalized.string();
+            if (FT_New_Face(impl_->library, font_path_string.c_str(), 0, &face) != 0)
+            {
+                pano_log_warning(
+                    "Panorama font atlas: failed to load '{}'", normalized.generic_string());
+                return false;
+            }
+            font.path = normalized;
         }
 
-        PanoramaFontAtlas::Impl::FontFace font;
         font.face = face;
-        font.path = normalized;
-        font.weight = weight;
         impl_->faces.push_back(std::move(font));
-        pano_log_info("Panorama font atlas: loaded '{}' for weight {}", normalized.generic_string(), weight);
+        pano_log_info("Panorama font atlas: loaded '{}' for weight {}", source.identity, weight);
         return true;
     };
 
     bool loaded_any = false;
-    for (const PanoramaFontAtlasFace& face : faces)
+    for (PlannedFace& face : faces)
     {
-        loaded_any = load_face(face.path, face.weight) || loaded_any;
+        loaded_any = load_face(std::move(face.source), face.weight) || loaded_any;
     }
     if (!loaded_any)
     {

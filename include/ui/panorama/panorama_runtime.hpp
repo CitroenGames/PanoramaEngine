@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ui/panorama/panorama_dom.hpp"
+#include "ui/panorama/panorama_localization.hpp"
 #include "ui/panorama/panorama_package.hpp"
 #include "ui/panorama/panorama_resource_provider.hpp"
 
@@ -133,6 +134,16 @@ public:
 
     void set_client(PanoramaRuntimeClient* client);
 
+    // Host policy for the runtime's OWN localization table. The runtime resolves $.Localize(),
+    // LocalizeSafe() and token-valued attributes through a PanoramaLocalization it owns, which
+    // is a DIFFERENT object from the document session's -- so a host that applies an asset
+    // policy to localization reads (a native-first probe, a telemetry/enforcement read gate)
+    // must install it here as well, or this second consumer keeps reading Valve's text
+    // ungated. Both must be set before initialize(), which is when the table is loaded.
+    void set_localization_read_gate(PanoramaLocalization::ReadGate gate);
+    void set_localization_native_token_table_override(
+        PanoramaLocalization::NativeTokenTableOverride override_fn);
+
     // Host preludes: JavaScript run after the core prelude and before the
     // document's scripts, in registration order. This is how an embedder installs
     // the native-API shims its content expects (e.g. the game's CS:GO prelude).
@@ -166,6 +177,8 @@ private:
     HostActionHandler host_action_;
     FocusRequestHandler focus_request_;
     PanoramaRuntimeClient* client_ = nullptr;
+    PanoramaLocalization::ReadGate localization_read_gate_;
+    PanoramaLocalization::NativeTokenTableOverride localization_native_override_;
     std::vector<PanoramaRuntimeScript> bootstrap_scripts_;
     std::unique_ptr<Impl> impl_;
 };

@@ -27,6 +27,18 @@ public:
         height = 0;
         return 0;
     }
+    // Same contract, but the host has ALREADY resolved the resource's container bytes and
+    // `source` is only its stable cache identity (not a filesystem path). This is the entry
+    // point the Panorama host uses for animated <Movie>/background-image video: the resource
+    // system, not the render backend, owns where content comes from, so a backend never has to
+    // open a file. `bytes` may be empty when the host could not resolve the identity, which a
+    // backend that needs data must treat as a failed load. The default forwards to the
+    // identity-only overload above so existing backends behave exactly as before.
+    virtual PanoramaTextureId load_texture(
+        std::string_view source, std::span<const std::uint8_t> /*bytes*/, int& width, int& height)
+    {
+        return load_texture(source, width, height);
+    }
     virtual void release_texture(PanoramaTextureId texture) = 0;
 
     // Re-uploads `rgba` into an EXISTING texture returned by generate_texture,

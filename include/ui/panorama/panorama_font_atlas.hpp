@@ -4,7 +4,10 @@
 #include "ui/panorama/panorama_paint.hpp"
 
 #include <filesystem>
+#include <functional>
 #include <memory>
+#include <optional>
+#include <string_view>
 #include <vector>
 
 namespace panorama
@@ -18,6 +21,25 @@ struct PanoramaFontAtlasFace
     int weight = 400;
 };
 
+// Resolves one font face's file bytes without the atlas ever touching a filesystem.
+// Consulted once per candidate face NAME (the bare filename for a discovered face, the
+// configured spelling for an explicitly configured one) BEFORE any on-disk probe for that
+// name, in exactly the shape sourceloader::SourceSoundLibrary::ScriptLoaderOverride already
+// established for the same problem (soundscript.hpp:98-104):
+//
+//   * a populated optional with bytes -- the provider served this face definitively; the
+//     atlas opens it with FT_New_Memory_Face and never looks at the disk for that name;
+//   * a populated optional that is EMPTY -- the provider handled this face definitively and
+//     refuses it (an engine host enforcing a native-only content policy); the atlas must not
+//     fall back to reading the name from disk, and this face simply does not load;
+//   * std::nullopt -- the provider has no opinion; the atlas continues with its ordinary
+//     on-disk discovery for that name.
+//
+// This is what lets an engine host serve faces out of a content package while PanoramaEngine
+// stays standalone: the library never learns what a package, an asset store, or a mount is.
+using PanoramaFontBytesProvider =
+    std::function<std::optional<std::vector<unsigned char>>(std::string_view face_name)>;
+
 // Deterministic font loading for standalone applications. When faces is empty,
 // the atlas discovers common regular/medium/bold filenames under the supplied
 // search directories and conventional font folders near resource_root. When
@@ -28,6 +50,8 @@ struct PanoramaFontAtlasLoadOptions
     std::filesystem::path resource_root;
     std::vector<std::filesystem::path> search_directories;
     std::vector<PanoramaFontAtlasFace> faces;
+    // Optional byte source consulted ahead of every filesystem probe. See above.
+    PanoramaFontBytesProvider font_bytes_provider;
 };
 
 // FreeType-backed text provider for the native Panorama renderer. It keeps glyph

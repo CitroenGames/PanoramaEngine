@@ -2112,6 +2112,10 @@ bool PanoramaRuntime::initialize_with_script_contexts(
     impl->focus_request = focus_request_;
     impl->client = client_;
     impl->bootstrap_scripts = bootstrap_scripts_;
+    // Host localization policy must be installed BEFORE the load below, which is the one and
+    // only time this table reads anything.
+    impl->localization.set_read_gate(localization_read_gate_);
+    impl->localization.set_native_token_table_override(localization_native_override_);
     impl->localization.load(resource_root);
 
     // Register the Panel class and its prototype.
@@ -2305,6 +2309,25 @@ void PanoramaRuntime::set_client(PanoramaRuntimeClient* client)
     if (impl_)
     {
         impl_->client = client_;
+    }
+}
+
+void PanoramaRuntime::set_localization_read_gate(PanoramaLocalization::ReadGate gate)
+{
+    localization_read_gate_ = std::move(gate);
+    if (impl_)
+    {
+        impl_->localization.set_read_gate(localization_read_gate_);
+    }
+}
+
+void PanoramaRuntime::set_localization_native_token_table_override(
+    PanoramaLocalization::NativeTokenTableOverride override_fn)
+{
+    localization_native_override_ = std::move(override_fn);
+    if (impl_)
+    {
+        impl_->localization.set_native_token_table_override(localization_native_override_);
     }
 }
 

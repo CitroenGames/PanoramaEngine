@@ -10,6 +10,8 @@
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -28,6 +30,26 @@ namespace panorama
 class PanoramaLocalization
 {
 public:
+    // A parsed token table: normalized, lower-cased key -> localized string, exactly the shape
+    // load() builds and localize() looks up in.
+    using TokenTable = std::unordered_map<std::string, std::string>;
+
+    // One parsed localization document. `language` is the file's own `"Language"` value when it
+    // declares one (Valve's token files all do); it is informational here -- this class only
+    // ever loads English -- and exists so a host that compiles these documents into a native
+    // asset can carry the culture instead of inventing one.
+    struct TokenDocument
+    {
+        std::string language;
+        TokenTable tokens;
+    };
+
+    // The two logical documents load() looks for, in load order, relative to each probed root.
+    // Named here (rather than spelled inline) because they are also the identities the native
+    // override below is asked about, and the two must not drift.
+    static constexpr std::string_view kValveTokenDocument = "resource/valve_english.txt";
+    static constexpr std::string_view kCsgoTokenDocument = "resource/csgo_english.txt";
+
     // Consulted immediately before each existing localization file is read, with that file's
     // path; returning false skips the read. The host installs this to apply its own asset
     // policy to these reads (OpenStrike routes it into the engine's resolver telemetry and
@@ -38,21 +60,66 @@ public:
     // Survives load(): it is host policy, not part of the loaded token set.
     void set_read_gate(ReadGate gate) { read_gate_ = std::move(gate); }
 
-    // How many localization files the last load() actually read. Zero means the token table is
-    // built-in defaults only -- either nothing was found, or every candidate was refused by the
-    // read gate. Hosts distinguish those two by whether their own gate refused anything.
+    // The host's NATIVE-FIRST probe, in the same shape as
+    // sourceloader::SourceSoundLibrary::ScriptLoaderOverride and
+    // PanoramaFontAtlasLoadOptions::font_bytes_provider: consulted once per logical document
+    // (kValveTokenDocument / kCsgoTokenDocument) at the START of load(), before any resource
+    // root is probed on disk. Returning a table makes that document resolve natively -- it is
+    // merged exactly as the parsed file would have been, and no root is then searched for it.
+    // Returning nullopt falls through to the existing per-root file search and its read gate.
+    //
+    // This is what lets a host serve these documents out of its own cooked content instead of
+    // reading Valve's text off disk, without PanoramaEngine gaining any knowledge of the host's
+    // asset system. Survives load(), like the gate: it is host policy, not loaded data.
+    using NativeTokenTableOverride =
+        std::function<std::optional<TokenTable>(std::string_view logical_path)>;
+    void set_native_token_table_override(NativeTokenTableOverride override_fn)
+    {
+        native_token_table_override_ = std::move(override_fn);
+    }
+
+    // How many localization documents the last load() actually resolved -- natively or by
+    // reading a file. Zero means the token table is built-in defaults only: nothing was found,
+    // or every candidate was refused by the read gate. Hosts distinguish those two by whether
+    // their own gate refused anything.
     [[nodiscard]] std::size_t loaded_file_count() const noexcept { return loaded_file_count_; }
 
-    // Clears all previously loaded tokens (built-in defaults are reloaded),
-    // then searches `resource_root` and its two parent directories for
-    // `resource/valve_english.txt` and `resource/csgo_english.txt`, loading
-    // whichever exist. Safe to call again with a different root; each call
-    // fully replaces the previous token set rather than merging into it.
+    // Decodes a localization file's bytes (UTF-16 LE/BE or UTF-8/ANSI, BOM-aware) and parses
+    // its `"Tokens"` block. Public and static because it is the ONE parse of this format:
+    // a host that compiles these documents into a native asset must run exactly this, not a
+    // second implementation that could drift from what load() does at runtime.
+    [[nodiscard]] static TokenDocument parse_token_file(std::span<const unsigned char> bytes)
+    {
+        return parse_token_document(decode_text_file(bytes));
+    }
+
+    // Clears all previously loaded tokens (built-in defaults are reloaded), consults the
+    // native override for each logical document, then searches `resource_root` and its two
+    // parent directories for whichever documents the override did not serve, loading those
+    // that exist. Safe to call again with a different root; each call fully replaces the
+    // previous token set rather than merging into it.
     void load(const std::filesystem::path& resource_root)
     {
         tokens_.clear();
         loaded_file_count_ = 0;
         load_builtin_defaults();
+
+        // Native first, once per logical document -- a native document has no per-root
+        // spelling, so probing it per root would resolve the same asset up to three times.
+        bool served_natively[2] = {false, false};
+        const std::string_view documents[2] = {kValveTokenDocument, kCsgoTokenDocument};
+        if (native_token_table_override_)
+        {
+            for (std::size_t index = 0; index < 2; ++index)
+            {
+                if (std::optional<TokenTable> table = native_token_table_override_(documents[index]))
+                {
+                    merge_tokens(*table);
+                    served_natively[index] = true;
+                    ++loaded_file_count_;
+                }
+            }
+        }
 
         std::vector<std::filesystem::path> roots;
         if (!resource_root.empty())
@@ -95,8 +162,13 @@ public:
             {
                 continue;
             }
-            try_file(root / "resource/valve_english.txt");
-            try_file(root / "resource/csgo_english.txt");
+            for (std::size_t index = 0; index < 2; ++index)
+            {
+                if (!served_natively[index])
+                {
+                    try_file(root / std::filesystem::path(documents[index]));
+                }
+            }
         }
     }
 
@@ -318,7 +390,7 @@ private:
         }
     }
 
-    static std::string decode_text_file(const std::vector<unsigned char>& bytes)
+    static std::string decode_text_file(std::span<const unsigned char> bytes)
     {
         if (bytes.size() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE)
         {
@@ -375,17 +447,39 @@ private:
             return false;
         }
 
-        parse_tokens(decode_text_file(bytes));
+        merge_tokens(parse_token_document(decode_text_file(bytes)).tokens);
         return true;
     }
 
-    void parse_tokens(std::string_view text)
+    void merge_tokens(const TokenTable& table)
     {
+        for (const auto& [key, value] : table)
+        {
+            tokens_[key] = value;
+        }
+    }
+
+    static TokenDocument parse_token_document(std::string_view text)
+    {
+        TokenDocument document;
         TokenStream stream(text);
         std::string token;
         bool quoted = false;
         while (stream.next(token, quoted))
         {
+            // The file's own culture, e.g. `"Language" "English"`. Only read OUTSIDE a
+            // Tokens block (this loop only runs there), so a token whose KEY is "Language"
+            // can never steal its value's place in the key/value pairing below.
+            if (document.language.empty() && lower_ascii(token) == "language")
+            {
+                std::string language;
+                bool language_quoted = false;
+                if (stream.next(language, language_quoted) && language != "{" && language != "}")
+                {
+                    document.language = std::move(language);
+                }
+                continue;
+            }
             if (lower_ascii(token) != "tokens")
             {
                 continue;
@@ -436,9 +530,10 @@ private:
                     }
                 }
 
-                tokens_[lower_ascii(normalize_token(token))] = value;
+                document.tokens[lower_ascii(normalize_token(token))] = value;
             }
         }
+        return document;
     }
 
     void add_builtin(std::string_view key, std::string_view value)
@@ -488,8 +583,9 @@ private:
         add_builtin("SFUI_Map_cs_italy", "Italy");
     }
 
-    std::unordered_map<std::string, std::string> tokens_;
+    TokenTable tokens_;
     ReadGate read_gate_;
+    NativeTokenTableOverride native_token_table_override_;
     std::size_t loaded_file_count_ = 0;
 };
 }
