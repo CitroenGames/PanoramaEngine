@@ -278,3 +278,38 @@ debug_info = ProgramDatabase
 generate_debug_info = true
 outdir = ../bin/posix/Release
 intdir = ../build/obj/posix/Release/PanoramaExampleWindowRaster
+
+# Complete Windows-only GPU host: Win32 events/windowing, DXGI swap chain,
+# D3D12 frame resources, and the optional PanoramaD3D12Backend adapter.
+[project:PanoramaExampleWindowD3D12]
+type = exe
+std = 20
+sources = 05_window_d3d12/win32_main.cpp
+includes = ../include, ..
+warning_level = Level4
+multiprocessor = true
+exceptions = true
+rtti = true
+subsystem = Console
+target_link_libraries(PRIVATE PanoramaEngine)
+if(Windows)
+{
+    defines = NOMINMAX, WIN32_LEAN_AND_MEAN, UNICODE, _UNICODE
+    libs = user32.lib, dxgi.lib, d3d12.lib, d3dcompiler.lib
+}
+
+[config:Debug|x64]
+runtime_library = MultiThreadedDebug
+optimization = Disabled
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../bin/x64/Debug
+intdir = ../build/obj/x64/Debug/PanoramaExampleWindowD3D12
+
+[config:Release|x64]
+runtime_library = MultiThreaded
+optimization = MaxSpeed
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../bin/x64/Release
+intdir = ../build/obj/x64/Release/PanoramaExampleWindowD3D12

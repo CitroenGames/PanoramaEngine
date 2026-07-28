@@ -1,11 +1,11 @@
 # Examples
 
-Four standalone example programs. The first three are console-only (a single
+Five standalone example programs. The first three are console-only (a single
 `main.cpp` with no window, GPU, or game-filesystem dependency), the fastest
 way to confirm a fresh checkout (or a port to a new build system) actually
 compiles and runs. The fourth puts the same CPU rasterizer behind a real
-native window. All of them link only `PanoramaEngine` and its vendored
-`Thirdparty/` dependencies. See [../docs/building.md](../docs/building.md)
+native window. The fifth is a complete Windows-only Direct3D 12 host and also
+links the Windows graphics SDK. See [../docs/building.md](../docs/building.md)
 for build-system-agnostic requirements and
 [../docs/integration.md](../docs/integration.md) for production integration
 details beyond what these examples show.
@@ -158,3 +158,31 @@ it links against `X11` on Linux out of the box. On macOS it needs
 [XQuartz](https://www.xquartz.org/) installed — `examples.buildscript`
 already points the macOS config at XQuartz's standard install location
 (`/opt/X11`).
+
+## 05_window_d3d12
+
+A complete Windows GPU host for the optional
+`adapters/panorama_d3d12_backend.hpp`. It creates the Win32 window, selects a
+D3D12 adapter (falling back to WARP), owns the DXGI flip-model swap chain,
+render-target views, command allocators, resource transitions, presentation,
+and frame fence, then submits `PanoramaView::draw_list()` through
+`PanoramaGeometryCache`.
+
+The example has its own copy of 04's bundled XML, scripts, CSS, and Lato fonts
+so its output can be compared directly with the CPU rasterizer without reaching
+into another example's directory. Unchanged ticks replay cached GPU geometry;
+live input, scripts, animations, and resizes rebuild only the draw-list commands
+whose content changed.
+
+Run it from `bin/x64/Debug`:
+
+```powershell
+.\PanoramaExampleWindowD3D12.exe [layout.xml]
+```
+
+Use `--warp` to force Microsoft's software D3D12 adapter, which is useful on a
+remote session or for checking the example without relying on a hardware GPU:
+
+```powershell
+.\PanoramaExampleWindowD3D12.exe --warp [layout.xml]
+```

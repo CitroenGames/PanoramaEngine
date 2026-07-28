@@ -17,6 +17,8 @@ Useful options:
   (this is already the default when added through `add_subdirectory`).
 - `PANORAMA_BUILD_WINDOW_EXAMPLE=OFF` skips the Win32/X11 window example while
   retaining the three headless examples.
+- `PANORAMA_BUILD_D3D12_EXAMPLE=OFF` skips the Windows-only Direct3D 12
+  example. It has no effect on non-Windows builds.
 - `PANORAMA_BUILD_TESTS=OFF` skips the dedicated standalone API test target and
   CTest registration (this already defaults to off when PanoramaEngine is
   added through `add_subdirectory`).
@@ -99,7 +101,8 @@ actually compiles and runs before wiring up a production renderer. The fourth,
 X11 window (`win32_main.cpp` / `posix_main.cpp`, platform-conditional in
 `examples.buildscript`, so only one compiles per platform) to demonstrate
 what a minimal platform windowing layer around the same CPU rasterizer
-looks like — see [../examples/README.md](../examples/README.md#04_window_raster).
+looks like. The fifth is a Windows-only GPU example with a complete DXGI/D3D12
+host. See [../examples/README.md](../examples/README.md) for both window paths.
 
 | Example | What it exercises |
 | --- | --- |
@@ -107,6 +110,7 @@ looks like — see [../examples/README.md](../examples/README.md#04_window_raste
 | `PanoramaExampleSoftwareRaster` | Building a `PanoramaDrawList` and replaying it through a tiny CPU rasterizer to a `.bmp` |
 | `PanoramaExampleScriptedUi` | `PanoramaView` high-level lifecycle + synthetic clicks mutating the DOM through QuickJS |
 | `PanoramaExampleWindowRaster` | Dirty-tracked `PanoramaView` updates, an optimized CPU rasterizer, and paced Win32/X11 presentation from XML on disk |
+| `PanoramaExampleWindowD3D12` | Win32 input, DXGI swap-chain ownership, D3D12 frame synchronization, the optional D3D12 adapter, and incremental geometry replay |
 
 ## Tests
 

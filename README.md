@@ -58,7 +58,7 @@ the vendored `Thirdparty/freetype/` library.
 | `include/ui/panorama/` | Public library headers |
 | `src/` | Engine implementation |
 | `adapters/` | Optional, opt-in `PanoramaRenderBackend` implementations for Direct3D 12 and Vulkan; include one directly and link its graphics SDK when needed |
-| `examples/` | Four small standalone examples, including a real window |
+| `examples/` | Five small standalone examples, including CPU and D3D12 windows |
 | `Thirdparty/quickjs-0.15.0/` | Vendored QuickJS dependency |
 | `Thirdparty/freetype/` | Vendored FreeType dependency used by `PanoramaFontAtlas` |
 | `docs/` | Build, integration, architecture, and support notes |
@@ -85,6 +85,7 @@ library and these programs:
 | `PanoramaExampleSoftwareRaster` | Building a `PanoramaDrawList` and replaying it through a tiny CPU rasterizer |
 | `PanoramaExampleScriptedUi` | QuickJS runtime, input dispatch, DOM mutation, dirty handling, and relayout |
 | `PanoramaExampleWindowRaster` | A dirty-tracked `PanoramaView`, optimized CPU rasterizer, and paced Win32/X11 host loading XML from disk |
+| `PanoramaExampleWindowD3D12` | A complete Win32/DXGI/D3D12 host using the optional D3D12 adapter and incremental geometry cache |
 
 More build details are in [docs/building.md](docs/building.md).
 
