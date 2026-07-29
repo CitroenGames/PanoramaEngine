@@ -1,0 +1,61 @@
+<root>
+    <styles>
+        <include src="file://{resources}/styles/snake.css" />
+    </styles>
+    <scripts>
+        <include src="file://{resources}/scripts/snake.js" />
+    </scripts>
+
+    <!--
+        Panorama owns this transparent HUD only. The board, food, and snake are
+        submitted by NativeSnakeRenderer through a separate D3D12 pipeline.
+    -->
+    <Panel id="SnakeHud" class="snake-hud">
+        <Panel id="TopHud" class="top-hud">
+            <Panel class="brand-block">
+                <Label class="eyebrow" text="PANORAMA GUI / NATIVE D3D12 GAME" />
+                <Label class="game-title" text="NEON SNAKE" />
+            </Panel>
+
+            <Panel class="stat-block">
+                <Label class="stat-name" text="SCORE" />
+                <Label id="ScoreValue" class="stat-value score-value" text="0000" />
+            </Panel>
+            <Panel class="stat-block">
+                <Label class="stat-name" text="BEST" />
+                <Label id="BestValue" class="stat-value" text="0000" />
+            </Panel>
+            <Panel class="stat-block">
+                <Label class="stat-name" text="SPEED" />
+                <Label id="SpeedValue" class="stat-value" text="1.0x" />
+            </Panel>
+            <Panel class="stat-block status-block">
+                <Label class="stat-name" text="STATE" />
+                <Label id="StatusValue" class="stat-value state-value" text="READY" />
+            </Panel>
+        </Panel>
+
+        <Panel id="GameStage" class="game-stage">
+            <Panel id="StateOverlay" class="state-overlay">
+                <Label id="OverlayTitle" class="overlay-title" text="READY?" />
+                <Label id="OverlayBody" class="overlay-body" text="Press an arrow key or WASD to move" />
+                <Button id="OverlayButton" class="primary-button" onactivate="SnakeAction('primary')">
+                    <Label id="OverlayButtonLabel" class="button-label" text="START GAME" />
+                </Button>
+            </Panel>
+        </Panel>
+
+        <Panel id="BottomHud" class="bottom-hud">
+            <Panel class="control-copy">
+                <Label class="control-title" text="CONTROLS" />
+                <Label class="control-text" text="ARROWS / WASD  MOVE     SPACE  PAUSE     R  RESTART     ESC  QUIT" />
+            </Panel>
+            <Button id="RestartButton" class="hud-button restart-button" onactivate="SnakeAction('restart')">
+                <Label class="button-label" text="RESTART" />
+            </Button>
+            <Button id="PauseButton" class="hud-button" onactivate="SnakeAction('pause')">
+                <Label id="PauseButtonLabel" class="button-label" text="START" />
+            </Button>
+        </Panel>
+    </Panel>
+</root>

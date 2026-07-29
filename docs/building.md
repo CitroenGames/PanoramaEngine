@@ -18,7 +18,7 @@ Useful options:
 - `PANORAMA_BUILD_WINDOW_EXAMPLE=OFF` skips the Win32/X11 window example while
   retaining the three headless examples.
 - `PANORAMA_BUILD_D3D12_EXAMPLE=OFF` skips the Windows-only Direct3D 12
-  example. It has no effect on non-Windows builds.
+  host and Snake examples. It has no effect on non-Windows builds.
 - `PANORAMA_BUILD_TESTS=OFF` skips the dedicated standalone API test target and
   CTest registration (this already defaults to off when PanoramaEngine is
   added through `add_subdirectory`).
@@ -111,6 +111,7 @@ host. See [../examples/README.md](../examples/README.md) for both window paths.
 | `PanoramaExampleScriptedUi` | `PanoramaView` high-level lifecycle + synthetic clicks mutating the DOM through QuickJS |
 | `PanoramaExampleWindowRaster` | Dirty-tracked `PanoramaView` updates, an optimized CPU rasterizer, and paced Win32/X11 presentation from XML on disk |
 | `PanoramaExampleWindowD3D12` | Win32 input, DXGI swap-chain ownership, D3D12 frame synchronization, the optional D3D12 adapter, and incremental geometry replay |
+| `PanoramaExampleD3D12Snake` | Native D3D12 game rendering followed by a transparent, interactive Panorama HUD pass |
 
 ## Tests
 

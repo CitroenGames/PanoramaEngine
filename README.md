@@ -86,6 +86,7 @@ library and these programs:
 | `PanoramaExampleScriptedUi` | QuickJS runtime, input dispatch, DOM mutation, dirty handling, and relayout |
 | `PanoramaExampleWindowRaster` | A dirty-tracked `PanoramaView`, optimized CPU rasterizer, and paced Win32/X11 host loading XML from disk |
 | `PanoramaExampleWindowD3D12` | A complete Win32/DXGI/D3D12 host using the optional D3D12 adapter and incremental geometry cache |
+| `PanoramaExampleD3D12Snake` | A native D3D12 Snake game composited with an interactive Panorama score/menu HUD |
 
 More build details are in [docs/building.md](docs/building.md).
 

@@ -313,3 +313,38 @@ debug_info = ProgramDatabase
 generate_debug_info = true
 outdir = ../bin/x64/Release
 intdir = ../build/obj/x64/Release/PanoramaExampleWindowD3D12
+
+# Windows-only Snake game: the board, food, and snake use a dedicated native
+# D3D12 pipeline; PanoramaEngine is composited afterward for the interactive HUD.
+[project:PanoramaExampleD3D12Snake]
+type = exe
+std = 20
+sources = 06_d3d12_snake/win32_main.cpp
+includes = ../include, ..
+warning_level = Level4
+multiprocessor = true
+exceptions = true
+rtti = true
+subsystem = Console
+target_link_libraries(PRIVATE PanoramaEngine)
+if(Windows)
+{
+    defines = NOMINMAX, WIN32_LEAN_AND_MEAN, UNICODE, _UNICODE
+    libs = user32.lib, dxgi.lib, d3d12.lib, d3dcompiler.lib
+}
+
+[config:Debug|x64]
+runtime_library = MultiThreadedDebug
+optimization = Disabled
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../bin/x64/Debug
+intdir = ../build/obj/x64/Debug/PanoramaExampleD3D12Snake
+
+[config:Release|x64]
+runtime_library = MultiThreaded
+optimization = MaxSpeed
+debug_info = ProgramDatabase
+generate_debug_info = true
+outdir = ../bin/x64/Release
+intdir = ../build/obj/x64/Release/PanoramaExampleD3D12Snake

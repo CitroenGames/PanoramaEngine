@@ -186,3 +186,30 @@ remote session or for checking the example without relying on a hardware GPU:
 ```powershell
 .\PanoramaExampleWindowD3D12.exe --warp [layout.xml]
 ```
+
+## 06_d3d12_snake
+
+A playable 2D Snake game that deliberately keeps game rendering outside
+Panorama. `NativeSnakeRenderer` owns a small D3D12 root signature, pipeline
+state, per-frame upload vertex buffers, and draw call for the board, food, and
+snake. The Panorama draw list is submitted only afterward as a transparent GUI
+pass for the score, best score, speed, game state, controls, and clickable
+start/pause/restart menus.
+
+The native game model drives the HUD by updating a few label nodes, while the
+buttons call back to the host through the Panorama runtime action bridge. The
+bundled layout, CSS, script, and Lato font files make the sample independently
+runnable.
+
+Run it from `bin/x64/Debug`:
+
+```powershell
+.\PanoramaExampleD3D12Snake.exe
+```
+
+Use arrow keys or WASD to steer, Space to pause, R to restart, and Escape to
+quit. Pass `--warp` to force Microsoft's software adapter:
+
+```powershell
+.\PanoramaExampleD3D12Snake.exe --warp
+```
