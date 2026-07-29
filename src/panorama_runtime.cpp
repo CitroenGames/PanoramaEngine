@@ -9,8 +9,12 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <functional>
+#include <limits>
+#include <list>
+#include <map>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -113,44 +117,7 @@ bool clear_group_selection(PanoramaNode& node, const std::string& group, const P
 
 bool set_inline_style_property(PanoramaNode& node, const std::string& property, const std::string& value)
 {
-    const std::string wanted = to_lower(property);
-    std::string rebuilt;
-    std::size_t cursor = 0;
-    while (cursor < node.inline_style.size())
-    {
-        const std::size_t semi = node.inline_style.find(';', cursor);
-        const std::size_t end = semi == std::string::npos ? node.inline_style.size() : semi;
-        const std::string declaration = trim(std::string_view(node.inline_style).substr(cursor, end - cursor));
-        cursor = semi == std::string::npos ? node.inline_style.size() : semi + 1U;
-        const std::size_t colon = declaration.find(':');
-        if (colon == std::string::npos || to_lower(trim(std::string_view(declaration).substr(0, colon))) == wanted)
-        {
-            continue;
-        }
-        if (!rebuilt.empty())
-        {
-            rebuilt += ' ';
-        }
-        rebuilt += declaration;
-        rebuilt += ';';
-    }
-    if (!value.empty())
-    {
-        if (!rebuilt.empty())
-        {
-            rebuilt += ' ';
-        }
-        rebuilt += property;
-        rebuilt += ": ";
-        rebuilt += value;
-        rebuilt += ';';
-    }
-    if (rebuilt == node.inline_style)
-    {
-        return false;
-    }
-    node.inline_style = std::move(rebuilt);
-    return true;
+    return panorama_set_inline_style_property(node, property, value);
 }
 
 bool detach_child(PanoramaNode& parent, PanoramaNode& child, std::unique_ptr<PanoramaNode>* out)
@@ -164,6 +131,7 @@ bool detach_child(PanoramaNode& parent, PanoramaNode& child, std::unique_ptr<Pan
                 *out = std::move(*it);
             }
             parent.children.erase(it);
+            panorama_notify_tree_structure_changed(parent);
             return true;
         }
     }
@@ -265,7 +233,7 @@ constexpr const char* kPanoramaCorePrelude = R"JS(
 // PanoramaRuntime::Impl
 //=============================================================================
 
-struct PanoramaRuntime::Impl final : PanoramaNodeLifetimeObserver
+struct PanoramaRuntime::Impl final
 {
     JSRuntime* rt = nullptr;
     JSContext* ctx = nullptr;
@@ -292,16 +260,21 @@ struct PanoramaRuntime::Impl final : PanoramaNodeLifetimeObserver
     // root (real Panorama semantics), not the document. A stack — not a
     // save/restore local — so node destruction can null dead entries in place
     // (a restored local would re-arm a dangling pointer).
-    std::vector<PanoramaNode*> context_stack;
+    struct ContextEntry
+    {
+        PanoramaNode* node = nullptr;
+        PanoramaNodeLifetimeRegistration lifetime;
+    };
+    std::list<ContextEntry> context_stack;
 
     // Innermost live context, no fallback: what a registration should capture.
     [[nodiscard]] PanoramaNode* innermost_context() const
     {
         for (auto it = context_stack.rbegin(); it != context_stack.rend(); ++it)
         {
-            if (*it != nullptr)
+            if (it->node != nullptr)
             {
-                return *it;
+                return it->node;
             }
         }
         return nullptr;
@@ -317,6 +290,7 @@ struct PanoramaRuntime::Impl final : PanoramaNodeLifetimeObserver
 
     struct EventHandler
     {
+        Impl* owner = nullptr;
         JSValue fn = JS_UNDEFINED;
         PanoramaNode* context = nullptr;
         // Panel the handler was scoped to: RegisterEventHandler(event, panel, fn)
@@ -328,8 +302,17 @@ struct PanoramaRuntime::Impl final : PanoramaNodeLifetimeObserver
         // UnregisterEventHandler (real Panorama returns an opaque handle, not an
         // index — indices shift as handlers are removed).
         int id = 0;
+        PanoramaNodeLifetimeRegistration context_lifetime;
+        PanoramaNodeLifetimeRegistration target_lifetime;
     };
-    std::unordered_map<std::string, std::vector<EventHandler>> event_handlers;
+    using EventHandlerList = std::list<EventHandler>;
+    struct EventHandlerLocation
+    {
+        std::string event_name;
+        EventHandlerList::iterator handler;
+    };
+    std::unordered_map<std::string, EventHandlerList> event_handlers;
+    std::unordered_map<int, EventHandlerLocation> event_handlers_by_id;
     int next_event_handler_id = 1;
 
     // One stable JS wrapper per node (script-side identity: wrapping the same
@@ -338,25 +321,47 @@ struct PanoramaRuntime::Impl final : PanoramaNodeLifetimeObserver
     // become inert — every panel method treats a null opaque as "panel gone")
     // and releases the reference.
     std::unordered_map<PanoramaNode*, JSValue> panel_wrappers;
+    std::unordered_map<PanoramaNode*, JSValue> style_wrappers;
     std::unordered_map<PanoramaNode*, JSValue> panel_data;
     std::unordered_map<PanoramaNode*, std::unordered_map<std::string, JSValue>> panel_events;
     std::unordered_map<PanoramaNode*, std::unordered_map<std::string, std::string>> switch_classes;
+    std::unordered_map<PanoramaNode*, PanoramaNodeLifetimeRegistration> observed_nodes;
 
     struct Scheduled
     {
         int id = 0;
-        double remaining = 0.0;
+        double deadline = 0.0;
+        std::uint64_t sequence = 0;
         JSValue fn = JS_UNDEFINED;
         PanoramaNode* context = nullptr; // registering script's context panel
+        PanoramaNodeLifetimeRegistration context_lifetime;
     };
-    std::vector<Scheduled> scheduled;
+    using ScheduledKey = std::pair<double, std::uint64_t>;
+    using ScheduledQueue = std::map<ScheduledKey, Scheduled>;
+    ScheduledQueue scheduled;
+    std::unordered_map<int, ScheduledQueue::iterator> scheduled_by_id;
     int next_schedule_id = 1;
+    std::uint64_t next_schedule_sequence = 0;
+    double scheduler_time = 0.0;
+    PanoramaRuntimeWorkBudget work_budget;
 
-    // In-flight dispatch snapshots (fire()'s handler copy, update()'s due list).
-    // A handler may delete panels mid-dispatch; node destruction must null dead
-    // contexts inside these working copies too, not just the registries above.
-    std::vector<std::vector<EventHandler>*> live_handler_batches;
-    std::vector<Scheduled>* firing_scheduled = nullptr;
+    int allocate_schedule_id()
+    {
+        if (scheduled_by_id.size() >= static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        {
+            return 0;
+        }
+        for (;;)
+        {
+            const int candidate = next_schedule_id;
+            next_schedule_id =
+                candidate == std::numeric_limits<int>::max() ? 1 : candidate + 1;
+            if (!scheduled_by_id.contains(candidate))
+            {
+                return candidate;
+            }
+        }
+    }
 
     // SetDialogVariable: capture each node's original text as a template so repeated
     // updates re-expand cleanly into the node's text.
@@ -365,6 +370,8 @@ struct PanoramaRuntime::Impl final : PanoramaNodeLifetimeObserver
 
     JSValue wrap_panel(PanoramaNode* node);
     PanoramaNode* panel_node(JSValueConst value) const;
+    void ensure_observed(PanoramaNode* node);
+    void erase_event_handler(int id);
 
     // `source` scopes delivery: handlers registered with a panel target only run
     // when that panel is the event's source. A null source (plain DispatchEvent)
@@ -373,28 +380,30 @@ struct PanoramaRuntime::Impl final : PanoramaNodeLifetimeObserver
     void run_code(PanoramaNode* context, const std::string& code, const char* origin);
     void apply_dialog_variables(PanoramaNode* node);
     void dump_pending_error(const char* origin);
+    void drain_pending_jobs(const char* origin);
 
-    // PanoramaNodeLifetimeObserver: drop every reference to a dying node before
-    // it dangles (registered for the lifetime of the JS context).
-    void on_panorama_node_destroyed(PanoramaNode& node) override;
-
-    ~Impl() override
-    {
-        panorama_remove_node_lifetime_observer(*this);
-    }
+    static void observed_node_destroyed(void* context, PanoramaNode& node);
+    static void handler_node_destroyed(void* context, PanoramaNode& node);
+    static void null_context_entry(void* context, PanoramaNode& node);
 
     // Pushes a script context for the duration of a scope (layout script, event
     // handler, scheduled callback).
     struct ContextScope
     {
         Impl& impl;
+        std::list<ContextEntry>::iterator entry;
         ContextScope(Impl& owner, PanoramaNode* context) : impl(owner)
         {
-            impl.context_stack.push_back(context);
+            entry = impl.context_stack.emplace(impl.context_stack.end());
+            entry->node = context;
+            if (context != nullptr)
+            {
+                entry->lifetime.bind(*context, &Impl::null_context_entry, &*entry);
+            }
         }
         ~ContextScope()
         {
-            impl.context_stack.pop_back();
+            impl.context_stack.erase(entry);
         }
         ContextScope(const ContextScope&) = delete;
         ContextScope& operator=(const ContextScope&) = delete;
@@ -406,6 +415,11 @@ namespace
 PanoramaRuntime::Impl* impl_of(JSContext* ctx)
 {
     return static_cast<PanoramaRuntime::Impl*>(JS_GetContextOpaque(ctx));
+}
+
+void null_node_pointer(void* context, PanoramaNode&)
+{
+    *static_cast<PanoramaNode**>(context) = nullptr;
 }
 
 PanoramaNode* node_arg(JSContext* ctx, JSValueConst value)
@@ -587,6 +601,7 @@ JSValue panel_remove_and_delete_children(JSContext* ctx, JSValueConst this_val, 
     if (node != nullptr && !node->children.empty())
     {
         node->children.clear();
+        panorama_notify_tree_structure_changed(*node);
         mark_dirty(ctx);
     }
     return JS_UNDEFINED;
@@ -605,7 +620,9 @@ JSValue panel_delete_async(JSContext* ctx, JSValueConst this_val, int /*argc*/, 
     });
     if (it != siblings.end())
     {
+        PanoramaNode* parent = node->parent;
         siblings.erase(it);
+        panorama_notify_tree_structure_changed(*parent);
         mark_dirty(ctx);
     }
     return JS_UNDEFINED;
@@ -650,6 +667,7 @@ JSValue panel_move_child_before(JSContext* ctx, JSValueConst this_val, int argc,
         return node.get() == before;
     }) : siblings.end();
     siblings.insert(insert_at, std::move(owned));
+    panorama_notify_tree_structure_changed(*parent);
     mark_dirty(ctx);
     return JS_UNDEFINED;
 }
@@ -701,6 +719,7 @@ JSValue panel_move_child_after(JSContext* ctx, JSValueConst this_val, int argc, 
         }
     }
     siblings.insert(insert_at, std::move(owned));
+    panorama_notify_tree_structure_changed(*parent);
     mark_dirty(ctx);
     return JS_UNDEFINED;
 }
@@ -721,6 +740,7 @@ JSValue panel_set_parent(JSContext* ctx, JSValueConst this_val, int argc, JSValu
     }
     node->parent = parent;
     parent->children.push_back(std::move(owned));
+    panorama_notify_tree_structure_changed(*parent);
     mark_dirty(ctx);
     return JS_UNDEFINED;
 }
@@ -1095,6 +1115,7 @@ JSValue panel_add_option(JSContext* ctx, JSValueConst this_val, int argc, JSValu
         {
             option->parent = node;
             node->children.push_back(std::move(owned));
+            panorama_notify_tree_structure_changed(*node);
         }
     }
     mark_dirty(ctx);
@@ -1107,6 +1128,7 @@ JSValue panel_remove_all_options(JSContext* ctx, JSValueConst this_val, int /*ar
     if (node != nullptr)
     {
         node->children.clear();
+        panorama_notify_tree_structure_changed(*node);
         node->attributes.erase("selected");
         mark_dirty(ctx);
     }
@@ -1409,12 +1431,19 @@ JSValue panel_get_style(JSContext* ctx, JSValueConst this_val, int /*argc*/, JSV
     {
         return JS_NULL;
     }
-    JSValue obj = JS_NewObjectClass(ctx, impl_of(ctx)->style_class_id);
+    PanoramaRuntime::Impl* impl = impl_of(ctx);
+    if (const auto found = impl->style_wrappers.find(node); found != impl->style_wrappers.end())
+    {
+        return JS_DupValue(ctx, found->second);
+    }
+    impl->ensure_observed(node);
+    JSValue obj = JS_NewObjectClass(ctx, impl->style_class_id);
     if (JS_IsException(obj))
     {
         return obj;
     }
     JS_DefinePropertyValueStr(ctx, obj, kStylePanelSlot, JS_DupValue(ctx, this_val), 0);
+    impl->style_wrappers.emplace(node, JS_DupValue(ctx, obj));
     return obj;
 }
 
@@ -1650,6 +1679,7 @@ JSValue dollar_create_panel(JSContext* ctx, JSValueConst /*this_val*/, int argc,
         return impl->localization.localize(text);
     });
     parent->children.push_back(std::move(created));
+    panorama_notify_tree_structure_changed(*parent);
     impl->dirty = true;
     return wrap(ctx, raw);
 }
@@ -1674,8 +1704,30 @@ JSValue dollar_register_event_handler(JSContext* ctx, JSValueConst /*this_val*/,
     // other panels' events.
     PanoramaNode* target = argc >= 3 ? impl->panel_node(argv[1]) : nullptr;
     const int id = impl->next_event_handler_id++;
-    impl->event_handlers[name].push_back(
-        PanoramaRuntime::Impl::EventHandler{JS_DupValue(ctx, fn), impl->innermost_context(), target, id});
+    auto& handlers = impl->event_handlers[name];
+    auto handler = handlers.emplace(handlers.end());
+    handler->owner = impl;
+    handler->fn = JS_DupValue(ctx, fn);
+    handler->context = impl->innermost_context();
+    handler->target = target;
+    handler->id = id;
+    if (handler->context != nullptr)
+    {
+        handler->context_lifetime.bind(
+            *handler->context,
+            &PanoramaRuntime::Impl::handler_node_destroyed,
+            &*handler);
+    }
+    if (handler->target != nullptr && handler->target != handler->context)
+    {
+        handler->target_lifetime.bind(
+            *handler->target,
+            &PanoramaRuntime::Impl::handler_node_destroyed,
+            &*handler);
+    }
+    impl->event_handlers_by_id.emplace(
+        id,
+        PanoramaRuntime::Impl::EventHandlerLocation{name, handler});
     return JS_NewInt32(ctx, id);
 }
 
@@ -1693,20 +1745,10 @@ JSValue dollar_unregister_event_handler(JSContext* ctx, JSValueConst /*this_val*
     const std::string name = to_std_string(ctx, argv[0]);
     int id = 0;
     JS_ToInt32(ctx, &id, argv[1]);
-    const auto it = impl->event_handlers.find(name);
-    if (it == impl->event_handlers.end())
+    const auto location = impl->event_handlers_by_id.find(id);
+    if (location != impl->event_handlers_by_id.end() && location->second.event_name == name)
     {
-        return JS_UNDEFINED;
-    }
-    auto& handlers = it->second;
-    for (auto h = handlers.begin(); h != handlers.end(); ++h)
-    {
-        if (h->id == id)
-        {
-            JS_FreeValue(ctx, h->fn);
-            handlers.erase(h);
-            break;
-        }
+        impl->erase_event_handler(id);
     }
     return JS_UNDEFINED;
 }
@@ -1731,11 +1773,42 @@ JSValue dollar_schedule(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSV
     JS_ToFloat64(ctx, &seconds, argv[0]);
 
     PanoramaRuntime::Impl::Scheduled entry;
-    entry.id = impl->next_schedule_id++;
-    entry.remaining = seconds;
+    entry.id = impl->allocate_schedule_id();
+    if (entry.id == 0)
+    {
+        return JS_NewInt32(ctx, 0);
+    }
+    entry.sequence = impl->next_schedule_sequence++;
+    if (std::isnan(seconds))
+    {
+        // Match the old countdown behavior: NaN never became due.
+        entry.deadline = std::numeric_limits<double>::infinity();
+    }
+    else if (seconds <= 0.0)
+    {
+        // Zero and negative delays are both "next update". Giving them the
+        // current absolute deadline preserves insertion order with an existing
+        // ready backlog and prevents a self-rescheduling negative timer from
+        // jumping the bounded queue forever.
+        entry.deadline = impl->scheduler_time;
+    }
+    else
+    {
+        entry.deadline = impl->scheduler_time + seconds;
+    }
     entry.fn = JS_DupValue(ctx, argv[1]);
     entry.context = impl->innermost_context();
-    impl->scheduled.push_back(entry);
+    const PanoramaRuntime::Impl::ScheduledKey key{entry.deadline, entry.sequence};
+    PanoramaNode* context = entry.context;
+    const auto inserted = impl->scheduled.emplace(key, std::move(entry)).first;
+    if (context != nullptr)
+    {
+        inserted->second.context_lifetime.bind(
+            *context,
+            &null_node_pointer,
+            &inserted->second.context);
+    }
+    impl->scheduled_by_id.emplace(entry.id, inserted);
     return JS_NewInt32(ctx, entry.id);
 }
 
@@ -1748,14 +1821,12 @@ JSValue dollar_cancel_scheduled(JSContext* ctx, JSValueConst /*this_val*/, int a
     int id = 0;
     JS_ToInt32(ctx, &id, argv[0]);
     PanoramaRuntime::Impl* impl = impl_of(ctx);
-    for (auto it = impl->scheduled.begin(); it != impl->scheduled.end(); ++it)
+    const auto indexed = impl->scheduled_by_id.find(id);
+    if (indexed != impl->scheduled_by_id.end())
     {
-        if (it->id == id)
-        {
-            JS_FreeValue(ctx, it->fn);
-            impl->scheduled.erase(it);
-            break;
-        }
+        JS_FreeValue(ctx, indexed->second->second.fn);
+        impl->scheduled.erase(indexed->second);
+        impl->scheduled_by_id.erase(indexed);
     }
     return JS_UNDEFINED;
 }
@@ -1785,6 +1856,7 @@ JSValue PanoramaRuntime::Impl::wrap_panel(PanoramaNode* node)
     {
         return JS_NULL;
     }
+    ensure_observed(node);
     // One wrapper per node: script-side identity (`a === b` for the same panel)
     // and a single place to neutralize when the node is destroyed.
     const auto it = panel_wrappers.find(node);
@@ -1807,110 +1879,88 @@ PanoramaNode* PanoramaRuntime::Impl::panel_node(JSValueConst value) const
     return static_cast<PanoramaNode*>(JS_GetOpaque(value, panel_class_id));
 }
 
-void PanoramaRuntime::Impl::on_panorama_node_destroyed(PanoramaNode& node)
+void PanoramaRuntime::Impl::ensure_observed(PanoramaNode* node)
 {
-    if (ctx == nullptr)
+    if (node == nullptr || observed_nodes.contains(node))
     {
         return;
     }
+    auto [found, inserted] = observed_nodes.try_emplace(node);
+    if (inserted)
+    {
+        found->second.bind(*node, &Impl::observed_node_destroyed, this);
+    }
+}
 
-    // Neutralize the JS wrapper: surviving script references keep a valid JS
-    // object whose opaque is null, which every panel method treats as "panel
-    // gone" (and IsValid() reports false).
-    const auto wrapper = panel_wrappers.find(&node);
-    if (wrapper != panel_wrappers.end())
+void PanoramaRuntime::Impl::erase_event_handler(int id)
+{
+    const auto location = event_handlers_by_id.find(id);
+    if (location == event_handlers_by_id.end())
+    {
+        return;
+    }
+    const auto handlers = event_handlers.find(location->second.event_name);
+    if (handlers != event_handlers.end())
+    {
+        JS_FreeValue(ctx, location->second.handler->fn);
+        handlers->second.erase(location->second.handler);
+    }
+    event_handlers_by_id.erase(location);
+}
+
+void PanoramaRuntime::Impl::handler_node_destroyed(void* context, PanoramaNode&)
+{
+    auto* handler = static_cast<EventHandler*>(context);
+    handler->owner->erase_event_handler(handler->id);
+}
+
+void PanoramaRuntime::Impl::null_context_entry(void* context, PanoramaNode&)
+{
+    static_cast<ContextEntry*>(context)->node = nullptr;
+}
+
+void PanoramaRuntime::Impl::observed_node_destroyed(void* context, PanoramaNode& node)
+{
+    auto& impl = *static_cast<Impl*>(context);
+    impl.observed_nodes.erase(&node);
+    if (impl.ctx == nullptr)
+    {
+        return;
+    }
+    const auto style_wrapper = impl.style_wrappers.find(&node);
+    if (style_wrapper != impl.style_wrappers.end())
+    {
+        JS_FreeValue(impl.ctx, style_wrapper->second);
+        impl.style_wrappers.erase(style_wrapper);
+    }
+    const auto wrapper = impl.panel_wrappers.find(&node);
+    if (wrapper != impl.panel_wrappers.end())
     {
         JS_SetOpaque(wrapper->second, nullptr);
-        JS_FreeValue(ctx, wrapper->second);
-        panel_wrappers.erase(wrapper);
+        JS_FreeValue(impl.ctx, wrapper->second);
+        impl.panel_wrappers.erase(wrapper);
     }
-
-    const auto data = panel_data.find(&node);
-    if (data != panel_data.end())
+    const auto data = impl.panel_data.find(&node);
+    if (data != impl.panel_data.end())
     {
-        JS_FreeValue(ctx, data->second);
-        panel_data.erase(data);
+        JS_FreeValue(impl.ctx, data->second);
+        impl.panel_data.erase(data);
     }
-
-    const auto events = panel_events.find(&node);
-    if (events != panel_events.end())
+    const auto events = impl.panel_events.find(&node);
+    if (events != impl.panel_events.end())
     {
         for (auto& [event_name, fn] : events->second)
         {
-            JS_FreeValue(ctx, fn);
+            JS_FreeValue(impl.ctx, fn);
         }
-        panel_events.erase(events);
+        impl.panel_events.erase(events);
     }
-
-    switch_classes.erase(&node);
-    dialog_templates.erase(&node);
-    dialog_vars.erase(&node);
-
-    // Handlers registered by the dying panel's script context — or scoped TO the
-    // dying panel via RegisterEventHandler(event, panel, fn) — die with it (real
-    // Panorama scopes a panel's registrations to the panel); in-flight dispatch
-    // batches hold their own dup'd functions, so only their pointers are nulled.
-    for (auto& [event_name, handlers] : event_handlers)
+    impl.switch_classes.erase(&node);
+    impl.dialog_templates.erase(&node);
+    impl.dialog_vars.erase(&node);
+    if (impl.document == &node)
     {
-        handlers.erase(
-            std::remove_if(
-                handlers.begin(),
-                handlers.end(),
-                [&](EventHandler& handler) {
-                    if (handler.context != &node && handler.target != &node)
-                    {
-                        return false;
-                    }
-                    JS_FreeValue(ctx, handler.fn);
-                    return true;
-                }),
-            handlers.end());
-    }
-    for (std::vector<EventHandler>* batch : live_handler_batches)
-    {
-        for (EventHandler& handler : *batch)
-        {
-            if (handler.context == &node)
-            {
-                handler.context = nullptr;
-            }
-            if (handler.target == &node)
-            {
-                handler.target = nullptr;
-            }
-        }
-    }
-
-    // Scheduled callbacks survive (they are script-owned, not panel-owned) but
-    // fall back to the document context.
-    for (Scheduled& entry : scheduled)
-    {
-        if (entry.context == &node)
-        {
-            entry.context = nullptr;
-        }
-    }
-    if (firing_scheduled != nullptr)
-    {
-        for (Scheduled& entry : *firing_scheduled)
-        {
-            if (entry.context == &node)
-            {
-                entry.context = nullptr;
-            }
-        }
-    }
-
-    for (PanoramaNode*& entry : context_stack)
-    {
-        if (entry == &node)
-        {
-            entry = nullptr;
-        }
-    }
-    if (document == &node)
-    {
-        document = nullptr;
+        impl.document = nullptr;
     }
 }
 
@@ -1934,6 +1984,25 @@ void PanoramaRuntime::Impl::dump_pending_error(const char* origin)
     pano_log_warning("[panorama] {} error: {}", origin, message);
 }
 
+void PanoramaRuntime::Impl::drain_pending_jobs(const char* origin)
+{
+    std::size_t executed = 0;
+    while (work_budget.pending_jobs_per_pump == 0 || executed < work_budget.pending_jobs_per_pump)
+    {
+        JSContext* job_ctx = nullptr;
+        const int result = JS_ExecutePendingJob(rt, &job_ctx);
+        if (result <= 0)
+        {
+            if (result < 0)
+            {
+                dump_pending_error(origin);
+            }
+            break;
+        }
+        ++executed;
+    }
+}
+
 void PanoramaRuntime::Impl::fire(const std::string& name, int argc, JSValueConst* argv, PanoramaNode* source)
 {
     const auto it = event_handlers.find(name);
@@ -1948,24 +2017,27 @@ void PanoramaRuntime::Impl::fire(const std::string& name, int argc, JSValueConst
     // their own), and the batch is registered so node destruction can null dead
     // contexts inside it. Panel-scoped handlers are filtered here, against the
     // event's source panel; null-source fires keep delivering to everyone.
-    std::vector<EventHandler> handlers;
-    handlers.reserve(it->second.size());
+    std::vector<JSValue> functions;
+    std::vector<PanoramaNode*> contexts;
+    functions.reserve(it->second.size());
+    contexts.reserve(it->second.size());
     for (const EventHandler& handler : it->second)
     {
         if (source != nullptr && handler.target != nullptr && handler.target != source)
         {
             continue;
         }
-        handlers.push_back(EventHandler{JS_DupValue(ctx, handler.fn), handler.context, handler.target});
+        functions.push_back(JS_DupValue(ctx, handler.fn));
+        contexts.push_back(handler.context);
     }
-    live_handler_batches.push_back(&handlers);
+    PanoramaScopedNodeWatch context_watch(std::move(contexts));
 
-    for (const EventHandler& handler : handlers)
+    for (std::size_t index = 0; index < functions.size(); ++index)
     {
         // Each handler resolves $.GetContextPanel() against the layout root of
         // the script that registered it (captured at registration).
-        ContextScope scope(*this, handler.context);
-        JSValue result = JS_Call(ctx, handler.fn, JS_UNDEFINED, argc, argv);
+        ContextScope scope(*this, context_watch.nodes()[index]);
+        JSValue result = JS_Call(ctx, functions[index], JS_UNDEFINED, argc, argv);
         if (JS_IsException(result))
         {
             dump_pending_error(("event '" + name + "'").c_str());
@@ -1973,10 +2045,9 @@ void PanoramaRuntime::Impl::fire(const std::string& name, int argc, JSValueConst
         JS_FreeValue(ctx, result);
     }
 
-    live_handler_batches.pop_back();
-    for (const EventHandler& handler : handlers)
+    for (JSValue function : functions)
     {
-        JS_FreeValue(ctx, handler.fn);
+        JS_FreeValue(ctx, function);
     }
 }
 
@@ -2087,6 +2158,7 @@ bool PanoramaRuntime::initialize_with_script_contexts(
     shutdown();
 
     auto impl = std::make_unique<Impl>();
+    impl->work_budget = work_budget_;
     impl->rt = JS_NewRuntime();
     if (impl->rt == nullptr)
     {
@@ -2104,7 +2176,7 @@ bool PanoramaRuntime::initialize_with_script_contexts(
     JSContext* ctx = impl->ctx;
     JS_SetContextOpaque(ctx, impl.get());
     impl->document = &root;
-    panorama_add_node_lifetime_observer(*impl);
+    impl->ensure_observed(&root);
     impl->load_layout_file = file_loader_;       // so init-time BLoadLayout works
     impl->load_layout_snippet = snippet_loader_;
     impl->has_layout_snippet = snippet_exists_;
@@ -2382,10 +2454,7 @@ void PanoramaRuntime::run_source_in_context(const std::string& source, const std
         panorama_debug_set_mutation_context("run_source_in_context " + origin);
     }
     impl_->run_code(&context, source, origin.c_str());
-    JSContext* job_ctx = nullptr;
-    while (JS_ExecutePendingJob(impl_->rt, &job_ctx) > 0)
-    {
-    }
+    impl_->drain_pending_jobs(origin.c_str());
 }
 
 void PanoramaRuntime::run_node_handler(PanoramaNode& node, const std::string& event_attr)
@@ -2426,10 +2495,7 @@ void PanoramaRuntime::run_node_handler(PanoramaNode& node, const std::string& ev
             JS_FreeValue(impl_->ctx, fn);
         }
     }
-    JSContext* job_ctx = nullptr;
-    while (JS_ExecutePendingJob(impl_->rt, &job_ctx) > 0)
-    {
-    }
+    impl_->drain_pending_jobs(event_attr.c_str());
 }
 
 void PanoramaRuntime::run_script_source(const std::string& source, const char* origin)
@@ -2443,10 +2509,21 @@ void PanoramaRuntime::run_script_source(const std::string& source, const char* o
     JS_FreeValue(ctx, result);
 
     // Drain any micro-tasks (promise jobs) the script queued.
-    JSContext* job_ctx = nullptr;
-    while (JS_ExecutePendingJob(impl_->rt, &job_ctx) > 0)
+    impl_->drain_pending_jobs(origin);
+}
+
+void PanoramaRuntime::set_work_budget(PanoramaRuntimeWorkBudget budget) noexcept
+{
+    work_budget_ = budget;
+    if (impl_)
     {
+        impl_->work_budget = budget;
     }
+}
+
+PanoramaRuntimeWorkBudget PanoramaRuntime::work_budget() const noexcept
+{
+    return work_budget_;
 }
 
 void PanoramaRuntime::update(double dt_seconds)
@@ -2457,35 +2534,49 @@ void PanoramaRuntime::update(double dt_seconds)
     }
 
     JSContext* ctx = impl_->ctx;
+    impl_->scheduler_time += dt_seconds;
 
-    // Collect callbacks that are due, then fire outside the scan so a callback may
-    // reschedule without disturbing iteration.
+    // Pop only the deadline-ordered ready prefix. Equal deadlines use the
+    // monotonically increasing sequence, so insertion order remains stable.
+    // The batch is complete before dispatch: a callback scheduled from another
+    // callback (including zero/negative delay) remains a next-update operation,
+    // matching the historical vector-snapshot behavior.
     std::vector<Impl::Scheduled> due;
-    for (auto it = impl_->scheduled.begin(); it != impl_->scheduled.end();)
+    const std::size_t callback_budget = impl_->work_budget.scheduled_callbacks_per_update;
+    due.reserve(callback_budget == 0
+        ? impl_->scheduled.size()
+        : std::min(callback_budget, impl_->scheduled.size()));
+    while (!impl_->scheduled.empty() && (callback_budget == 0 || due.size() < callback_budget))
     {
-        it->remaining -= dt_seconds;
-        if (it->remaining <= 0.0)
+        auto first = impl_->scheduled.begin();
+        const double deadline = first->first.first;
+        // Positive infinity represents the old NaN-delay "never due" state.
+        if ((std::isinf(deadline) && deadline > 0.0) || !(deadline <= impl_->scheduler_time))
         {
-            due.push_back(*it);
-            it = impl_->scheduled.erase(it);
+            break;
         }
-        else
-        {
-            ++it;
-        }
+        impl_->scheduled_by_id.erase(first->second.id);
+        first->second.context_lifetime.reset();
+        due.push_back(std::move(first->second));
+        impl_->scheduled.erase(first);
     }
 
-    // Register the due batch so a callback that deletes another callback's
-    // context panel nulls the stale pointer here too, not only in `scheduled`.
-    impl_->firing_scheduled = &due;
+    std::vector<PanoramaNode*> due_contexts;
+    due_contexts.reserve(due.size());
     for (const Impl::Scheduled& entry : due)
     {
+        due_contexts.push_back(entry.context);
+    }
+    PanoramaScopedNodeWatch due_context_watch(std::move(due_contexts));
+    for (std::size_t index = 0; index < due.size(); ++index)
+    {
+        const Impl::Scheduled& entry = due[index];
         if (panorama_debug_tree_guard_enabled())
         {
             panorama_debug_set_mutation_context("scheduled callback id=" + std::to_string(entry.id));
         }
         // The callback sees its registering script's context panel.
-        Impl::ContextScope scope(*impl_, entry.context);
+        Impl::ContextScope scope(*impl_, due_context_watch.nodes()[index]);
         JSValue result = JS_Call(ctx, entry.fn, JS_UNDEFINED, 0, nullptr);
         if (JS_IsException(result))
         {
@@ -2494,12 +2585,7 @@ void PanoramaRuntime::update(double dt_seconds)
         JS_FreeValue(ctx, result);
         JS_FreeValue(ctx, entry.fn);
     }
-    impl_->firing_scheduled = nullptr;
-
-    JSContext* job_ctx = nullptr;
-    while (JS_ExecutePendingJob(impl_->rt, &job_ctx) > 0)
-    {
-    }
+    impl_->drain_pending_jobs("pending job");
 }
 
 void PanoramaRuntime::dispatch_event(const std::string& event_name)
@@ -2555,8 +2641,9 @@ void PanoramaRuntime::shutdown()
                 JS_FreeValue(ctx, handler.fn);
             }
         }
-        for (auto& entry : impl_->scheduled)
+        for (auto& scheduled_entry : impl_->scheduled)
         {
+            Impl::Scheduled& entry = scheduled_entry.second;
             JS_FreeValue(ctx, entry.fn);
         }
         for (auto& [node, data] : impl_->panel_data)
@@ -2577,13 +2664,22 @@ void PanoramaRuntime::shutdown()
             JS_SetOpaque(wrapper, nullptr);
             JS_FreeValue(ctx, wrapper);
         }
+        for (auto& [node, wrapper] : impl_->style_wrappers)
+        {
+            JS_FreeValue(ctx, wrapper);
+        }
     }
     impl_->event_handlers.clear();
+    impl_->event_handlers_by_id.clear();
     impl_->scheduled.clear();
+    impl_->scheduled_by_id.clear();
     impl_->panel_data.clear();
     impl_->panel_events.clear();
     impl_->panel_wrappers.clear();
+    impl_->style_wrappers.clear();
     impl_->switch_classes.clear();
+    impl_->observed_nodes.clear();
+    impl_->context_stack.clear();
 
     if (impl_->ctx != nullptr)
     {

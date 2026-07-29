@@ -757,6 +757,19 @@ struct PanoramaKeyframes
     std::uint32_t channels = 0;
 };
 
+// Immutable result of parsing one CSS source. Document sessions cache these
+// templates by normalized resource identity and append copies to a live sheet,
+// avoiding repeated tokenization while preserving per-document source order and
+// layout scopes.
+struct PanoramaParsedStyleSource
+{
+    std::vector<PanoramaRule> rules;
+    std::unordered_map<std::string, std::string> defines;
+    std::unordered_map<std::string, PanoramaKeyframes> keyframes;
+    bool has_sibling_rules = false;
+    bool has_focus_within_rules = false;
+};
+
 class PanoramaStyleSheet
 {
 public:
@@ -772,6 +785,11 @@ public:
     // with the default and get the old global behaviour.
     static constexpr std::uint16_t kRootLayoutScope = 1;
 
+    [[nodiscard]] static PanoramaParsedStyleSource parse_source(std::string_view css);
+    std::uint16_t add_parsed_source(
+        const PanoramaParsedStyleSource& source,
+        std::uint16_t layout_scope = kRootLayoutScope);
+
     // Parses a Panorama CSS source and appends its rules. May be called multiple
     // times to accumulate several stylesheets; source order is preserved across
     // calls so later sheets win ties.
@@ -785,6 +803,14 @@ public:
     // style_scope_mark of the node or one of its ancestors. Returns the source
     // index for add_source_scope.
     std::uint16_t add_source(std::string_view css, std::uint16_t layout_scope = kRootLayoutScope);
+
+    // Defers @define substitution/keyframe derivation until the outermost batch
+    // ends. Nested document/frame loads can therefore append many sources while
+    // resolving the accumulated declarations exactly once.
+    void begin_source_batch() noexcept;
+    void end_source_batch();
+    [[nodiscard]] std::uint64_t source_parse_count() const noexcept { return source_parse_count_; }
+    [[nodiscard]] std::uint64_t value_finalization_count() const noexcept { return value_finalization_count_; }
 
     // Re-include of an already-parsed sheet by ANOTHER layout: widens the
     // sheet's scope set without reparsing (its cascade position is unchanged —
@@ -878,6 +904,10 @@ public:
 
 private:
     void compute_node(PanoramaNode& node, const PanoramaNode* prev_sibling = nullptr) const;
+    // Heap-backed depth-first walk used after one node has been computed. Keeping
+    // descendant traversal out of compute_node_impl prevents one large cascade
+    // frame per DOM level from overflowing the host thread's stack.
+    void compute_descendants_iterative(PanoramaNode& node) const;
     // CPUMT-49: compute_node's actual body, parameterized on whether to recurse
     // into children. compute_node(node, prev) == compute_node_impl(node, prev,
     // true) — behavior-identical to the pre-CPUMT-49 compute_node for every
@@ -912,6 +942,10 @@ private:
     // generation) pair (e.g. each node's inline-style cache) revalidate when the
     // sheet content — including @defines, which alter resolved values — changes.
     std::uint64_t generation_ = 0;
+    std::size_t source_batch_depth_ = 0;
+    bool source_values_dirty_ = false;
+    std::uint64_t source_parse_count_ = 0;
+    std::uint64_t value_finalization_count_ = 0;
     // Never-reused identity for caches that outlive any one sheet (a destroyed
     // sheet's address can be recycled; this cannot).
     [[nodiscard]] static std::uint64_t next_sheet_instance_id() noexcept;
@@ -1007,6 +1041,37 @@ PanoramaClip parse_panorama_clip(std::string_view value);
     const std::vector<unsigned char>& rgba, int width, int height, float std_x, float std_y);
 
 void apply_panorama_declaration(PanoramaComputedStyle& style, std::string_view property, std::string_view value);
+
+// Structured inline declarations are the authoritative mutation surface for
+// script writes. `inline_style` remains a compatibility serialization for hosts
+// that read or directly replace the public raw attribute.
+[[nodiscard]] bool panorama_set_inline_style_property(
+    PanoramaNode& node,
+    std::string_view property,
+    std::string_view value);
+
+struct PanoramaInlineStyleStats
+{
+    std::uint64_t raw_parses = 0;
+    std::uint64_t property_writes = 0;
+    std::uint64_t serializations = 0;
+};
+[[nodiscard]] PanoramaInlineStyleStats& panorama_inline_style_stats();
+[[nodiscard]] PanoramaInlineStyleStats panorama_inline_style_stats_take();
+
+struct PanoramaMatchedStyleCacheStats
+{
+    std::uint64_t lookups = 0;
+    std::uint64_t hits = 0;
+    std::uint64_t misses = 0;
+    std::uint64_t inserts = 0;
+    std::uint64_t evictions = 0;
+    std::uint64_t generation_resets = 0;
+    std::size_t entries = 0;
+    std::size_t capacity = 4096;
+};
+[[nodiscard]] PanoramaMatchedStyleCacheStats& panorama_matched_style_cache_stats();
+[[nodiscard]] PanoramaMatchedStyleCacheStats panorama_matched_style_cache_stats_take();
 
 // Cascade work counters (diagnostics): cumulative tallies of what compute() did,
 // for benchmarks/regression hunts. Reset the struct, run a compute, read it back.

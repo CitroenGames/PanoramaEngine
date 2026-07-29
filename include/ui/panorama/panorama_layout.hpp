@@ -20,6 +20,13 @@ struct PanoramaTextMeasure
     // caller (see panorama_transform_text), so the measurer must not transform again.
     std::function<std::pair<float, float>(
         std::string_view text, float font_size, int font_weight, float letter_spacing)> measure;
+    // Optional one-pass shaping path. It supplies UTF-8 byte spans, advances,
+    // and leading kerning for the authoritative artifact shared by layout and
+    // paint. Custom measurers can omit it and use the deterministic fallback.
+    PanoramaTextShapeRun shape;
+    // Changes whenever the measure/shape result for an identical request can
+    // change (font face, DPI/hinting generation).
+    std::function<std::uint64_t()> generation;
 };
 
 // Default approximate text measurer (0.5em advance, 1.2em line height).

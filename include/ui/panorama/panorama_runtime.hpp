@@ -5,6 +5,7 @@
 #include "ui/panorama/panorama_package.hpp"
 #include "ui/panorama/panorama_resource_provider.hpp"
 
+#include <cstddef>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -33,6 +34,15 @@ struct PanoramaRuntimeScriptInclude
 {
     std::string path;
     PanoramaNode* context = nullptr;
+};
+
+// Per-pump scheduler limits. A zero limit keeps the historical compatibility
+// behavior and drains all ready work. Non-zero limits retain excess callbacks
+// and promise jobs for the next update/pump in deterministic order.
+struct PanoramaRuntimeWorkBudget
+{
+    std::size_t scheduled_callbacks_per_update = 0;
+    std::size_t pending_jobs_per_pump = 0;
 };
 
 class PanoramaRuntimeClient
@@ -96,6 +106,11 @@ public:
 
     // Pumps scheduled callbacks and the JS micro-task queue. dt is in seconds.
     void update(double dt_seconds);
+
+    // May be changed before or after initialize(). The default zero/zero policy
+    // preserves drain-to-empty behavior for existing hosts.
+    void set_work_budget(PanoramaRuntimeWorkBudget budget) noexcept;
+    [[nodiscard]] PanoramaRuntimeWorkBudget work_budget() const noexcept;
 
     // Fires a Panorama event into the JS event bus from native code.
     void dispatch_event(const std::string& event_name);
@@ -180,6 +195,7 @@ private:
     PanoramaLocalization::ReadGate localization_read_gate_;
     PanoramaLocalization::NativeTokenTableOverride localization_native_override_;
     std::vector<PanoramaRuntimeScript> bootstrap_scripts_;
+    PanoramaRuntimeWorkBudget work_budget_;
     std::unique_ptr<Impl> impl_;
 };
 }

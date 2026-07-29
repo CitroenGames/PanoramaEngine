@@ -38,8 +38,14 @@
 //   font_atlas.load(...);                        // uploads the glyph atlas now
 //
 //   // per frame, inside your render pass on `cmd`:
-//   backend.new_frame(cmd, fb_width, fb_height);
+//   const auto ui_submission = backend.new_frame(cmd, fb_width, fb_height);
 //   geometry_cache.submit(draw_list, backend, ui_scale);   // or replay(backend)
+//   // ... end/submit `cmd` on init.queue, then:
+//   backend.submit_frame(ui_submission); // MUST follow the host vkQueueSubmit
+//
+// submit_frame() queues an empty fence-bearing submission after the host's UI
+// submission. Released resources are reclaimed only when that post-submit fence
+// completes. If recording is discarded, call abandon_frame() instead.
 //
 // Threading: single-threaded, like the rest of the engine. All calls must come
 // from the thread that owns `init.queue`.
@@ -48,6 +54,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -102,12 +109,17 @@ public:
         {
             return;
         }
-        vkDeviceWaitIdle(init_.device);
+        if (const panorama::PanoramaSubmissionId recording = submissions_.recording())
+        {
+            rebase_retirements(recording, submissions_.abandon_submission(recording));
+        }
+        (void)vkDeviceWaitIdle(init_.device);
+        complete_all_submissions();
+        reclaim_retired();
 
         for (auto& [id, geometry] : geometries_)
         {
-            destroy_buffer(geometry.vertex_buffer, geometry.vertex_memory);
-            destroy_buffer(geometry.index_buffer, geometry.index_memory);
+            destroy_buffer(geometry.buffer, geometry.memory);
         }
         geometries_.clear();
 
@@ -162,9 +174,23 @@ public:
     // pass on `cmd`. `cmd` is the command buffer subsequent render_geometry
     // calls (via the geometry cache) record into; it must stay in the recording
     // state and inside the render pass until you stop issuing draws for this
-    // frame. `fb_width`/`fb_height` are the render target size in pixels.
-    void new_frame(VkCommandBuffer cmd, std::uint32_t fb_width, std::uint32_t fb_height)
+    // frame. `fb_width`/`fb_height` are the render target size in pixels. The
+    // returned identity must be passed to exactly one of submit_frame() or
+    // abandon_frame() before another frame is begun.
+    [[nodiscard]] panorama::PanoramaSubmissionId new_frame(
+        VkCommandBuffer cmd, std::uint32_t fb_width, std::uint32_t fb_height)
     {
+        if (cmd == VK_NULL_HANDLE)
+        {
+            throw std::runtime_error("PanoramaVulkanBackend: new_frame requires a command buffer");
+        }
+        poll_completed_submissions();
+        const panorama::PanoramaSubmissionId submission = submissions_.begin_submission();
+        if (!submission)
+        {
+            throw std::runtime_error(
+                "PanoramaVulkanBackend: previous frame was not submitted or abandoned");
+        }
         current_cmd_ = cmd;
         framebuffer_extent_ = VkExtent2D{fb_width, fb_height};
         current_blend_ = panorama::PanoramaBlendMode::Normal;
@@ -179,11 +205,97 @@ public:
             0.0F, 0.0F, 1.0F, 0.0F,
             -1.0F, -1.0F, 0.0F, 1.0F,
         };
+        invalidate_state_cache();
+        const VkViewport viewport{
+            0.0F, 0.0F,
+            static_cast<float>(framebuffer_extent_.width),
+            static_cast<float>(framebuffer_extent_.height),
+            0.0F, 1.0F};
+        vkCmdSetViewport(current_cmd_, 0, 1, &viewport);
+        return submission;
     }
 
-    void wait_idle() { vkDeviceWaitIdle(init_.device); }
+    // Call after host-owned commands disturb graphics state between Panorama
+    // draws. The next draw conservatively restores all Panorama-owned state.
+    void invalidate_state_cache() noexcept
+    {
+        bound_pipeline_ = VK_NULL_HANDLE;
+        bound_descriptor_ = VK_NULL_HANDLE;
+        bound_geometry_ = 0;
+        bound_push_constants_valid_ = false;
+        bound_scissor_valid_ = false;
+    }
+
+    // Call immediately after the host successfully submits the command buffer
+    // passed to new_frame() on init.queue. Vulkan permits a submission with zero
+    // work batches and a fence; that fence is ordered after the preceding UI
+    // submission and provides the completion identity used for reclamation.
+    [[nodiscard]] panorama::PanoramaSubmissionId submit_frame(
+        panorama::PanoramaSubmissionId submission)
+    {
+        if (!submission || submission != submissions_.recording())
+        {
+            throw std::runtime_error("PanoramaVulkanBackend: submit_frame identity mismatch");
+        }
+
+        VkFenceCreateInfo fence_info{};
+        fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        VkFence fence = VK_NULL_HANDLE;
+        check(vkCreateFence(init_.device, &fence_info, init_.allocator, &fence),
+              "vkCreateFence(frame completion)");
+        const VkResult submit_result = vkQueueSubmit(init_.queue, 0, nullptr, fence);
+        if (submit_result != VK_SUCCESS)
+        {
+            vkDestroyFence(init_.device, fence, init_.allocator);
+            check(submit_result, "vkQueueSubmit(frame completion)");
+        }
+        if (!submissions_.mark_submitted(submission))
+        {
+            vkDestroyFence(init_.device, fence, init_.allocator);
+            throw std::runtime_error("PanoramaVulkanBackend: invalid submission transition");
+        }
+        completion_points_.push_back(CompletionPoint{submission, fence});
+        current_cmd_ = VK_NULL_HANDLE;
+        poll_completed_submissions();
+        return submission;
+    }
+
+    void abandon_frame(panorama::PanoramaSubmissionId submission)
+    {
+        if (!submission || submission != submissions_.recording())
+        {
+            throw std::runtime_error("PanoramaVulkanBackend: abandon_frame identity mismatch");
+        }
+        const panorama::PanoramaSubmissionId fallback = submissions_.abandon_submission(submission);
+        rebase_retirements(submission, fallback);
+        current_cmd_ = VK_NULL_HANDLE;
+        reclaim_retired();
+    }
+
+    // Explicit host-requested idle is retained for resize/shutdown integration.
+    // Steady-state update/release paths never call it.
+    void wait_idle()
+    {
+        check(vkDeviceWaitIdle(init_.device), "vkDeviceWaitIdle");
+        complete_all_submissions();
+        reclaim_retired();
+    }
 
     // --- PanoramaRenderBackend ------------------------------------------------
+
+    [[nodiscard]] panorama::PanoramaRenderBackendCapabilities capabilities() const noexcept override
+    {
+        return {
+            panorama::kPanoramaRenderBackendContractVersion,
+            static_cast<std::uint32_t>(panorama::PanoramaRenderBackendFeature::DrawConstants) |
+                static_cast<std::uint32_t>(
+                    panorama::PanoramaRenderBackendFeature::ExplicitSubmissionCompletion) |
+                static_cast<std::uint32_t>(
+                    panorama::PanoramaRenderBackendFeature::CombinedGeometryAllocation) |
+                static_cast<std::uint32_t>(
+                    panorama::PanoramaRenderBackendFeature::RedundantStateSuppression),
+        };
+    }
 
     panorama::PanoramaTextureId generate_texture(std::span<const unsigned char> rgba, int width, int height) override
     {
@@ -205,11 +317,23 @@ public:
         {
             return false;
         }
-        // Uploads must not race a frame that may still be sampling this image;
-        // the synchronous submit + queue wait inside upload_texture handles the
-        // ordering, but the host must not have in-flight frames using it.
-        vkDeviceWaitIdle(init_.device);
-        upload_texture(it->second, rgba);
+        // Never mutate an image that a submitted or merely-recorded frame may
+        // sample. Upload a replacement, atomically switch future draws to its
+        // descriptor, and retire the old image against the current submission
+        // horizon.
+        Texture replacement = create_texture(width, height);
+        try
+        {
+            upload_texture(replacement, rgba);
+        }
+        catch (...)
+        {
+            destroy_texture(replacement);
+            throw;
+        }
+        Texture previous = it->second;
+        it->second = replacement;
+        retire_texture(previous);
         return true;
     }
 
@@ -220,8 +344,7 @@ public:
         {
             return;
         }
-        vkDeviceWaitIdle(init_.device);
-        destroy_texture(it->second);
+        retire_texture(it->second);
         textures_.erase(it);
     }
 
@@ -248,46 +371,45 @@ public:
         // Geometry is compiled in framebuffer pixels: scale the design-pixel
         // positions by ui_scale, matching the coordinate space new_frame()'s
         // projection expects. UVs and colors pass through unchanged.
-        std::vector<panorama::PanoramaPaintVertex> scaled(vertices.begin(), vertices.end());
-        for (panorama::PanoramaPaintVertex& vertex : scaled)
-        {
-            vertex.x *= ui_scale;
-            vertex.y *= ui_scale;
-        }
-        std::vector<std::uint32_t> index_data(indices.begin(), indices.end());
-
         Geometry geometry;
-        geometry.index_count = static_cast<std::uint32_t>(index_data.size());
-        create_host_buffer(
-            scaled.size() * sizeof(panorama::PanoramaPaintVertex),
-            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, scaled.data(), geometry.vertex_buffer, geometry.vertex_memory);
-        create_host_buffer(
-            index_data.size() * sizeof(std::uint32_t),
-            VK_BUFFER_USAGE_INDEX_BUFFER_BIT, index_data.data(), geometry.index_buffer, geometry.index_memory);
+        geometry.index_count = static_cast<std::uint32_t>(indices.size());
+        geometry.ui_scale = ui_scale;
+        const VkDeviceSize vertex_bytes =
+            vertices.size() * sizeof(panorama::PanoramaPaintVertex);
+        const VkDeviceSize index_bytes = indices.size() * sizeof(std::uint32_t);
+        geometry.index_offset = (vertex_bytes + 3U) & ~VkDeviceSize{3U};
+        create_buffer(geometry.index_offset + index_bytes,
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            geometry.buffer, geometry.memory);
+        void* mapped = nullptr;
+        check(vkMapMemory(init_.device, geometry.memory, 0,
+                  geometry.index_offset + index_bytes, 0, &mapped),
+            "vkMapMemory(geometry arena)");
+        auto* scaled = static_cast<panorama::PanoramaPaintVertex*>(mapped);
+        for (std::size_t index = 0; index < vertices.size(); ++index)
+        {
+            scaled[index] = vertices[index];
+            scaled[index].x *= ui_scale;
+            scaled[index].y *= ui_scale;
+        }
+        auto* index_data = reinterpret_cast<std::uint32_t*>(
+            static_cast<std::uint8_t*>(mapped) + geometry.index_offset);
+        for (std::size_t index = 0; index < indices.size(); ++index)
+        {
+            index_data[index] = static_cast<std::uint32_t>(indices[index]);
+        }
+        vkUnmapMemory(init_.device, geometry.memory);
 
         const panorama::PanoramaCompiledGeometryHandle handle = next_geometry_id_++;
         geometries_.emplace(handle, geometry);
         return handle;
     }
 
-    // `constants` (see panorama_paint.hpp's PanoramaDrawConstants) is accepted
-    // for PanoramaRenderBackend conformance but not yet applied: this backend's
-    // vertex shader is precompiled SPIR-V (adapters/shaders/panorama_ui.vert,
-    // see adapters/shaders/README.md) that this header cannot regenerate, so
-    // wiring a per-draw transform/opacity into it would require extending the
-    // GLSL source AND re-running glslc, out of scope for a host-side-only
-    // change. The painter now emits a non-identity value for any transformed
-    // or partially-opaque command (see DrawListBuilder::paint's layer-context
-    // comment in panorama_paint.cpp) rather than only ever identity, so THIS
-    // ADAPTER RENDERS SUCH CONTENT WRONG (untransformed, undimmed) until it is
-    // wired up -- a future change that wants this adapter to honor a
-    // non-identity value must extend the push-constant range (see
-    // create_pipeline_layout) and the GLSL together, then regenerate the
-    // .spv.inl files.
     void render_geometry(panorama::PanoramaCompiledGeometryHandle geometry, panorama::PanoramaTextureId texture,
-        const panorama::PanoramaDrawConstants& /*constants*/) override
+        const panorama::PanoramaDrawConstants& constants) override
     {
-        if (current_cmd_ == VK_NULL_HANDLE)
+        if (current_cmd_ == VK_NULL_HANDLE || constants.opacity <= 0.0F)
         {
             return;
         }
@@ -308,24 +430,55 @@ public:
             }
         }
 
-        vkCmdBindPipeline(current_cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_for(current_blend_));
+        const VkPipeline pipeline = pipeline_for(current_blend_);
+        if (pipeline != bound_pipeline_)
+        {
+            vkCmdBindPipeline(current_cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            bound_pipeline_ = pipeline;
+        }
+        const VkRect2D scissor = current_scissor();
+        if (!bound_scissor_valid_ ||
+            std::memcmp(&bound_scissor_, &scissor, sizeof(scissor)) != 0)
+        {
+            vkCmdSetScissor(current_cmd_, 0, 1, &scissor);
+            bound_scissor_ = scissor;
+            bound_scissor_valid_ = true;
+        }
 
-        const VkViewport viewport{
-            0.0F, 0.0F,
-            static_cast<float>(framebuffer_extent_.width), static_cast<float>(framebuffer_extent_.height),
-            0.0F, 1.0F};
-        vkCmdSetViewport(current_cmd_, 0, 1, &viewport);
-        vkCmdSetScissor(current_cmd_, 0, 1, &current_scissor());
+        std::array<float, 24> push_constants{};
+        std::copy(projection_.begin(), projection_.end(), push_constants.begin());
+        const panorama::PanoramaGpuDrawConstants draw_constants =
+            panorama::panorama_pack_gpu_draw_constants(constants, mesh.ui_scale);
+        std::memcpy(
+            push_constants.data() + 16, &draw_constants, sizeof(draw_constants));
+        if (!bound_push_constants_valid_ ||
+            std::memcmp(bound_push_constants_.data(), push_constants.data(),
+                push_constants.size() * sizeof(float)) != 0)
+        {
+            vkCmdPushConstants(
+                current_cmd_, pipeline_layout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                static_cast<std::uint32_t>(push_constants.size() * sizeof(float)),
+                push_constants.data());
+            bound_push_constants_ = push_constants;
+            bound_push_constants_valid_ = true;
+        }
+        if (descriptor != bound_descriptor_)
+        {
+            vkCmdBindDescriptorSets(
+                current_cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                pipeline_layout_, 0, 1, &descriptor, 0, nullptr);
+            bound_descriptor_ = descriptor;
+        }
 
-        vkCmdPushConstants(
-            current_cmd_, pipeline_layout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
-            static_cast<std::uint32_t>(projection_.size() * sizeof(float)), projection_.data());
-        vkCmdBindDescriptorSets(
-            current_cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1, &descriptor, 0, nullptr);
-
-        const VkDeviceSize offset = 0;
-        vkCmdBindVertexBuffers(current_cmd_, 0, 1, &mesh.vertex_buffer, &offset);
-        vkCmdBindIndexBuffer(current_cmd_, mesh.index_buffer, 0, VK_INDEX_TYPE_UINT32);
+        if (geometry != bound_geometry_)
+        {
+            const VkDeviceSize vertex_offset = 0;
+            vkCmdBindVertexBuffers(
+                current_cmd_, 0, 1, &mesh.buffer, &vertex_offset);
+            vkCmdBindIndexBuffer(
+                current_cmd_, mesh.buffer, mesh.index_offset, VK_INDEX_TYPE_UINT32);
+            bound_geometry_ = geometry;
+        }
         vkCmdDrawIndexed(current_cmd_, mesh.index_count, 1, 0, 0, 0);
     }
 
@@ -336,11 +489,7 @@ public:
         {
             return;
         }
-        // The geometry cache releases handles that fell out of the draw list;
-        // those buffers may still be referenced by an in-flight frame.
-        vkDeviceWaitIdle(init_.device);
-        destroy_buffer(it->second.vertex_buffer, it->second.vertex_memory);
-        destroy_buffer(it->second.index_buffer, it->second.index_memory);
+        retire_geometry(it->second);
         geometries_.erase(it);
     }
 
@@ -358,11 +507,25 @@ private:
 
     struct Geometry
     {
-        VkBuffer vertex_buffer = VK_NULL_HANDLE;
-        VkDeviceMemory vertex_memory = VK_NULL_HANDLE;
-        VkBuffer index_buffer = VK_NULL_HANDLE;
-        VkDeviceMemory index_memory = VK_NULL_HANDLE;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkDeviceSize index_offset = 0;
         std::uint32_t index_count = 0;
+        float ui_scale = 1.0F;
+    };
+
+    struct RetiredResource
+    {
+        panorama::PanoramaSubmissionId retire_after{};
+        Texture texture{};
+        Geometry geometry{};
+        bool is_texture = false;
+    };
+
+    struct CompletionPoint
+    {
+        panorama::PanoramaSubmissionId submission{};
+        VkFence fence = VK_NULL_HANDLE;
     };
 
     static void check(VkResult result, const char* what)
@@ -371,6 +534,113 @@ private:
         {
             throw std::runtime_error(std::string("PanoramaVulkanBackend: ") + what + " failed (VkResult " +
                                      std::to_string(static_cast<int>(result)) + ")");
+        }
+    }
+
+    // --- submission completion / deferred free -------------------------------
+
+    void poll_completed_submissions()
+    {
+        std::size_t completed_count = 0;
+        while (completed_count < completion_points_.size())
+        {
+            CompletionPoint& point = completion_points_[completed_count];
+            const VkResult status = vkGetFenceStatus(init_.device, point.fence);
+            if (status == VK_NOT_READY)
+            {
+                break;
+            }
+            check(status, "vkGetFenceStatus(frame completion)");
+            (void)submissions_.mark_completed(point.submission);
+            vkDestroyFence(init_.device, point.fence, init_.allocator);
+            point.fence = VK_NULL_HANDLE;
+            ++completed_count;
+        }
+        if (completed_count != 0)
+        {
+            completion_points_.erase(
+                completion_points_.begin(), completion_points_.begin() + completed_count);
+        }
+        reclaim_retired();
+    }
+
+    void complete_all_submissions() noexcept
+    {
+        for (CompletionPoint& point : completion_points_)
+        {
+            (void)submissions_.mark_completed(point.submission);
+            if (point.fence != VK_NULL_HANDLE)
+            {
+                vkDestroyFence(init_.device, point.fence, init_.allocator);
+                point.fence = VK_NULL_HANDLE;
+            }
+        }
+        completion_points_.clear();
+        if (const panorama::PanoramaSubmissionId last = submissions_.last_submitted())
+        {
+            (void)submissions_.mark_completed(last);
+        }
+    }
+
+    void reclaim_retired()
+    {
+        std::size_t write = 0;
+        for (std::size_t read = 0; read < retired_.size(); ++read)
+        {
+            RetiredResource& retired = retired_[read];
+            if (submissions_.can_reclaim(retired.retire_after))
+            {
+                if (retired.is_texture)
+                {
+                    destroy_texture(retired.texture);
+                }
+                else
+                {
+                    destroy_buffer(retired.geometry.buffer, retired.geometry.memory);
+                }
+            }
+            else
+            {
+                if (write != read)
+                {
+                    retired_[write] = retired_[read];
+                }
+                ++write;
+            }
+        }
+        retired_.resize(write);
+    }
+
+    void retire_texture(Texture& texture)
+    {
+        RetiredResource retired;
+        retired.retire_after = submissions_.retirement_horizon();
+        retired.texture = texture;
+        retired.is_texture = true;
+        texture = {};
+        retired_.push_back(retired);
+        reclaim_retired();
+    }
+
+    void retire_geometry(Geometry& geometry)
+    {
+        RetiredResource retired;
+        retired.retire_after = submissions_.retirement_horizon();
+        retired.geometry = geometry;
+        geometry = {};
+        retired_.push_back(retired);
+        reclaim_retired();
+    }
+
+    void rebase_retirements(
+        panorama::PanoramaSubmissionId from, panorama::PanoramaSubmissionId to) noexcept
+    {
+        for (RetiredResource& retired : retired_)
+        {
+            if (retired.retire_after == from)
+            {
+                retired.retire_after = to;
+            }
         }
     }
 
@@ -515,7 +785,9 @@ private:
         VkPushConstantRange range{};
         range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
         range.offset = 0;
-        range.size = 16 * sizeof(float); // mat4 projection
+        // mat4 projection + two vec4 values containing the affine draw
+        // transform, scaled translation, opacity, and padding.
+        range.size = 24 * sizeof(float);
 
         VkPipelineLayoutCreateInfo info{};
         info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -960,6 +1232,9 @@ private:
 
     std::unordered_map<panorama::PanoramaTextureId, Texture> textures_;
     std::unordered_map<panorama::PanoramaCompiledGeometryHandle, Geometry> geometries_;
+    std::vector<RetiredResource> retired_;
+    std::vector<CompletionPoint> completion_points_;
+    panorama::PanoramaSubmissionTracker submissions_;
     Texture white_;
     panorama::PanoramaTextureId next_texture_id_ = 1;
     panorama::PanoramaCompiledGeometryHandle next_geometry_id_ = 1;
@@ -975,5 +1250,12 @@ private:
     int scissor_width_ = 0;
     int scissor_height_ = 0;
     VkRect2D scissor_cache_{};
+    VkPipeline bound_pipeline_ = VK_NULL_HANDLE;
+    VkDescriptorSet bound_descriptor_ = VK_NULL_HANDLE;
+    panorama::PanoramaCompiledGeometryHandle bound_geometry_ = 0;
+    std::array<float, 24> bound_push_constants_{};
+    VkRect2D bound_scissor_{};
+    bool bound_push_constants_valid_ = false;
+    bool bound_scissor_valid_ = false;
 };
 }

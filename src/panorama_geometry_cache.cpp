@@ -1,8 +1,10 @@
 #include "ui/panorama/panorama_geometry_cache.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <unordered_map>
 #include <utility>
 
@@ -36,6 +38,89 @@ template <typename T>
 void hash_value(std::uint64_t& hash, const T& value)
 {
     hash_bytes(hash, &value, sizeof(T));
+}
+
+struct PreparedGeometryChunk
+{
+    std::vector<PanoramaPaintVertex> vertices;
+    std::vector<int> indices;
+    std::uint64_t signature = 0;
+};
+
+bool prepare_geometry_chunks(const PanoramaDrawCommand& command, float ui_scale,
+    std::vector<PreparedGeometryChunk>& chunks, std::size_t* hashed_bytes)
+{
+    chunks.clear();
+    chunks.reserve(panorama_geometry_chunk_count(command.indices.size()));
+
+    for (std::size_t first_index = 0; first_index < command.indices.size();
+         first_index += kPanoramaGeometryChunkIndexLimit)
+    {
+        const std::size_t end_index =
+            std::min(first_index + kPanoramaGeometryChunkIndexLimit, command.indices.size());
+        PreparedGeometryChunk chunk;
+        chunk.indices.reserve(end_index - first_index);
+        chunk.vertices.reserve(std::min(end_index - first_index, command.vertices.size()));
+
+        std::unordered_map<int, int> local_indices;
+        local_indices.reserve(end_index - first_index);
+        for (std::size_t index_offset = first_index; index_offset < end_index; ++index_offset)
+        {
+            const int source_index = command.indices[index_offset];
+            if (source_index < 0 ||
+                static_cast<std::size_t>(source_index) >= command.vertices.size() ||
+                chunk.vertices.size() >= static_cast<std::size_t>(std::numeric_limits<int>::max()))
+            {
+                chunks.clear();
+                return false;
+            }
+
+            const auto [it, inserted] =
+                local_indices.emplace(source_index, static_cast<int>(chunk.vertices.size()));
+            if (inserted)
+            {
+                chunk.vertices.push_back(command.vertices[static_cast<std::size_t>(source_index)]);
+            }
+            chunk.indices.push_back(it->second);
+        }
+
+        chunk.signature = 1469598103934665603ULL;
+        hash_value(chunk.signature, ui_scale);
+        hash_value(chunk.signature, command.texture);
+        hash_value(chunk.signature, command.blend_mode);
+        const std::size_t vertex_count = chunk.vertices.size();
+        const std::size_t index_count = chunk.indices.size();
+        hash_value(chunk.signature, vertex_count);
+        hash_value(chunk.signature, index_count);
+        hash_bytes(chunk.signature, chunk.vertices.data(),
+            chunk.vertices.size() * sizeof(PanoramaPaintVertex));
+        hash_bytes(chunk.signature, chunk.indices.data(),
+            chunk.indices.size() * sizeof(int));
+        if (hashed_bytes != nullptr)
+        {
+            *hashed_bytes += chunk.vertices.size() * sizeof(PanoramaPaintVertex) +
+                chunk.indices.size() * sizeof(int);
+        }
+        chunks.push_back(std::move(chunk));
+    }
+    return !chunks.empty();
+}
+
+std::uint64_t prepared_entry_signature(
+    std::span<const PreparedGeometryChunk> chunks,
+    PanoramaTextureId texture,
+    PanoramaBlendMode blend_mode)
+{
+    std::uint64_t signature = 1469598103934665603ULL;
+    hash_value(signature, texture);
+    hash_value(signature, blend_mode);
+    const std::size_t chunk_count = chunks.size();
+    hash_value(signature, chunk_count);
+    for (const PreparedGeometryChunk& chunk : chunks)
+    {
+        hash_value(signature, chunk.signature);
+    }
+    return signature;
 }
 
 // Accumulates elapsed microseconds into *out on destruction; a null `out`
@@ -109,6 +194,7 @@ bool PanoramaGeometryCache::replay(PanoramaRenderBackend& backend) const
     {
         return false;
     }
+    PanoramaDrawStateCache state;
     for (const Entry& cached : entries_)
     {
         if (cached.is_blur())
@@ -132,12 +218,31 @@ bool PanoramaGeometryCache::replay(PanoramaRenderBackend& backend) const
                 cached.blur_std_y, cached.blur_passes);
             continue;
         }
-        backend.set_scissor(cached.scissor, cached.scissor_x, cached.scissor_y, cached.scissor_width, cached.scissor_height);
-        backend.set_blend_mode(cached.blend_mode);
-        backend.render_geometry(cached.geometry, cached.texture, cached.constants);
+        if (state.update_scissor(
+                cached.scissor, cached.scissor_x, cached.scissor_y,
+                cached.scissor_width, cached.scissor_height))
+        {
+            backend.set_scissor(
+                cached.scissor, cached.scissor_x, cached.scissor_y,
+                cached.scissor_width, cached.scissor_height);
+        }
+        if (state.update_blend(cached.blend_mode))
+        {
+            backend.set_blend_mode(cached.blend_mode);
+        }
+        for (const Chunk& chunk : cached.chunks)
+        {
+            backend.render_geometry(chunk.geometry, cached.texture, cached.constants);
+        }
     }
-    backend.set_scissor(false, 0, 0, 0, 0);
-    backend.set_blend_mode(PanoramaBlendMode::Normal);
+    if (state.scissor_valid() && state.update_scissor(false, 0, 0, 0, 0))
+    {
+        backend.set_scissor(false, 0, 0, 0, 0);
+    }
+    if (state.blend_valid() && state.update_blend(PanoramaBlendMode::Normal))
+    {
+        backend.set_blend_mode(PanoramaBlendMode::Normal);
+    }
     return true;
 }
 
@@ -154,10 +259,7 @@ void PanoramaGeometryCache::submit(
 
     const bool can_reuse_previous_backend = previous_valid && !previous_entries.empty() && previous_backend == &backend;
 
-    // Local accumulators, folded into *stats at the end -- cheaper than
-    // branching on `stats != nullptr` at every counter increment, and the
-    // ScopedMicroTimer pointers below already make the actual clock reads free
-    // when stats is null.
+    // Local accumulators, folded into *stats at the end.
     double hash_us = 0.0;
     double compile_us = 0.0;
     double* const hash_us_out = stats != nullptr ? &hash_us : nullptr;
@@ -165,21 +267,30 @@ void PanoramaGeometryCache::submit(
     int stat_commands = 0;
     int stat_reused = 0;
     int stat_recompiled = 0;
+    int stat_chunks = 0;
+    int stat_reused_chunks = 0;
+    int stat_recompiled_chunks = 0;
+    std::size_t stat_hashed_bytes = 0;
     std::size_t stat_uploaded_bytes = 0;
+    std::size_t stat_max_chunk_uploaded_bytes = 0;
 
-    // Signature -> previous_entries index, for commands that miss the
-    // positional check below (a command inserted/removed earlier in the list
-    // shifts every later command's position). Built lazily from whatever is
-    // still unclaimed in previous_entries the FIRST time a positional check
-    // misses -- most frames never touch it at all. Claim-once: an index is
-    // erased the moment something reuses it, so two commands with an
-    // identical signature (duplicate icon quads, say) never both claim the
-    // same GPU handle.
-    std::unordered_multimap<std::uint64_t, std::size_t> leftover_by_signature;
-    bool leftover_indexed = false;
+    std::vector<bool> previous_claimed(previous_entries.size(), false);
+    std::unordered_multimap<std::uint64_t, std::size_t> previous_by_signature;
+    if (can_reuse_previous_backend)
+    {
+        previous_by_signature.reserve(previous_entries.size());
+        for (std::size_t index = 0; index < previous_entries.size(); ++index)
+        {
+            if (!previous_entries[index].chunks.empty())
+            {
+                previous_by_signature.emplace(previous_entries[index].signature, index);
+            }
+        }
+    }
 
     bool cache_complete = true;
     std::size_t cache_index = 0;
+    PanoramaDrawStateCache state;
     for (const PanoramaDrawCommand& command : draw_list.commands)
     {
         if (command.is_backdrop_blur())
@@ -216,6 +327,10 @@ void PanoramaGeometryCache::submit(
             blur_entry.constants_patchable = command.constants_patchable;
             blur_entry.context_index = command.context_index;
             entries_.push_back(blur_entry);
+            if (cache_index < previous_claimed.size() && previous_entries[cache_index].is_blur())
+            {
+                previous_claimed[cache_index] = true;
+            }
             ++cache_index; // keep the previous-entries cursor aligned (blur entries cache too)
             continue;
         }
@@ -230,124 +345,211 @@ void PanoramaGeometryCache::submit(
         const int sy = static_cast<int>(std::lround(command.scissor_y * ui_scale));
         const int sw = static_cast<int>(std::lround(command.scissor_width * ui_scale));
         const int sh = static_cast<int>(std::lround(command.scissor_height * ui_scale));
-        backend.set_scissor(command.scissor, sx, sy, sw, sh);
-        backend.set_blend_mode(command.blend_mode);
-        std::uint64_t signature = 0;
+        std::vector<PreparedGeometryChunk> prepared_chunks;
+        bool chunks_valid = false;
         {
             const ScopedMicroTimer timer(hash_us_out);
-            signature = panorama_geometry_signature(command, ui_scale);
+            chunks_valid = prepare_geometry_chunks(
+                command, ui_scale, prepared_chunks,
+                stats != nullptr ? &stat_hashed_bytes : nullptr);
         }
         ++stat_commands;
-
-        Entry* reusable = nullptr;
-        if (can_reuse_previous_backend && cache_index < previous_entries.size())
+        stat_chunks += static_cast<int>(prepared_chunks.size());
+        if (!chunks_valid)
         {
-            Entry& cached = previous_entries[cache_index];
-            if (cached.signature == signature && cached.texture == command.texture &&
-                cached.blend_mode == command.blend_mode && cached.geometry != 0)
+            cache_complete = false;
+            ++cache_index;
+            continue;
+        }
+
+        const std::uint64_t signature =
+            prepared_entry_signature(prepared_chunks, command.texture, command.blend_mode);
+        constexpr std::size_t kNoEntry = std::numeric_limits<std::size_t>::max();
+        std::size_t donor_index = kNoEntry;
+
+        // First prefer an exact positional entry, then an exact entry shifted by
+        // insertion/removal. If neither exists, the positional entry remains a
+        // useful partial donor: unchanged fixed chunks can still be retained.
+        if (can_reuse_previous_backend && cache_index < previous_entries.size() &&
+            !previous_claimed[cache_index])
+        {
+            const Entry& candidate = previous_entries[cache_index];
+            if (!candidate.chunks.empty() && candidate.texture == command.texture &&
+                candidate.blend_mode == command.blend_mode &&
+                candidate.signature == signature)
             {
-                reusable = &cached;
+                donor_index = cache_index;
             }
         }
-        ++cache_index;
-
-        // Positional miss: the command's content still might match something
-        // ELSEWHERE in the previous frame (a command earlier in the list was
-        // inserted/removed, shifting everything after it by one slot). Index
-        // whatever previous_entries are still unclaimed by signature -- lazily,
-        // once -- and look this one up there before giving up and recompiling.
-        if (reusable == nullptr && can_reuse_previous_backend)
+        if (donor_index == kNoEntry && can_reuse_previous_backend)
         {
-            if (!leftover_indexed)
-            {
-                leftover_indexed = true;
-                leftover_by_signature.reserve(previous_entries.size());
-                for (std::size_t i = 0; i < previous_entries.size(); ++i)
-                {
-                    if (previous_entries[i].geometry != 0)
-                    {
-                        leftover_by_signature.emplace(previous_entries[i].signature, i);
-                    }
-                }
-            }
-            const auto [first, last] = leftover_by_signature.equal_range(signature);
+            const auto [first, last] = previous_by_signature.equal_range(signature);
             for (auto it = first; it != last; ++it)
             {
-                Entry& candidate = previous_entries[it->second];
-                if (candidate.geometry != 0 && candidate.texture == command.texture &&
+                const Entry& candidate = previous_entries[it->second];
+                if (!previous_claimed[it->second] && !candidate.chunks.empty() &&
+                    candidate.texture == command.texture &&
                     candidate.blend_mode == command.blend_mode)
                 {
-                    reusable = &candidate;
-                    leftover_by_signature.erase(it);
+                    donor_index = it->second;
                     break;
                 }
             }
         }
-
-        if (reusable != nullptr)
+        if (donor_index == kNoEntry && can_reuse_previous_backend &&
+            cache_index < previous_entries.size() && !previous_claimed[cache_index])
         {
-            // Vertex/index content is unchanged (the signature match already
-            // proved that), but scissor and PanoramaDrawConstants are mutable
-            // per-entry state, not part of the signature -- update them in place
-            // instead of recompiling (see panorama_geometry_signature's comment).
-            reusable->scissor = command.scissor;
-            reusable->scissor_x = sx;
-            reusable->scissor_y = sy;
-            reusable->scissor_width = sw;
-            reusable->scissor_height = sh;
-            reusable->constants = command.constants;
-            reusable->constants_patchable = command.constants_patchable;
-            reusable->context_index = command.context_index;
-            backend.render_geometry(reusable->geometry, reusable->texture, reusable->constants);
-            entries_.push_back(*reusable);
-            reusable->geometry = 0; // claimed: release_geometry_entries below must not free it
-            ++stat_reused;
+            const Entry& candidate = previous_entries[cache_index];
+            if (!candidate.chunks.empty() && candidate.texture == command.texture &&
+                candidate.blend_mode == command.blend_mode)
+            {
+                donor_index = cache_index;
+            }
+        }
+        Entry* donor = nullptr;
+        if (donor_index != kNoEntry)
+        {
+            previous_claimed[donor_index] = true;
+            donor = &previous_entries[donor_index];
+        }
+        ++cache_index;
+
+        Entry entry;
+        entry.texture = command.texture;
+        entry.blend_mode = command.blend_mode;
+        entry.scissor = command.scissor;
+        entry.scissor_x = sx;
+        entry.scissor_y = sy;
+        entry.scissor_width = sw;
+        entry.scissor_height = sh;
+        entry.signature = signature;
+        entry.constants = command.constants;
+        entry.constants_patchable = command.constants_patchable;
+        entry.context_index = command.context_index;
+        entry.chunks.reserve(prepared_chunks.size());
+
+        std::unordered_multimap<std::uint64_t, std::size_t> donor_by_signature;
+        if (donor != nullptr)
+        {
+            donor_by_signature.reserve(donor->chunks.size());
+            for (std::size_t index = 0; index < donor->chunks.size(); ++index)
+            {
+                if (donor->chunks[index].geometry != 0)
+                {
+                    donor_by_signature.emplace(donor->chunks[index].signature, index);
+                }
+            }
+        }
+
+        bool command_compiled = false;
+        bool command_failed = false;
+        for (std::size_t chunk_index = 0; chunk_index < prepared_chunks.size(); ++chunk_index)
+        {
+            const PreparedGeometryChunk& prepared = prepared_chunks[chunk_index];
+            PanoramaCompiledGeometryHandle geometry = 0;
+
+            if (donor != nullptr && chunk_index < donor->chunks.size() &&
+                donor->chunks[chunk_index].geometry != 0 &&
+                donor->chunks[chunk_index].signature == prepared.signature)
+            {
+                geometry = donor->chunks[chunk_index].geometry;
+                donor->chunks[chunk_index].geometry = 0;
+            }
+            else if (donor != nullptr)
+            {
+                const auto [first, last] = donor_by_signature.equal_range(prepared.signature);
+                for (auto it = first; it != last; ++it)
+                {
+                    Chunk& candidate = donor->chunks[it->second];
+                    if (candidate.geometry != 0)
+                    {
+                        geometry = candidate.geometry;
+                        candidate.geometry = 0;
+                        break;
+                    }
+                }
+            }
+
+            if (geometry != 0)
+            {
+                ++stat_reused_chunks;
+            }
+            else
+            {
+                const ScopedMicroTimer timer(compile_us_out);
+                geometry = backend.compile_geometry(prepared.vertices, prepared.indices, ui_scale);
+                if (geometry == 0)
+                {
+                    command_failed = true;
+                    break;
+                }
+                command_compiled = true;
+                ++stat_recompiled_chunks;
+                const std::size_t uploaded_bytes =
+                    prepared.vertices.size() * sizeof(PanoramaPaintVertex) +
+                    prepared.indices.size() * sizeof(int);
+                stat_uploaded_bytes += uploaded_bytes;
+                stat_max_chunk_uploaded_bytes =
+                    std::max(stat_max_chunk_uploaded_bytes, uploaded_bytes);
+            }
+            entry.chunks.push_back(Chunk{geometry, prepared.signature});
+        }
+
+        if (command_failed)
+        {
+            for (Chunk& chunk : entry.chunks)
+            {
+                backend.release_geometry(chunk.geometry);
+                chunk.geometry = 0;
+            }
+            cache_complete = false;
             continue;
         }
 
-        PanoramaCompiledGeometryHandle geometry = 0;
+        if (state.update_scissor(command.scissor, sx, sy, sw, sh))
         {
-            const ScopedMicroTimer timer(compile_us_out);
-            geometry = backend.compile_geometry(
-                std::span<const PanoramaPaintVertex>(command.vertices.data(), command.vertices.size()),
-                std::span<const int>(command.indices.data(), command.indices.size()), ui_scale);
+            backend.set_scissor(command.scissor, sx, sy, sw, sh);
         }
-        if (geometry != 0)
+        if (state.update_blend(command.blend_mode))
         {
-            backend.render_geometry(geometry, command.texture, command.constants);
-            entries_.push_back(Entry{
-                .geometry = geometry,
-                .texture = command.texture,
-                .blend_mode = command.blend_mode,
-                .scissor = command.scissor,
-                .scissor_x = sx,
-                .scissor_y = sy,
-                .scissor_width = sw,
-                .scissor_height = sh,
-                .signature = signature,
-                .constants = command.constants,
-                .constants_patchable = command.constants_patchable,
-                .context_index = command.context_index,
-            });
+            backend.set_blend_mode(command.blend_mode);
+        }
+        for (const Chunk& chunk : entry.chunks)
+        {
+            backend.render_geometry(chunk.geometry, command.texture, command.constants);
+        }
+        entries_.push_back(std::move(entry));
+        if (command_compiled)
+        {
             ++stat_recompiled;
-            stat_uploaded_bytes += command.vertices.size() * sizeof(PanoramaPaintVertex) + command.indices.size() * sizeof(int);
-            continue;
         }
-        cache_complete = false;
+        else
+        {
+            ++stat_reused;
+        }
     }
 
     if (!previous_entries.empty() && previous_backend != nullptr && previous_backend == panorama_render_backend())
     {
         for (const Entry& cached : previous_entries)
         {
-            if (cached.geometry != 0)
+            for (const Chunk& chunk : cached.chunks)
             {
-                previous_backend->release_geometry(cached.geometry);
+                if (chunk.geometry != 0)
+                {
+                    previous_backend->release_geometry(chunk.geometry);
+                }
             }
         }
     }
-    backend.set_scissor(false, 0, 0, 0, 0); // clear so the clip never leaks into later rendering
-    backend.set_blend_mode(PanoramaBlendMode::Normal);
+    if (state.scissor_valid() && state.update_scissor(false, 0, 0, 0, 0))
+    {
+        backend.set_scissor(false, 0, 0, 0, 0);
+    }
+    if (state.blend_valid() && state.update_blend(PanoramaBlendMode::Normal))
+    {
+        backend.set_blend_mode(PanoramaBlendMode::Normal);
+    }
 
     valid_ = cache_complete;
     if (!valid_)
@@ -362,7 +564,12 @@ void PanoramaGeometryCache::submit(
         stats->commands = stat_commands;
         stats->reused = stat_reused;
         stats->recompiled = stat_recompiled;
+        stats->chunks = stat_chunks;
+        stats->reused_chunks = stat_reused_chunks;
+        stats->recompiled_chunks = stat_recompiled_chunks;
+        stats->hashed_bytes = stat_hashed_bytes;
         stats->uploaded_bytes = stat_uploaded_bytes;
+        stats->max_chunk_uploaded_bytes = stat_max_chunk_uploaded_bytes;
     }
 }
 
@@ -411,9 +618,12 @@ void PanoramaGeometryCache::release()
     {
         for (const Entry& cached : entries_)
         {
-            if (cached.geometry != 0)
+            for (const Chunk& chunk : cached.chunks)
             {
-                backend_->release_geometry(cached.geometry);
+                if (chunk.geometry != 0)
+                {
+                    backend_->release_geometry(chunk.geometry);
+                }
             }
         }
     }

@@ -13,6 +13,30 @@ namespace panorama
 namespace
 {
 using strings::starts_with;
+
+struct StyleSourceBatch
+{
+    explicit StyleSourceBatch(PanoramaStyleSheet& sheet) : sheet_(sheet) { sheet_.begin_source_batch(); }
+    ~StyleSourceBatch() { sheet_.end_source_batch(); }
+    PanoramaStyleSheet& sheet_;
+};
+
+PanoramaDocument clone_panorama_document(const PanoramaDocument& source)
+{
+    PanoramaDocument clone;
+    if (source.root != nullptr)
+    {
+        clone.root = clone_panorama_node(*source.root);
+    }
+    clone.stylesheet_includes = source.stylesheet_includes;
+    clone.script_includes = source.script_includes;
+    clone.inline_styles = source.inline_styles;
+    for (const auto& [name, snippet] : source.snippets)
+    {
+        clone.snippets.emplace(name, snippet != nullptr ? clone_panorama_node(*snippet) : nullptr);
+    }
+    return clone;
+}
 }
 
 std::unique_ptr<PanoramaNode> clone_panorama_node(const PanoramaNode& source, PanoramaNode* parent)
@@ -31,28 +55,47 @@ std::unique_ptr<PanoramaNode> clone_panorama_node(const PanoramaNode& source, Pa
     {
         node->children.push_back(clone_panorama_node(*child, node.get()));
     }
+    panorama_notify_tree_structure_changed(*node);
     return node;
 }
 
-PanoramaDocumentSession::PanoramaDocumentSession()
-{
-    panorama_add_node_lifetime_observer(*this);
-}
+PanoramaDocumentSession::PanoramaDocumentSession() = default;
+PanoramaDocumentSession::~PanoramaDocumentSession() = default;
 
-PanoramaDocumentSession::~PanoramaDocumentSession()
+void PanoramaDocumentSession::script_context_destroyed(void* context, PanoramaNode& node)
 {
-    panorama_remove_node_lifetime_observer(*this);
-}
-
-void PanoramaDocumentSession::on_panorama_node_destroyed(PanoramaNode& node)
-{
-    for (PanoramaScriptInclude& script : script_refs_)
+    auto& session = *static_cast<PanoramaDocumentSession*>(context);
+    const auto found = session.script_context_registrations_.find(&node);
+    if (found == session.script_context_registrations_.end())
     {
-        if (script.context == &node)
+        return;
+    }
+    std::vector<std::size_t> indices = std::move(found->second.script_indices);
+    session.script_context_registrations_.erase(found);
+    for (std::size_t index : indices)
+    {
+        if (index < session.script_refs_.size())
         {
-            script.context = nullptr;
+            session.script_refs_[index].context = nullptr;
         }
     }
+}
+
+void PanoramaDocumentSession::add_script_reference(PanoramaScriptInclude script)
+{
+    PanoramaNode* context = script.context;
+    const std::size_t index = script_refs_.size();
+    script_refs_.push_back(std::move(script));
+    if (context == nullptr)
+    {
+        return;
+    }
+    auto [found, inserted] = script_context_registrations_.try_emplace(context);
+    if (inserted)
+    {
+        found->second.lifetime.bind(*context, &PanoramaDocumentSession::script_context_destroyed, this);
+    }
+    found->second.script_indices.push_back(index);
 }
 
 PanoramaResourceManager& PanoramaDocumentSession::resources() noexcept
@@ -98,6 +141,7 @@ const PanoramaStyleSheet& PanoramaDocumentSession::style_sheet() const noexcept
 void PanoramaDocumentSession::clear()
 {
     resources_.clear();
+    invalidate_source_cache();
     resource_root_.clear();
     max_depth_ = 8;
     localize_text_ = true;
@@ -106,12 +150,82 @@ void PanoramaDocumentSession::clear()
 
 void PanoramaDocumentSession::clear_document()
 {
+    // Detach exact node registrations while the old tree is still alive.
+    script_context_registrations_.clear();
+    script_refs_.clear();
     document_ = PanoramaDocument{};
     style_sheet_.clear(); // PanoramaStyleSheet is non-copyable (cache identity)
-    script_refs_.clear(); // context pointers die with the document tree
     loaded_stylesheets_.clear();
+    loaded_inline_styles_.clear();
     layout_scopes_.clear();
     next_layout_scope_ = PanoramaStyleSheet::kRootLayoutScope + 1;
+}
+
+void PanoramaDocumentSession::invalidate_source_cache()
+{
+    parsed_layout_cache_.clear();
+    parsed_style_cache_.clear();
+    ++source_cache_generation_;
+    ++source_stats_.invalidations;
+}
+
+PanoramaDocument PanoramaDocumentSession::load_cached_layout(std::string_view normalized_path)
+{
+    const std::string key(normalized_path);
+    if (const auto found = parsed_layout_cache_.find(key); found != parsed_layout_cache_.end())
+    {
+        ++source_stats_.layout_cache_hits;
+        return clone_panorama_document(found->second);
+    }
+    ++source_stats_.resource_reads;
+    const std::string xml = read_text_resource(normalized_path);
+    if (xml.empty())
+    {
+        return {};
+    }
+    ++source_stats_.layout_parses;
+    PanoramaDocument parsed = parse_panorama_xml(xml);
+    auto [stored, inserted] = parsed_layout_cache_.emplace(key, std::move(parsed));
+    (void)inserted;
+    return clone_panorama_document(stored->second);
+}
+
+const PanoramaParsedStyleSource* PanoramaDocumentSession::load_cached_style(
+    std::string_view cache_key,
+    std::string_view path)
+{
+    const std::string key(cache_key);
+    if (const auto found = parsed_style_cache_.find(key); found != parsed_style_cache_.end())
+    {
+        ++source_stats_.style_cache_hits;
+        return &found->second;
+    }
+    ++source_stats_.resource_reads;
+    const std::string css = read_text_resource(path);
+    if (css.empty())
+    {
+        return nullptr;
+    }
+    ++source_stats_.style_parses;
+    auto [stored, inserted] = parsed_style_cache_.emplace(key, PanoramaStyleSheet::parse_source(css));
+    (void)inserted;
+    return &stored->second;
+}
+
+const PanoramaParsedStyleSource* PanoramaDocumentSession::cache_inline_style(
+    std::string cache_key,
+    std::string_view css)
+{
+    if (const auto found = parsed_style_cache_.find(cache_key); found != parsed_style_cache_.end())
+    {
+        ++source_stats_.style_cache_hits;
+        return &found->second;
+    }
+    ++source_stats_.style_parses;
+    auto [stored, inserted] =
+        parsed_style_cache_.emplace(std::move(cache_key), PanoramaStyleSheet::parse_source(css));
+    (void)inserted;
+    return &stored->second;
 }
 
 bool PanoramaDocumentSession::load(std::string_view document_path, PanoramaDocumentSessionOptions options)
@@ -140,16 +254,16 @@ PanoramaDocumentLoadResult PanoramaDocumentSession::load_into(
     {
         return result;
     }
+    StyleSourceBatch source_batch(style_sheet_);
 
     const std::string normalized = normalize_panorama_entry_path(document_path);
-    const std::string xml = read_text_resource(normalized);
-    if (xml.empty())
+    PanoramaDocument fragment = load_cached_layout(normalized);
+    if (fragment.root == nullptr)
     {
         pano_log_warning("Panorama document session: missing resource '{}'", normalized);
         return result;
     }
 
-    PanoramaDocument fragment = parse_panorama_xml(xml);
     const PanoramaLocalizeCallback localize = [this](std::string_view text) {
         return localization_.localize(text);
     };
@@ -196,15 +310,24 @@ PanoramaDocumentLoadResult PanoramaDocumentSession::load_into(
             style_sheet_.add_source_scope(it->second, layout_scope);
             continue;
         }
-        const std::string css = read_text_resource(css_path);
-        if (!css.empty())
+        if (const PanoramaParsedStyleSource* css = load_cached_style("file:" + css_path, css_path))
         {
-            loaded_stylesheets_.emplace(css_path, style_sheet_.add_source(css, layout_scope));
+            loaded_stylesheets_.emplace(css_path, style_sheet_.add_parsed_source(*css, layout_scope));
         }
     }
-    for (const std::string& inline_css : fragment.inline_styles)
+    for (std::size_t inline_index = 0; inline_index < fragment.inline_styles.size(); ++inline_index)
     {
-        style_sheet_.add_source(inline_css, layout_scope);
+        const std::string identity = normalized + "#inline:" + std::to_string(inline_index);
+        if (const auto loaded = loaded_inline_styles_.find(identity); loaded != loaded_inline_styles_.end())
+        {
+            style_sheet_.add_source_scope(loaded->second, layout_scope);
+            continue;
+        }
+        if (const PanoramaParsedStyleSource* css =
+                cache_inline_style("inline:" + identity, fragment.inline_styles[inline_index]))
+        {
+            loaded_inline_styles_.emplace(identity, style_sheet_.add_parsed_source(*css, layout_scope));
+        }
     }
 
     for (const std::string& include : fragment.script_includes)
@@ -213,7 +336,7 @@ PanoramaDocumentLoadResult PanoramaDocumentSession::load_into(
         document_.script_includes.push_back(script_path);
         // `parent` is this layout file's root: scripts run with it as their
         // $.GetContextPanel() (frame sublayouts get the frame, not the outer load target).
-        script_refs_.push_back(PanoramaScriptInclude{script_path, &parent});
+        add_script_reference(PanoramaScriptInclude{script_path, &parent});
         result.scripts_added.push_back(PanoramaScriptInclude{std::move(script_path), &parent});
     }
 
@@ -241,6 +364,7 @@ PanoramaDocumentLoadResult PanoramaDocumentSession::load_into(
 
     if (fragment.root != nullptr)
     {
+        const bool adds_children = !fragment.root->children.empty();
         for (auto& child : fragment.root->children)
         {
             child->parent = &parent;
@@ -251,6 +375,10 @@ PanoramaDocumentLoadResult PanoramaDocumentSession::load_into(
                 child->style_scope_mark = layout_scope;
             }
             parent.children.push_back(std::move(child));
+        }
+        if (adds_children)
+        {
+            panorama_notify_tree_structure_changed(parent);
         }
     }
 
@@ -308,6 +436,7 @@ PanoramaDocumentLoadResult PanoramaDocumentSession::load_sublayout(PanoramaNode&
         // The wrapper node is discarded; nothing references it yet (its scripts
         // run after this returns, against `target` as their context).
     }
+    panorama_notify_tree_structure_changed(target);
 
     // Inserted nodes start style-dirty, but the ancestor chain must learn about
     // them for compute_invalidated to reach the new subtree.
@@ -334,7 +463,7 @@ bool PanoramaDocumentSession::instantiate_snippet(PanoramaNode& target, std::str
         const std::unique_ptr<PanoramaNode> wrapper = clone_panorama_node(*it->second->children.front(), nullptr);
         if (target.id.empty() && !wrapper->id.empty())
         {
-            target.id = wrapper->id;
+            target.set_id(wrapper->id);
         }
         if (target.text.empty() && !wrapper->text.empty())
         {
@@ -375,6 +504,7 @@ bool PanoramaDocumentSession::instantiate_snippet(PanoramaNode& target, std::str
             target.children.push_back(clone_panorama_node(*child, &target));
         }
     }
+    panorama_notify_tree_structure_changed(target);
     target.mark_style_dirty(); // ancestors must route the partial recompute here
     return true;
 }

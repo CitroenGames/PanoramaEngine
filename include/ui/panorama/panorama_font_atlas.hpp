@@ -5,8 +5,10 @@
 
 #include <filesystem>
 #include <functional>
+#include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -54,6 +56,37 @@ struct PanoramaFontAtlasLoadOptions
     PanoramaFontBytesProvider font_bytes_provider;
 };
 
+struct PanoramaFontAtlasDirtyRect
+{
+    int x = 0;
+    int y = 0;
+    int width = 0;
+    int height = 0;
+};
+
+struct PanoramaFontAtlasCacheBudgets
+{
+    std::size_t measure_entries = 8192;
+    std::size_t measure_bytes = 2U * 1024U * 1024U;
+    std::size_t metrics_per_face = 32;
+};
+
+struct PanoramaFontAtlasStats
+{
+    std::uint64_t glyph_hits = 0;
+    std::uint64_t glyph_misses = 0;
+    std::uint64_t measure_hits = 0;
+    std::uint64_t measure_misses = 0;
+    std::uint64_t measure_evictions = 0;
+    std::uint64_t metrics_evictions = 0;
+    std::uint64_t atlas_page_resets = 0;
+    std::uint64_t full_uploads = 0;
+    std::uint64_t in_place_uploads = 0;
+    std::uint64_t texture_replacements = 0;
+    std::uint64_t uploaded_bytes = 0;
+    std::uint64_t dirty_pixels = 0;
+};
+
 // FreeType-backed text provider for the native Panorama renderer. It keeps glyph
 // metrics in Panorama design units and uploads a premultiplied glyph atlas through
 // the active Panorama render backend.
@@ -73,6 +106,21 @@ public:
     [[nodiscard]] bool loaded() const;
 
     void set_ui_scale(float ui_scale);
+    void set_cache_budgets(PanoramaFontAtlasCacheBudgets budgets);
+    [[nodiscard]] PanoramaFontAtlasCacheBudgets cache_budgets() const;
+
+    void enable_counters(bool enabled);
+    void reset_counters();
+    [[nodiscard]] PanoramaFontAtlasStats stats() const;
+
+    // Metric generation changes when scale/font metrics invalidate shaped
+    // text. Page generation changes when existing UVs cease to be valid.
+    [[nodiscard]] std::uint64_t metric_generation() const;
+    [[nodiscard]] std::uint64_t atlas_page_generation() const;
+    [[nodiscard]] std::uint64_t atlas_content_generation() const;
+    [[nodiscard]] int atlas_width() const;
+    [[nodiscard]] int atlas_height() const;
+    [[nodiscard]] std::span<const PanoramaFontAtlasDirtyRect> dirty_rects() const;
 
     [[nodiscard]] PanoramaTextMeasure text_measure();
     void ensure_tree_text(PanoramaNode& root);

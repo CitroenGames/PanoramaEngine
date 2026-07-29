@@ -3,11 +3,44 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <limits>
+#include <unordered_map>
 
 namespace panorama
 {
 namespace
 {
+thread_local bool g_text_edit_counters_enabled = false;
+thread_local PanoramaTextEditStats g_text_edit_stats;
+
+struct TextMetadata
+{
+    const char* data = nullptr;
+    std::size_t size = 0;
+    int codepoints = 0;
+    std::uint64_t last_use = 0;
+};
+
+thread_local std::unordered_map<const PanoramaNode*, TextMetadata> g_text_metadata;
+thread_local std::uint64_t g_text_metadata_clock = 0;
+constexpr std::size_t kTextMetadataBudget = 2048;
+
+void record_scan(std::size_t bytes, bool retained)
+{
+    if (!g_text_edit_counters_enabled)
+    {
+        return;
+    }
+    if (retained)
+    {
+        g_text_edit_stats.retained_bytes_scanned += bytes;
+    }
+    else
+    {
+        g_text_edit_stats.inserted_bytes_scanned += bytes;
+    }
+}
+
 // ---- UTF-8 boundary helpers --------------------------------------------------
 // Offsets into the value are always kept on codepoint boundaries, so caret motion
 // never splits a multi-byte sequence (WebCore operates on full characters).
@@ -57,8 +90,9 @@ int prev_boundary(std::string_view text, int pos)
     return pos;
 }
 
-int count_codepoints(std::string_view text)
+int count_codepoints(std::string_view text, bool retained = false)
 {
+    record_scan(text.size(), retained);
     int count = 0;
     for (char c : text)
     {
@@ -68,6 +102,46 @@ int count_codepoints(std::string_view text)
         }
     }
     return count;
+}
+
+void store_metadata(const PanoramaNode& node, int codepoints)
+{
+    if (g_text_metadata.size() >= kTextMetadataBudget && g_text_metadata.find(&node) == g_text_metadata.end())
+    {
+        const auto oldest = std::min_element(g_text_metadata.begin(), g_text_metadata.end(),
+            [](const auto& a, const auto& b) { return a.second.last_use < b.second.last_use; });
+        if (oldest != g_text_metadata.end())
+        {
+            g_text_metadata.erase(oldest);
+        }
+    }
+    TextMetadata& metadata = g_text_metadata[&node];
+    metadata.data = node.text.data();
+    metadata.size = node.text.size();
+    metadata.codepoints = codepoints;
+    metadata.last_use = ++g_text_metadata_clock;
+}
+
+int text_codepoints(const PanoramaNode& node)
+{
+    const auto found = g_text_metadata.find(&node);
+    if (found != g_text_metadata.end() && found->second.data == node.text.data() &&
+        found->second.size == node.text.size())
+    {
+        found->second.last_use = ++g_text_metadata_clock;
+        if (g_text_edit_counters_enabled)
+        {
+            ++g_text_edit_stats.metadata_hits;
+        }
+        return found->second.codepoints;
+    }
+    if (g_text_edit_counters_enabled)
+    {
+        ++g_text_edit_stats.metadata_misses;
+    }
+    const int result = count_codepoints(node.text, true);
+    store_metadata(node, result);
+    return result;
 }
 
 // Truncates `text` to at most `max_codepoints` codepoints, returning the byte view.
@@ -206,6 +280,12 @@ bool assign_selection(PanoramaNode& node, int caret, int anchor)
     return changed;
 }
 
+void clamp_selection_without_metadata_refresh(PanoramaNode& node)
+{
+    node.text_caret = clamp_to_boundary_down(node.text, node.text_caret);
+    node.text_selection_anchor = clamp_to_boundary_down(node.text, node.text_selection_anchor);
+}
+
 // Logical caret advance by one unit in `direction` at `granularity`.
 int advance_position(std::string_view text, int pos, PanoramaTextDirection direction, PanoramaTextGranularity gran)
 {
@@ -221,6 +301,21 @@ int advance_position(std::string_view text, int pos, PanoramaTextDirection direc
     return pos;
 }
 } // namespace
+
+void panorama_enable_text_edit_counters(bool enabled) noexcept
+{
+    g_text_edit_counters_enabled = enabled;
+}
+
+void panorama_reset_text_edit_counters() noexcept
+{
+    g_text_edit_stats = {};
+}
+
+PanoramaTextEditStats panorama_text_edit_stats() noexcept
+{
+    return g_text_edit_stats;
+}
 
 bool panorama_node_is_text_entry(const PanoramaNode& node)
 {
@@ -244,8 +339,11 @@ bool panorama_text_entry_has_selection(const PanoramaNode& node)
 
 void panorama_text_entry_clamp_selection(PanoramaNode& node)
 {
-    node.text_caret = clamp_to_boundary_down(node.text, node.text_caret);
-    node.text_selection_anchor = clamp_to_boundary_down(node.text, node.text_selection_anchor);
+    clamp_selection_without_metadata_refresh(node);
+    // This public hook is the documented synchronization point after direct
+    // external writes to node.text, including same-size writes that pointer/
+    // size validation alone cannot detect.
+    store_metadata(node, count_codepoints(node.text, true));
 }
 
 bool panorama_text_entry_set_selection(PanoramaNode& node, int start, int end)
@@ -296,6 +394,7 @@ bool panorama_text_entry_set_value(PanoramaNode& node, std::string_view utf8)
     }
     const bool text_changed = node.text != sanitized;
     node.text = std::move(sanitized);
+    store_metadata(node, count_codepoints(node.text));
     const int end = static_cast<int>(node.text.size());
     const bool sel_changed = assign_selection(node, end, end);
     return text_changed || sel_changed;
@@ -307,26 +406,64 @@ bool panorama_text_entry_insert(PanoramaNode& node, std::string_view utf8)
     {
         return false;
     }
-    panorama_text_entry_clamp_selection(node);
+    clamp_selection_without_metadata_refresh(node);
     const int start = panorama_text_entry_selection_start(node);
     const int end = panorama_text_entry_selection_end(node);
 
-    const std::string prefix = node.text.substr(0, static_cast<std::size_t>(start));
-    const std::string suffix = node.text.substr(static_cast<std::size_t>(end));
-
-    std::string insertion = newlines_to_spaces(utf8);
+    std::string insertion_storage;
+    std::string_view insertion = utf8;
+    const bool needs_normalization = utf8.find_first_of("\r\n") != std::string_view::npos;
+    const char* value_begin = node.text.data();
+    const char* value_end = value_begin + node.text.size();
+    const bool aliases_value = !utf8.empty() && utf8.data() >= value_begin && utf8.data() < value_end;
+    if (needs_normalization)
+    {
+        insertion_storage = newlines_to_spaces(utf8);
+        insertion = insertion_storage;
+    }
+    else if (aliases_value)
+    {
+        // replace()/reserve() may invalidate a view into the value itself.
+        insertion_storage.assign(utf8);
+        insertion = insertion_storage;
+    }
+    const int selected_codepoints =
+        count_codepoints(std::string_view(node.text).substr(static_cast<std::size_t>(start),
+                             static_cast<std::size_t>(end - start)),
+            true);
+    const int retained_codepoints = text_codepoints(node) - selected_codepoints;
     const int cap = max_chars(node);
     if (cap > 0)
     {
-        const int kept = count_codepoints(prefix) + count_codepoints(suffix);
-        insertion = std::string(truncate_codepoints(insertion, std::max(0, cap - kept)));
+        insertion = truncate_codepoints(insertion, std::max(0, cap - retained_codepoints));
     }
 
-    std::string next = prefix + insertion + suffix;
-    const bool text_changed = node.text != next;
-    node.text = std::move(next);
+    const bool text_changed = start != end || !insertion.empty();
+    if (text_changed)
+    {
+        const std::size_t old_capacity = node.text.capacity();
+        const std::size_t next_size =
+            node.text.size() - static_cast<std::size_t>(end - start) + insertion.size();
+        if (next_size > old_capacity)
+        {
+            node.text.reserve(next_size);
+            if (g_text_edit_counters_enabled)
+            {
+                ++g_text_edit_stats.capacity_growths;
+            }
+        }
+        if (g_text_edit_counters_enabled)
+        {
+            ++g_text_edit_stats.edits;
+            ++g_text_edit_stats.in_place_edits;
+            g_text_edit_stats.bytes_moved += node.text.size() - static_cast<std::size_t>(end);
+        }
+        node.text.replace(static_cast<std::size_t>(start), static_cast<std::size_t>(end - start),
+            insertion.data(), insertion.size());
+    }
     const int caret = start + static_cast<int>(insertion.size());
     const bool sel_changed = assign_selection(node, caret, caret);
+    store_metadata(node, retained_codepoints + count_codepoints(insertion));
     return text_changed || sel_changed;
 }
 
@@ -337,7 +474,7 @@ bool panorama_text_entry_delete(
     {
         return false;
     }
-    panorama_text_entry_clamp_selection(node);
+    clamp_selection_without_metadata_refresh(node);
 
     int from = panorama_text_entry_selection_start(node);
     int to = panorama_text_entry_selection_end(node);
@@ -362,7 +499,19 @@ bool panorama_text_entry_delete(
         return false;
     }
 
-    node.text = node.text.substr(0, static_cast<std::size_t>(from)) + node.text.substr(static_cast<std::size_t>(to));
+    const int removed_codepoints =
+        count_codepoints(std::string_view(node.text).substr(static_cast<std::size_t>(from),
+                             static_cast<std::size_t>(to - from)),
+            true);
+    const int before_codepoints = text_codepoints(node);
+    if (g_text_edit_counters_enabled)
+    {
+        ++g_text_edit_stats.edits;
+        ++g_text_edit_stats.in_place_edits;
+        g_text_edit_stats.bytes_moved += node.text.size() - static_cast<std::size_t>(to);
+    }
+    node.text.erase(static_cast<std::size_t>(from), static_cast<std::size_t>(to - from));
+    store_metadata(node, before_codepoints - removed_codepoints);
     assign_selection(node, from, from);
     return true;
 }
@@ -374,7 +523,7 @@ bool panorama_text_entry_move(
     {
         return false;
     }
-    panorama_text_entry_clamp_selection(node);
+    clamp_selection_without_metadata_refresh(node);
 
     if (!extend)
     {

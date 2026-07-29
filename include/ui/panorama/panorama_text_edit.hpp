@@ -39,6 +39,25 @@ enum class PanoramaTextDirection : std::uint8_t
     Forward,
 };
 
+// Opt-in deterministic work counters for edit-scaling regressions. Byte counts
+// describe explicit scans/moves requested by this layer (the standard
+// library's internal bookkeeping is deliberately not guessed).
+struct PanoramaTextEditStats
+{
+    std::uint64_t edits = 0;
+    std::uint64_t in_place_edits = 0;
+    std::uint64_t retained_bytes_scanned = 0;
+    std::uint64_t inserted_bytes_scanned = 0;
+    std::uint64_t bytes_moved = 0;
+    std::uint64_t capacity_growths = 0;
+    std::uint64_t metadata_hits = 0;
+    std::uint64_t metadata_misses = 0;
+};
+
+void panorama_enable_text_edit_counters(bool enabled) noexcept;
+void panorama_reset_text_edit_counters() noexcept;
+[[nodiscard]] PanoramaTextEditStats panorama_text_edit_stats() noexcept;
+
 // True for a node the editing engine operates on (a <TextEntry>).
 [[nodiscard]] bool panorama_node_is_text_entry(const PanoramaNode& node);
 

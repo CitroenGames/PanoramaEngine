@@ -262,6 +262,8 @@ shown in [docs/integration.md](docs/integration.md).
   input, animation, paint, and renderer responsibilities.
 - [docs/architecture.md](docs/architecture.md) - pipeline, module map, ownership,
   lifetime, and extension points.
+- [docs/performance.md](docs/performance.md) - deterministic performance
+  regression checks and opt-in baseline/candidate timing output.
 - [docs/panorama-support.md](docs/panorama-support.md) - supported Panorama
   document, CSS, scripting, input, rendering, and known limits.
 
@@ -278,8 +280,9 @@ shown in [docs/integration.md](docs/integration.md).
   break-anywhere fallback.
 - DOM, runtime, input controller, and node lifetime observer state are
   single-threaded.
-- The CMake project registers the scripted `PanoramaView` example as a
-  standalone CTest lifecycle smoke test.
+- The CMake project registers deterministic API/runtime/backend tests and the
+  scripted `PanoramaView` lifecycle smoke when tests are enabled. The separate
+  performance-regression harness is opt-in and never gates on wall time.
 
 ## Integration Notes
 

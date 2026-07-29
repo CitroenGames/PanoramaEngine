@@ -9,6 +9,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <deque>
 #include <sstream>
 #include <tuple>
 #include <unordered_map>
@@ -1104,21 +1105,19 @@ bool simple_matches(const PanoramaNode& node, const PanoramaSimpleSelector& simp
 
 const PanoramaNode* previous_sibling(const PanoramaNode& node)
 {
-    if (node.parent == nullptr)
-    {
-        return nullptr;
-    }
+    return node.previous_sibling_node;
+}
 
-    const PanoramaNode* previous = nullptr;
-    for (const auto& sibling : node.parent->children)
-    {
-        if (sibling.get() == &node)
-        {
-            return previous;
-        }
-        previous = sibling.get();
-    }
-    return nullptr;
+PanoramaInlineStyleStats& inline_style_stats_state()
+{
+    static thread_local PanoramaInlineStyleStats stats;
+    return stats;
+}
+
+PanoramaMatchedStyleCacheStats& matched_style_cache_stats_state()
+{
+    static thread_local PanoramaMatchedStyleCacheStats stats;
+    return stats;
 }
 
 bool selector_matches(const PanoramaNode& node, const PanoramaSelector& selector)
@@ -4178,6 +4177,30 @@ std::string extract_defines_and_strip(std::string_view css, std::unordered_map<s
 }
 }
 
+PanoramaInlineStyleStats& panorama_inline_style_stats()
+{
+    return inline_style_stats_state();
+}
+
+PanoramaInlineStyleStats panorama_inline_style_stats_take()
+{
+    PanoramaInlineStyleStats snapshot = inline_style_stats_state();
+    inline_style_stats_state() = PanoramaInlineStyleStats{};
+    return snapshot;
+}
+
+PanoramaMatchedStyleCacheStats& panorama_matched_style_cache_stats()
+{
+    return matched_style_cache_stats_state();
+}
+
+PanoramaMatchedStyleCacheStats panorama_matched_style_cache_stats_take()
+{
+    PanoramaMatchedStyleCacheStats snapshot = matched_style_cache_stats_state();
+    matched_style_cache_stats_state() = PanoramaMatchedStyleCacheStats{};
+    return snapshot;
+}
+
 std::string PanoramaStyleSheet::resolve_value_impl(std::string_view value, int depth) const
 {
     if (depth > 8 || defines_.empty())
@@ -4238,15 +4261,16 @@ void PanoramaStyleSheet::clear()
     rules_by_class_.clear();
     rules_by_type_.clear();
     rules_universal_.clear();
+    source_batch_depth_ = 0;
+    source_values_dirty_ = false;
     ++generation_; // dependent caches keyed on (instance, generation) revalidate
 }
 
-std::uint16_t PanoramaStyleSheet::add_source(std::string_view css, std::uint16_t layout_scope)
+PanoramaParsedStyleSource PanoramaStyleSheet::parse_source(std::string_view css)
 {
-    const std::uint16_t source_index = static_cast<std::uint16_t>(source_scopes_.size());
-    source_scopes_.push_back({layout_scope});
-
-    const std::string stripped = extract_defines_and_strip(strip_css_comments(css), defines_, keyframes_);
+    PanoramaParsedStyleSource parsed_source;
+    const std::string stripped =
+        extract_defines_and_strip(strip_css_comments(css), parsed_source.defines, parsed_source.keyframes);
     std::size_t cursor = 0;
     while (cursor < stripped.size())
     {
@@ -4311,8 +4335,6 @@ std::uint16_t PanoramaStyleSheet::add_source(std::string_view css, std::uint16_t
         }
 
         PanoramaRule rule;
-        rule.source_order = next_source_order_++;
-        rule.source_index = source_index;
         // NOTE: unlike WebCore (where one invalid selector drops the whole list),
         // Valve's Panorama parser keeps the valid segments of a selector list.
         // CS:GO depends on this leniency: `.content-navbar__tabs RadioButton, ...,
@@ -4325,8 +4347,10 @@ std::uint16_t PanoramaStyleSheet::add_source(std::string_view css, std::uint16_t
             {
                 parsed.specificity = specificity(parsed);
                 collect_selector_ancestor_hashes(parsed);
-                has_sibling_rules_ = has_sibling_rules_ || selector_uses_sibling_combinator(parsed);
-                has_focus_within_rules_ = has_focus_within_rules_ || selector_uses_focus_within(parsed);
+                parsed_source.has_sibling_rules =
+                    parsed_source.has_sibling_rules || selector_uses_sibling_combinator(parsed);
+                parsed_source.has_focus_within_rules =
+                    parsed_source.has_focus_within_rules || selector_uses_focus_within(parsed);
                 rule.selectors.push_back(std::move(parsed));
             }
         }
@@ -4340,18 +4364,75 @@ std::uint16_t PanoramaStyleSheet::add_source(std::string_view css, std::uint16_t
         }
         if (!rule.selectors.empty() && !rule.declarations.empty())
         {
-            rules_.push_back(std::move(rule));
-            index_rule(static_cast<int>(rules_.size()) - 1);
+            parsed_source.rules.push_back(std::move(rule));
         }
     }
+    return parsed_source;
+}
 
-    // A later sheet's @define can affect declarations parsed earlier in this or a
-    // previous add_source call, so re-resolve every declaration's value now.
-    resolve_all_values();
+std::uint16_t PanoramaStyleSheet::add_parsed_source(
+    const PanoramaParsedStyleSource& source,
+    std::uint16_t layout_scope)
+{
+    const std::uint16_t source_index = static_cast<std::uint16_t>(source_scopes_.size());
+    source_scopes_.push_back({layout_scope});
+
+    for (const auto& [name, value] : source.defines)
+    {
+        defines_.insert_or_assign(name, value);
+    }
+    for (const auto& [name, keyframes] : source.keyframes)
+    {
+        keyframes_.insert_or_assign(name, keyframes);
+    }
+    has_sibling_rules_ = has_sibling_rules_ || source.has_sibling_rules;
+    has_focus_within_rules_ = has_focus_within_rules_ || source.has_focus_within_rules;
+    for (const PanoramaRule& template_rule : source.rules)
+    {
+        PanoramaRule rule = template_rule;
+        rule.source_order = next_source_order_++;
+        rule.source_index = source_index;
+        rules_.push_back(std::move(rule));
+        index_rule(static_cast<int>(rules_.size()) - 1);
+    }
+
+    source_values_dirty_ = true;
+    if (source_batch_depth_ == 0)
+    {
+        resolve_all_values();
+        source_values_dirty_ = false;
+        ++value_finalization_count_;
+    }
     // Invalidate (sheet, generation)-keyed caches: @defines may have changed any
     // declaration's resolved value, and rules_ growth moved declaration storage.
     ++generation_;
     return source_index;
+}
+
+std::uint16_t PanoramaStyleSheet::add_source(std::string_view css, std::uint16_t layout_scope)
+{
+    ++source_parse_count_;
+    return add_parsed_source(parse_source(css), layout_scope);
+}
+
+void PanoramaStyleSheet::begin_source_batch() noexcept
+{
+    ++source_batch_depth_;
+}
+
+void PanoramaStyleSheet::end_source_batch()
+{
+    if (source_batch_depth_ == 0)
+    {
+        return;
+    }
+    --source_batch_depth_;
+    if (source_batch_depth_ == 0 && source_values_dirty_)
+    {
+        resolve_all_values();
+        source_values_dirty_ = false;
+        ++value_finalization_count_;
+    }
 }
 
 void PanoramaStyleSheet::add_source_scope(std::uint16_t source_index, std::uint16_t layout_scope)
@@ -4426,6 +4507,88 @@ void PanoramaStyleSheet::resolve_all_values()
             keyframes.channels |= stop.channels;
         }
     }
+}
+
+bool panorama_set_inline_style_property(
+    PanoramaNode& node,
+    std::string_view property,
+    std::string_view value)
+{
+    PanoramaInlineStyleCache& cache = node.inline_style_cache;
+    if (!cache.valid || cache.source != node.inline_style)
+    {
+        cache.declarations.clear();
+        cache.declarations.reserve(4);
+        for (const std::string& declaration_text : split_top_level(node.inline_style, ';'))
+        {
+            PanoramaDeclaration declaration;
+            if (parse_declaration(declaration_text, declaration))
+            {
+                cache.declarations.push_back(std::move(declaration));
+            }
+        }
+        cache.source = node.inline_style;
+        cache.valid = true;
+        cache.structured = false;
+        ++panorama_inline_style_stats().raw_parses;
+    }
+
+    PanoramaDeclaration replacement;
+    const bool has_replacement =
+        !trim(value).empty() && parse_declaration(std::string(property) + ":" + std::string(value), replacement);
+    const std::string wanted = has_replacement ? replacement.property : to_lower(trim(property));
+
+    std::vector<PanoramaDeclaration> updated;
+    updated.reserve(cache.declarations.size() + (has_replacement ? 1U : 0U));
+    for (PanoramaDeclaration declaration : cache.declarations)
+    {
+        if (declaration.property != wanted)
+        {
+            updated.push_back(std::move(declaration));
+        }
+    }
+    if (has_replacement)
+    {
+        updated.push_back(std::move(replacement));
+    }
+
+    std::string serialized;
+    for (const PanoramaDeclaration& declaration : updated)
+    {
+        if (!serialized.empty())
+        {
+            serialized.push_back(' ');
+        }
+        serialized += declaration.property;
+        serialized += ": ";
+        serialized += declaration.value;
+        if (declaration.important)
+        {
+            serialized += " !important";
+        }
+        serialized.push_back(';');
+    }
+    if (serialized == node.inline_style)
+    {
+        cache.declarations = std::move(updated);
+        cache.source = node.inline_style;
+        cache.sheet = nullptr;
+        cache.sheet_generation = 0;
+        cache.valid = true;
+        cache.structured = true;
+        return false;
+    }
+
+    node.inline_style = serialized;
+    cache.source = node.inline_style;
+    cache.declarations = std::move(updated);
+    cache.sheet = nullptr;
+    cache.sheet_generation = 0;
+    cache.valid = true;
+    cache.structured = true;
+    ++panorama_inline_style_stats().property_writes;
+    ++panorama_inline_style_stats().serializations;
+    return true;
 }
 
 namespace
@@ -4503,6 +4666,7 @@ struct MatchedStyleCache
     std::uint64_t sheet_generation = 0;
     std::size_t entry_count = 0;
     std::unordered_map<std::uint64_t, std::vector<MatchedStyleCacheEntry>> buckets;
+    std::deque<std::uint64_t> insertion_order;
 };
 
 void hash_mix_bytes(std::uint64_t& hash, const void* data, std::size_t size)
@@ -4577,6 +4741,38 @@ void PanoramaStyleSheet::compute_node(PanoramaNode& node, const PanoramaNode* pr
     compute_node_impl(node, prev_sibling, /*recurse=*/true);
 }
 
+void PanoramaStyleSheet::compute_descendants_iterative(PanoramaNode& node) const
+{
+    struct TraversalFrame
+    {
+        PanoramaNode* parent = nullptr;
+        std::size_t next_child = 0;
+    };
+
+    static thread_local std::vector<TraversalFrame> traversal;
+    traversal.clear();
+    selector_ancestor_filter().push_element(node);
+    traversal.push_back({&node, 0});
+    while (!traversal.empty())
+    {
+        TraversalFrame& frame = traversal.back();
+        if (frame.next_child >= frame.parent->children.size())
+        {
+            selector_ancestor_filter().pop_element();
+            traversal.pop_back();
+            continue;
+        }
+
+        const std::size_t child_index = frame.next_child++;
+        PanoramaNode* child = frame.parent->children[child_index].get();
+        const PanoramaNode* previous =
+            child_index > 0 ? frame.parent->children[child_index - 1].get() : nullptr;
+        compute_node_impl(*child, previous, /*recurse=*/false);
+        selector_ancestor_filter().push_element(*child);
+        traversal.push_back({child, 0});
+    }
+}
+
 // CPUMT-49: `recurse` splits compute_node's original always-recurse body so
 // compute_root_style can compute just one node's own style. compute_node(node,
 // prev) above is exactly compute_node_impl(node, prev, true) -- byte-identical
@@ -4592,18 +4788,55 @@ void PanoramaStyleSheet::compute_node_impl(PanoramaNode& node, const PanoramaNod
     node.descendant_style_dirty = false;
     node.style_fresh = true; // tells the selective anim re-capture this node changed
 
+    // Inherit the sheet-source applicability vector from the parent once, then
+    // widen it with this node's scope mark. A rule lookup below is O(1) and deep
+    // trees never rebuild an ancestor-mark vector per node/rule.
+    const std::uint64_t parent_scope_signature =
+        node.parent != nullptr ? node.parent->style_scope_cache_signature : 0;
+    if (node.style_scope_cache_generation != generation_ ||
+        node.style_scope_cache_parent != node.parent ||
+        node.style_scope_parent_signature != parent_scope_signature ||
+        node.style_scope_cache_mark != node.style_scope_mark ||
+        node.style_source_membership.size() != source_scopes_.size())
+    {
+        node.style_source_membership.assign(source_scopes_.size(), 0);
+        for (std::size_t source_index = 0; source_index < source_scopes_.size(); ++source_index)
+        {
+            bool applies =
+                node.parent != nullptr &&
+                source_index < node.parent->style_source_membership.size() &&
+                node.parent->style_source_membership[source_index] != 0;
+            if (!applies)
+            {
+                for (const std::uint16_t scope : source_scopes_[source_index])
+                {
+                    if (scope == kRootLayoutScope ||
+                        (node.style_scope_mark != 0 && scope == node.style_scope_mark))
+                    {
+                        applies = true;
+                        break;
+                    }
+                }
+            }
+            node.style_source_membership[source_index] = applies ? 1U : 0U;
+        }
+        std::uint64_t signature = 1469598103934665603ULL;
+        hash_mix(signature, instance_id_);
+        hash_mix(signature, generation_);
+        hash_mix(signature, parent_scope_signature);
+        hash_mix(signature, node.style_scope_mark);
+        node.style_scope_cache_generation = generation_;
+        node.style_scope_cache_parent = node.parent;
+        node.style_scope_parent_signature = parent_scope_signature;
+        node.style_scope_cache_mark = node.style_scope_mark;
+        node.style_scope_cache_signature = signature;
+    }
+
     // Recurse into children, threading each child's immediately preceding sibling so
     // it can reuse that sibling's computed style (style sharing). The node's own
     // identifiers join the ancestor bloom filter for the descendant match tests.
     const auto recurse_children = [this](PanoramaNode& parent_node) {
-        selector_ancestor_filter().push_element(parent_node);
-        const PanoramaNode* prev = nullptr;
-        for (const auto& child : parent_node.children)
-        {
-            compute_node(*child, prev);
-            prev = child.get();
-        }
-        selector_ancestor_filter().pop_element();
+        compute_descendants_iterative(parent_node);
     };
 
     // ---- style sharing fast path --------------------------------------------
@@ -4719,29 +4952,11 @@ void PanoramaStyleSheet::compute_node_impl(PanoramaNode& node, const PanoramaNod
     matches.clear();
     panorama_cascade_stats().candidate_rules += candidates.size();
 
-    // Layout-scope marks on this node's ancestor-or-self chain. A scoped sheet
-    // (see add_source) only styles nodes inside the subtrees its including
-    // layout created; kRootLayoutScope sheets apply everywhere.
-    static thread_local std::vector<std::uint16_t> active_scope_marks;
-    active_scope_marks.clear();
-    for (const PanoramaNode* scope_walk = &node; scope_walk != nullptr; scope_walk = scope_walk->parent)
-    {
-        if (scope_walk->style_scope_mark != 0)
-        {
-            active_scope_marks.push_back(scope_walk->style_scope_mark);
-        }
-    }
+    // Per-source scope membership was inherited once at the start of this node.
     const auto rule_in_scope = [&](const PanoramaRule& rule) {
-        const std::vector<std::uint16_t>& scopes = source_scopes_[static_cast<std::size_t>(rule.source_index)];
-        for (const std::uint16_t scope : scopes)
-        {
-            if (scope == kRootLayoutScope ||
-                std::find(active_scope_marks.begin(), active_scope_marks.end(), scope) != active_scope_marks.end())
-            {
-                return true;
-            }
-        }
-        return false;
+        const std::size_t source_index = static_cast<std::size_t>(rule.source_index);
+        return source_index < node.style_source_membership.size() &&
+               node.style_source_membership[source_index] != 0;
     };
 
     const SelectorAncestorFilter& ancestor_filter = selector_ancestor_filter();
@@ -4795,9 +5010,12 @@ void PanoramaStyleSheet::compute_node_impl(PanoramaNode& node, const PanoramaNod
     if (style_cache.sheet_instance != instance_id_ || style_cache.sheet_generation != generation_)
     {
         style_cache.buckets.clear();
+        style_cache.insertion_order.clear();
         style_cache.entry_count = 0;
         style_cache.sheet_instance = instance_id_;
         style_cache.sheet_generation = generation_;
+        ++panorama_matched_style_cache_stats().generation_resets;
+        panorama_matched_style_cache_stats().entries = 0;
     }
 
     const PanoramaComputedStyle* parent_style = node.parent != nullptr ? &node.parent->computed : nullptr;
@@ -4836,6 +5054,7 @@ void PanoramaStyleSheet::compute_node_impl(PanoramaNode& node, const PanoramaNod
         hash_mix(key_hash, parent_style->custom_properties.storage_key());
     }
 
+    ++panorama_matched_style_cache_stats().lookups;
     if (const auto bucket_it = style_cache.buckets.find(key_hash); bucket_it != style_cache.buckets.end())
     {
         for (const MatchedStyleCacheEntry& entry : bucket_it->second)
@@ -4859,6 +5078,7 @@ void PanoramaStyleSheet::compute_node_impl(PanoramaNode& node, const PanoramaNod
                 continue;
             }
             node.computed = entry.style;
+            ++panorama_matched_style_cache_stats().hits;
             if (recurse)
             {
                 recurse_children(node);
@@ -4866,6 +5086,7 @@ void PanoramaStyleSheet::compute_node_impl(PanoramaNode& node, const PanoramaNod
             return;
         }
     }
+    ++panorama_matched_style_cache_stats().misses;
 
     // ---- cache miss: build the style by applying the cascade -----------------
     PanoramaComputedStyle style;
@@ -4897,17 +5118,15 @@ void PanoramaStyleSheet::compute_node_impl(PanoramaNode& node, const PanoramaNod
         style.font_italic = true;
     }
 
-    // Inline style is parsed once per (source text, sheet state) and cached on the
-    // node — WebCore parses the style attribute into typed StyleProperties when it
-    // is set, never during style resolution. The cache revalidates on the exact
-    // source string so JS writes to `style` (which rewrite inline_style) reparse.
+    // Direct host replacement of the public raw string is parsed once. Structured
+    // script writes mutate this declaration vector directly; sheet changes only
+    // re-resolve values and never reparse the raw compatibility serialization.
     static const std::vector<PanoramaDeclaration> no_inline_declarations;
     const std::vector<PanoramaDeclaration>* inline_declarations = &no_inline_declarations;
     if (!node.inline_style.empty())
     {
         PanoramaInlineStyleCache& cache = node.inline_style_cache;
-        if (!cache.valid || cache.sheet != this || cache.sheet_generation != generation_ ||
-            cache.source != node.inline_style)
+        if (!cache.valid || cache.source != node.inline_style)
         {
             cache.declarations.clear();
             cache.declarations.reserve(4);
@@ -4921,9 +5140,18 @@ void PanoramaStyleSheet::compute_node_impl(PanoramaNode& node, const PanoramaNod
                 }
             }
             cache.source = node.inline_style;
+            cache.valid = true;
+            cache.structured = false;
+            ++panorama_inline_style_stats().raw_parses;
+        }
+        if (cache.sheet != this || cache.sheet_generation != generation_)
+        {
+            for (PanoramaDeclaration& declaration : cache.declarations)
+            {
+                declaration.resolved_value = resolve_value(declaration.value);
+            }
             cache.sheet = this;
             cache.sheet_generation = generation_;
-            cache.valid = true;
         }
         inline_declarations = &cache.declarations;
     }
@@ -4997,14 +5225,27 @@ void PanoramaStyleSheet::compute_node_impl(PanoramaNode& node, const PanoramaNod
     visit_sheet_declarations(true, apply_typed_property);
     visit_inline_declarations(true, apply_typed_property);
 
-    // Remember the result for identical future cascades. The cap bounds memory on
-    // pathological documents; clearing wholesale keeps the bookkeeping trivial
-    // (WebCore sweeps on a timer instead).
+    // Remember the result for identical future cascades. Deterministic FIFO
+    // eviction retains the other hot entries instead of producing a clear-all
+    // miss cliff when cardinality crosses the fixed bound.
     constexpr std::size_t kMatchedStyleCacheMaxEntries = 4096;
-    if (style_cache.entry_count >= kMatchedStyleCacheMaxEntries)
+    while (style_cache.entry_count >= kMatchedStyleCacheMaxEntries &&
+           !style_cache.insertion_order.empty())
     {
-        style_cache.buckets.clear();
-        style_cache.entry_count = 0;
+        const std::uint64_t evicted_hash = style_cache.insertion_order.front();
+        style_cache.insertion_order.pop_front();
+        const auto evicted_bucket = style_cache.buckets.find(evicted_hash);
+        if (evicted_bucket == style_cache.buckets.end() || evicted_bucket->second.empty())
+        {
+            continue;
+        }
+        evicted_bucket->second.erase(evicted_bucket->second.begin());
+        --style_cache.entry_count;
+        ++panorama_matched_style_cache_stats().evictions;
+        if (evicted_bucket->second.empty())
+        {
+            style_cache.buckets.erase(evicted_bucket);
+        }
     }
     MatchedStyleCacheEntry entry;
     entry.declaration_lists.reserve(matches.size());
@@ -5035,7 +5276,10 @@ void PanoramaStyleSheet::compute_node_impl(PanoramaNode& node, const PanoramaNod
     }
     entry.style = style;
     style_cache.buckets[key_hash].push_back(std::move(entry));
+    style_cache.insertion_order.push_back(key_hash);
     ++style_cache.entry_count;
+    ++panorama_matched_style_cache_stats().inserts;
+    panorama_matched_style_cache_stats().entries = style_cache.entry_count;
 
     node.computed = std::move(style);
     if (recurse)

@@ -3,6 +3,7 @@
 #include "ui/panorama/panorama_style.hpp"
 #include "ui/panorama/panorama_text_break.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -196,9 +197,13 @@ struct PanoramaInlineStyleCache
     std::string source;
     std::vector<PanoramaDeclaration> declarations;
     bool valid = false;
+    // True after a structured property mutation. A stylesheet-generation change
+    // only re-resolves these declarations; it never reparses `source`.
+    bool structured = false;
 };
 
 struct PanoramaNode;
+struct PanoramaDocumentIndex;
 
 // Node lifetime observation -----------------------------------------------------
 //
@@ -232,6 +237,56 @@ public:
 void panorama_add_node_lifetime_observer(PanoramaNodeLifetimeObserver& observer);
 void panorama_remove_node_lifetime_observer(PanoramaNodeLifetimeObserver& observer);
 
+// Intrusive, allocation-free registration for one exact node reference. Unlike
+// the compatibility observer registry above, destruction touches only links
+// attached to the dying node. Links are move-safe so they can live in standard
+// containers; callbacks may destroy the link itself.
+class PanoramaNodeLifetimeRegistration
+{
+public:
+    using Callback = void (*)(void* context, PanoramaNode& node);
+
+    PanoramaNodeLifetimeRegistration() = default;
+    PanoramaNodeLifetimeRegistration(PanoramaNode& node, Callback callback, void* context);
+    ~PanoramaNodeLifetimeRegistration();
+    PanoramaNodeLifetimeRegistration(const PanoramaNodeLifetimeRegistration&) = delete;
+    PanoramaNodeLifetimeRegistration& operator=(const PanoramaNodeLifetimeRegistration&) = delete;
+    PanoramaNodeLifetimeRegistration(PanoramaNodeLifetimeRegistration&& other) noexcept;
+    PanoramaNodeLifetimeRegistration& operator=(PanoramaNodeLifetimeRegistration&& other) noexcept;
+
+    void bind(PanoramaNode& node, Callback callback, void* context);
+    void reset() noexcept;
+    [[nodiscard]] PanoramaNode* node() const noexcept { return node_; }
+
+private:
+    friend struct PanoramaNode;
+    void take_from(PanoramaNodeLifetimeRegistration& other) noexcept;
+    void detach_for_notification() noexcept;
+
+    PanoramaNode* node_ = nullptr;
+    PanoramaNodeLifetimeRegistration* previous_ = nullptr;
+    PanoramaNodeLifetimeRegistration* next_ = nullptr;
+    Callback callback_ = nullptr;
+    void* context_ = nullptr;
+};
+
+// Opt-in deterministic counters used by scaling regressions. Disabled means the
+// hot paths do not increment counters.
+struct PanoramaDomStructuralCounters
+{
+    std::size_t hit_test_nodes_visited = 0;
+    std::size_t hit_test_subtrees_pruned = 0;
+    std::size_t id_index_rebuild_nodes = 0;
+    std::size_t id_index_candidate_checks = 0;
+    std::size_t lifetime_attached_callbacks = 0;
+    std::size_t lifetime_global_callbacks = 0;
+};
+
+void panorama_enable_dom_structural_counters(bool enabled) noexcept;
+void panorama_reset_dom_structural_counters() noexcept;
+[[nodiscard]] PanoramaDomStructuralCounters panorama_dom_structural_counters() noexcept;
+void panorama_record_hit_test_visit(bool pruned) noexcept;
+
 // Tree guard (diagnostic, PanoramaDiagnostics::tree_guard) --------------------
 //
 // Hunts use-after-free tree corruption: every node carries a liveness canary
@@ -249,20 +304,21 @@ void panorama_debug_set_mutation_context(std::string context);
 // (e.g. the onmouseout/onmouseover chains): entries whose node is destroyed
 // mid-iteration — a handler may delete arbitrary panels — are nulled in place,
 // so the iteration skips them instead of dangling.
-class PanoramaScopedNodeWatch final : public PanoramaNodeLifetimeObserver
+class PanoramaScopedNodeWatch final
 {
 public:
     explicit PanoramaScopedNodeWatch(std::vector<PanoramaNode*> nodes);
-    ~PanoramaScopedNodeWatch() override;
+    ~PanoramaScopedNodeWatch() = default;
     PanoramaScopedNodeWatch(const PanoramaScopedNodeWatch&) = delete;
     PanoramaScopedNodeWatch& operator=(const PanoramaScopedNodeWatch&) = delete;
 
     [[nodiscard]] const std::vector<PanoramaNode*>& nodes() const noexcept { return nodes_; }
 
-    void on_panorama_node_destroyed(PanoramaNode& node) override;
-
 private:
+    static void null_slot(void* context, PanoramaNode& node);
+
     std::vector<PanoramaNode*> nodes_;
+    std::vector<PanoramaNodeLifetimeRegistration> registrations_;
 };
 
 struct PanoramaNode
@@ -273,15 +329,15 @@ struct PanoramaNode
     static constexpr std::uint32_t kLivenessAlive = 0x50414E4Fu; // 'PANO'
     static constexpr std::uint32_t kLivenessDead = 0xDEADDEADu;
 
-    PanoramaNode() = default;
+    PanoramaNode();
     ~PanoramaNode(); // notifies lifetime observers (see above)
     PanoramaNode(const PanoramaNode&) = delete;
     PanoramaNode& operator=(const PanoramaNode&) = delete;
     // Moves keep working (e.g. `root = PanoramaNode{};` to reset a tree). The
     // moved-from shell still notifies observers when it dies; observers track
     // addresses, and the moved-to object is a new address to them.
-    PanoramaNode(PanoramaNode&&) = default;
-    PanoramaNode& operator=(PanoramaNode&&) = default;
+    PanoramaNode(PanoramaNode&&) noexcept;
+    PanoramaNode& operator=(PanoramaNode&&) noexcept;
 
     std::string tag;                 // original tag name, e.g. "Panel", "Label", "Button"
     std::string tag_lower;           // lowercased tag for matching
@@ -291,8 +347,15 @@ struct PanoramaNode
     std::string inline_style;        // raw style="" attribute text
     std::string text;                // text attribute or label body
 
+    // Root-local lookup cache. Null on ordinary nodes and created lazily by
+    // find_by_id(); declared before children so it outlives child destruction.
+    mutable std::unique_ptr<PanoramaDocumentIndex> document_index;
     PanoramaNode* parent = nullptr;
+    // Maintained with `parent` by built-in mutation owners. Selector matching
+    // follows this link in O(1), rather than rescanning parent->children.
+    PanoramaNode* previous_sibling_node = nullptr;
     std::vector<std::unique_ptr<PanoramaNode>> children;
+    PanoramaNodeLifetimeRegistration* lifetime_registrations = nullptr;
 
     std::uint32_t debug_liveness = kLivenessAlive; // tree-guard canary (see above)
 
@@ -303,6 +366,11 @@ struct PanoramaNode
     // Layout-derived aggregate including this node. The input controller uses it
     // to prune the popup-only hit-test without searching closed-menu subtrees.
     bool subtree_has_popup_layout = false;
+    // Post-layout conservative union used only when valid. Any transform,
+    // non-finite geometry, or mutation makes it invalid, which means input must
+    // descend normally rather than risk a false rejection.
+    PanoramaLayoutBox hit_test_subtree_bounds;
+    bool hit_test_subtree_bounds_valid = false;
 
     // Host-populated texture for image-like nodes (e.g. a rasterized SVG icon).
     // When non-zero, the paint layer emits a textured quad over the content box.
@@ -327,6 +395,15 @@ struct PanoramaNode
     // BLoadLayout). Scoped stylesheets only style nodes whose ancestor-or-self
     // chain carries a matching mark; 0 = unmarked.
     std::uint16_t style_scope_mark = 0;
+    // Generation-stamped inherited applicability for every stylesheet source.
+    // The cascade builds it once per (node, source) pair and every candidate rule
+    // then performs one indexed lookup.
+    mutable std::uint64_t style_scope_cache_generation = ~std::uint64_t{0};
+    mutable std::uint64_t style_scope_cache_signature = 0;
+    mutable std::uint64_t style_scope_parent_signature = 0;
+    mutable const PanoramaNode* style_scope_cache_parent = nullptr;
+    mutable std::uint16_t style_scope_cache_mark = 0;
+    mutable std::vector<unsigned char> style_source_membership;
 
     // text-overflow: shrink — the reduced font size that makes the text fit the box.
     // Computed + stored by the font atlas/text provider (which also pre-rasterizes
@@ -466,12 +543,20 @@ struct PanoramaNode
 
     [[nodiscard]] bool has_class(std::string_view klass) const;
     [[nodiscard]] PanoramaNode* find_by_id(std::string_view target_id);
+    [[nodiscard]] const PanoramaNode* find_by_id(std::string_view target_id) const;
+    void set_id(std::string new_id);
+    void invalidate_hit_test_bounds() noexcept;
 
     // True when the label carries html="true"; its `text` then contains a subset of
     // inline HTML markup (<b>/<i>) that the measure/paint paths interpret as styled
     // runs rather than literal characters.
     [[nodiscard]] bool is_html_text() const;
 };
+
+// Call once around structural mutations performed through the public children /
+// parent fields. It invalidates the root-local ID ordering and conservative hit
+// bounds. Built-in DOM/session/runtime mutation owners call this themselves.
+void panorama_notify_tree_structure_changed(PanoramaNode& node) noexcept;
 
 // The result of parsing a Panorama layout document. `root` is a synthetic node
 // holding the document's top-level panels as children. Resource resolution (frame

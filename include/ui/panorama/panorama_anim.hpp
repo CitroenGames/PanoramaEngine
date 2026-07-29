@@ -74,6 +74,15 @@ struct PanoramaRecompositeDirtyTracker
     std::uint32_t generation = 0;
 };
 
+// Optional traversal counters for verifying animation work gates. Callers that
+// do not pass this object pay no counter traffic on the recursive hot paths.
+struct PanoramaAnimationWorkStats
+{
+    std::uint64_t transition_nodes_visited = 0;
+    std::uint64_t keyframe_nodes_visited = 0;
+    std::uint64_t scroll_nodes_visited = 0;
+};
+
 // Snapshots each node's current computed values as transition targets, starting a
 // transition (from the currently displayed value) for any animatable property
 // whose target changed and that has a matching `transition-*` rule. On the first
@@ -90,6 +99,11 @@ struct PanoramaAnimCaptureResult
     bool any_transition_animating = false; // a visited node has a transition in flight
     bool any_keyframe_candidate = false;   // a visited node carries (or must revert) an animation-name
 };
+
+// Full-tree capture with the same active-work summary returned by the selective
+// form. panorama_capture_anim_targets() remains as the source-compatible
+// convenience API for callers that do not need frame-planning gates.
+PanoramaAnimCaptureResult panorama_capture_anim_targets_with_result(PanoramaNode& root);
 
 // Like panorama_capture_anim_targets, but only for nodes the cascade actually
 // recomputed since the last capture (PanoramaNode::style_fresh). Required after
@@ -112,7 +126,8 @@ void panorama_sync_anim_dimensions(PanoramaNode& node);
 // value changed this advance (see PanoramaRecompositeDirtyTracker); omit it
 // (the default) when the caller has no use for per-node granularity.
 PanoramaAnimationAdvanceResult panorama_advance_anim(
-    PanoramaNode& root, float dt, PanoramaRecompositeDirtyTracker* dirty_tracker = nullptr);
+    PanoramaNode& root, float dt, PanoramaRecompositeDirtyTracker* dirty_tracker = nullptr,
+    PanoramaAnimationWorkStats* work_stats = nullptr);
 
 // Advances CSS @keyframes animations by `dt` seconds for every node whose computed
 // `animation-name` names an entry in `keyframes`, writing the interpolated channels
@@ -123,14 +138,14 @@ PanoramaAnimationAdvanceResult panorama_advance_anim(
 // `dirty_tracker`: see panorama_advance_anim above.
 PanoramaAnimationAdvanceResult panorama_advance_keyframes(PanoramaNode& root,
     const std::unordered_map<std::string, PanoramaKeyframes>& keyframes, float dt,
-    PanoramaRecompositeDirtyTracker* dirty_tracker = nullptr);
+    PanoramaRecompositeDirtyTracker* dirty_tracker = nullptr, PanoramaAnimationWorkStats* work_stats = nullptr);
 
 // Sheet-aware overload: identical behavior, but each node's keyframe runtime
 // caches its registry resolution keyed on the sheet's never-reused instance id
 // + content generation (bumped by add_source/clear — the only registry
 // mutators), so steady-state frames skip the per-node name lookup.
 PanoramaAnimationAdvanceResult panorama_advance_keyframes(PanoramaNode& root, const PanoramaStyleSheet& sheet, float dt,
-    PanoramaRecompositeDirtyTracker* dirty_tracker = nullptr);
+    PanoramaRecompositeDirtyTracker* dirty_tracker = nullptr, PanoramaAnimationWorkStats* work_stats = nullptr);
 
 // Advances every active smooth-scroll spring (PanoramaNode::scroll_anim, started
 // by panorama_smooth_scroll_to / wheel input / smooth ScrollParentToMakePanelFit)
@@ -139,5 +154,6 @@ PanoramaAnimationAdvanceResult panorama_advance_keyframes(PanoramaNode& root, co
 // to the destination on overshoot or once position AND velocity are within
 // tolerance. Offsets apply through panorama_set_scroll_offset, so a changed
 // result (`layout_changed`) requires a relayout to move the content.
-PanoramaAnimationAdvanceResult panorama_advance_scroll_animations(PanoramaNode& root, float dt);
+PanoramaAnimationAdvanceResult panorama_advance_scroll_animations(
+    PanoramaNode& root, float dt, PanoramaAnimationWorkStats* work_stats = nullptr);
 }

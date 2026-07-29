@@ -43,15 +43,25 @@ struct AppState
 // SetDIBitsToDevice expects each pixel as B,G,R,X in memory (little-endian
 // 0x00RRGGBB); the engine's draw list -- and our Framebuffer -- use straight
 // R,G,B,A, so swap channels after a changed frame instead of in WM_PAINT.
-void repack_bgra(const panorama_example::Framebuffer& fb, std::vector<std::uint8_t>& out)
+void repack_bgra(const panorama_example::Framebuffer& fb,
+    std::vector<std::uint8_t>& out,
+    const panorama_example::RasterDamage& damage)
 {
     out.resize(fb.rgba.size());
-    for (std::size_t i = 0; i < fb.rgba.size(); i += 4)
+    for (int y = damage.top; y < damage.bottom; ++y)
     {
-        out[i + 0] = fb.rgba[i + 2]; // B
-        out[i + 1] = fb.rgba[i + 1]; // G
-        out[i + 2] = fb.rgba[i + 0]; // R
-        out[i + 3] = 0;
+        for (int x = damage.left; x < damage.right; ++x)
+        {
+            const std::size_t i =
+                (static_cast<std::size_t>(y) *
+                        static_cast<std::size_t>(fb.width) +
+                    static_cast<std::size_t>(x)) *
+                4U;
+            out[i + 0] = fb.rgba[i + 2]; // B
+            out[i + 1] = fb.rgba[i + 1]; // G
+            out[i + 2] = fb.rgba[i + 0]; // R
+            out[i + 3] = 0;
+        }
     }
 }
 
@@ -65,8 +75,12 @@ void refresh(HWND hwnd, AppState& state)
     state.last_update = now;
     if (state.document.update_frame(state.width, state.height, dt_seconds))
     {
-        repack_bgra(state.document.framebuffer(), state.bgra);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        const panorama_example::RasterDamage& damage =
+            state.document.last_damage();
+        repack_bgra(state.document.framebuffer(), state.bgra, damage);
+        const RECT invalid{
+            damage.left, damage.top, damage.right, damage.bottom};
+        InvalidateRect(hwnd, &invalid, FALSE);
     }
 }
 
@@ -365,7 +379,9 @@ int main(int argc, char** argv)
     // load() produced the first frame at the requested initial size. If native
     // window sizing adjusted the client area, one zero-delta update relayouts it.
     (void)state.document.update_frame(state.width, state.height, 0.0F);
-    repack_bgra(state.document.framebuffer(), state.bgra);
+    repack_bgra(
+        state.document.framebuffer(), state.bgra,
+        state.document.last_damage());
     state.last_update = FrameClock::now();
 
     ShowWindow(hwnd, SW_SHOWDEFAULT);

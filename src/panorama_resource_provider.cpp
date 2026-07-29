@@ -2,7 +2,7 @@
 
 #include <algorithm>
 #include <fstream>
-#include <iterator>
+#include <limits>
 #include <system_error>
 #include <utility>
 
@@ -48,14 +48,16 @@ std::string strip_panorama_prefix(std::string path)
     return path;
 }
 
-std::vector<std::filesystem::path> candidate_relative_paths(std::string_view path)
+std::vector<std::filesystem::path> candidate_relative_paths(
+    std::string_view path, bool already_normalized)
 {
     if (has_parent_reference(path))
     {
         return {};
     }
 
-    const std::string normalized = normalized_resource_key(path);
+    const std::string normalized =
+        already_normalized ? std::string(path) : normalized_resource_key(path);
     std::vector<std::filesystem::path> candidates;
     candidates.emplace_back(normalized);
 
@@ -85,12 +87,94 @@ std::optional<std::filesystem::path> safe_join(const std::filesystem::path& root
 
     return root / normalized;
 }
+
+std::optional<std::filesystem::path> resolve_normalized_file(
+    const std::filesystem::path& root, std::string_view normalized_path)
+{
+    if (root.empty())
+    {
+        return std::nullopt;
+    }
+    for (const std::filesystem::path& relative :
+         candidate_relative_paths(normalized_path, true))
+    {
+        const std::optional<std::filesystem::path> candidate = safe_join(root, relative);
+        if (!candidate)
+        {
+            continue;
+        }
+        std::error_code error;
+        if (std::filesystem::is_regular_file(*candidate, error))
+        {
+            return candidate->lexically_normal();
+        }
+    }
+    return std::nullopt;
+}
+
+std::vector<unsigned char> read_file_exact(
+    const std::filesystem::path& path, PanoramaResourceReadStats* stats)
+{
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file)
+    {
+        return {};
+    }
+    const std::streamoff end = file.tellg();
+    if (end < 0 ||
+        static_cast<std::uintmax_t>(end) >
+            static_cast<std::uintmax_t>(std::numeric_limits<std::size_t>::max()))
+    {
+        return {};
+    }
+    const std::size_t size = static_cast<std::size_t>(end);
+    if (size > static_cast<std::size_t>(std::numeric_limits<std::streamsize>::max()))
+    {
+        return {};
+    }
+    std::vector<unsigned char> bytes(size);
+    if (stats != nullptr)
+    {
+        ++stats->file_buffer_allocations;
+    }
+    file.seekg(0, std::ios::beg);
+    if (size != 0)
+    {
+        file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size));
+        if (!file || static_cast<std::size_t>(file.gcount()) != size)
+        {
+            return {};
+        }
+    }
+    return bytes;
+}
 }
 
 std::optional<std::filesystem::path> PanoramaResourceProvider::resolve_file(std::string_view path) const
 {
     (void)path;
     return std::nullopt;
+}
+
+bool PanoramaResourceProvider::read_view(
+    std::string_view normalized_path,
+    PanoramaResourceView& out,
+    PanoramaResourceReadStats* stats) const
+{
+    PanoramaResource owned;
+    if (!read(normalized_path, owned))
+    {
+        return false;
+    }
+    PanoramaResourceView view;
+    view.data = PanoramaSharedBytes::from_owned(std::move(owned.bytes));
+    view.source = std::move(owned.source);
+    if (stats != nullptr)
+    {
+        ++stats->owned_fallback_hits;
+    }
+    out = std::move(view);
+    return true;
 }
 
 void PanoramaResourceManager::add_provider(
@@ -138,13 +222,61 @@ void PanoramaResourceManager::clear()
 
 bool PanoramaResourceManager::read(std::string_view path, PanoramaResource& out) const
 {
+    return read(path, out, nullptr);
+}
+
+bool PanoramaResourceManager::read(
+    std::string_view path,
+    PanoramaResource& out,
+    PanoramaResourceReadStats* stats) const
+{
+    PanoramaResourceView view;
+    if (!read_view(path, view, stats))
+    {
+        return false;
+    }
+    PanoramaResource resource;
+    const std::span<const unsigned char> bytes = view.bytes();
+    resource.bytes.assign(bytes.begin(), bytes.end());
+    resource.source = std::move(view.source);
+    if (stats != nullptr)
+    {
+        ++stats->payload_copy_operations;
+        stats->copied_payload_bytes += bytes.size();
+    }
+    out = std::move(resource);
+    return true;
+}
+
+bool PanoramaResourceManager::read_view(
+    std::string_view path,
+    PanoramaResourceView& out,
+    PanoramaResourceReadStats* stats) const
+{
+    const std::string normalized = normalized_resource_key(path);
+    if (stats != nullptr)
+    {
+        ++stats->path_normalizations;
+    }
     for (const ProviderEntry& entry : providers_)
     {
-        PanoramaResource resource;
-        if (entry.provider != nullptr && entry.provider->read(path, resource))
+        if (entry.provider == nullptr)
+        {
+            continue;
+        }
+        if (stats != nullptr)
+        {
+            ++stats->provider_lookups;
+        }
+        PanoramaResourceView resource;
+        if (entry.provider->read_view(normalized, resource, stats))
         {
             out = std::move(resource);
             return true;
+        }
+        if (stats != nullptr)
+        {
+            ++stats->provider_fallthroughs;
         }
     }
     return false;
@@ -152,12 +284,28 @@ bool PanoramaResourceManager::read(std::string_view path, PanoramaResource& out)
 
 std::optional<std::string> PanoramaResourceManager::read_text(std::string_view path) const
 {
-    PanoramaResource resource;
-    if (!read(path, resource))
+    return read_text(path, nullptr);
+}
+
+std::optional<std::string> PanoramaResourceManager::read_text(
+    std::string_view path, PanoramaResourceReadStats* stats) const
+{
+    PanoramaResourceView resource;
+    if (!read_view(path, resource, stats))
     {
         return std::nullopt;
     }
-    return std::string(reinterpret_cast<const char*>(resource.bytes.data()), resource.bytes.size());
+    const std::span<const unsigned char> bytes = resource.bytes();
+    if (stats != nullptr)
+    {
+        ++stats->payload_copy_operations;
+        stats->copied_payload_bytes += bytes.size();
+    }
+    if (bytes.empty())
+    {
+        return std::string{};
+    }
+    return std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size());
 }
 
 std::optional<std::filesystem::path> PanoramaResourceManager::resolve_file(std::string_view path) const
@@ -183,10 +331,11 @@ bool PanoramaResourceManager::empty() const noexcept
 
 void PanoramaMemoryResourceProvider::add(std::string_view path, std::span<const unsigned char> bytes)
 {
-    PanoramaResource resource;
-    resource.bytes.assign(bytes.begin(), bytes.end());
-    resource.source = "memory:" + normalized_resource_key(path);
-    resources_[normalized_resource_key(path)] = std::move(resource);
+    const std::string key = normalized_resource_key(path);
+    StoredResource resource;
+    resource.data = PanoramaSharedBytes::copy_of(bytes);
+    resource.source = "memory:" + key;
+    resources_[key] = std::move(resource);
 }
 
 void PanoramaMemoryResourceProvider::add_text(std::string_view path, std::string_view text)
@@ -198,12 +347,38 @@ void PanoramaMemoryResourceProvider::add_text(std::string_view path, std::string
 
 bool PanoramaMemoryResourceProvider::read(std::string_view path, PanoramaResource& out) const
 {
-    const auto it = resources_.find(normalized_resource_key(path));
+    const std::string normalized = normalized_resource_key(path);
+    PanoramaResourceView view;
+    if (!read_view(normalized, view))
+    {
+        return false;
+    }
+    PanoramaResource resource;
+    const std::span<const unsigned char> bytes = view.bytes();
+    resource.bytes.assign(bytes.begin(), bytes.end());
+    resource.source = std::move(view.source);
+    out = std::move(resource);
+    return true;
+}
+
+bool PanoramaMemoryResourceProvider::read_view(
+    std::string_view normalized_path,
+    PanoramaResourceView& out,
+    PanoramaResourceReadStats* stats) const
+{
+    const auto it = resources_.find(normalized_path);
     if (it == resources_.end())
     {
         return false;
     }
-    out = it->second;
+    PanoramaResourceView view;
+    view.data = it->second.data;
+    view.source = it->second.source;
+    if (stats != nullptr)
+    {
+        ++stats->zero_copy_hits;
+    }
+    out = std::move(view);
     return true;
 }
 
@@ -214,17 +389,47 @@ PanoramaPackageResourceProvider::PanoramaPackageResourceProvider(const PanoramaP
 
 bool PanoramaPackageResourceProvider::read(std::string_view path, PanoramaResource& out) const
 {
-    if (package_ == nullptr || !package_->contains(path))
+    const std::string normalized = normalized_resource_key(path);
+    PanoramaResourceView view;
+    if (!read_view(normalized, view))
     {
         return false;
     }
+    PanoramaResource resource;
+    const std::span<const unsigned char> bytes = view.bytes();
+    resource.bytes.assign(bytes.begin(), bytes.end());
+    resource.source = std::move(view.source);
+    out = std::move(resource);
+    return true;
+}
 
+bool PanoramaPackageResourceProvider::read_view(
+    std::string_view normalized_path,
+    PanoramaResourceView& out,
+    PanoramaResourceReadStats* stats) const
+{
+    if (package_ == nullptr)
+    {
+        return false;
+    }
     try
     {
-        out.bytes = package_->read(path);
-        out.source = package_->path().empty()
-                         ? ("package:" + normalized_resource_key(path))
-                         : (package_->path().generic_string() + "#" + normalized_resource_key(path));
+        PanoramaSharedBytes data;
+        if (!package_->try_read_normalized(normalized_path, data))
+        {
+            return false;
+        }
+        PanoramaResourceView view;
+        view.data = std::move(data);
+        view.source = package_->path().empty()
+                          ? ("package:" + std::string(normalized_path))
+                          : (package_->path().generic_string() + "#" +
+                             std::string(normalized_path));
+        if (stats != nullptr)
+        {
+            ++stats->zero_copy_hits;
+        }
+        out = std::move(view);
         return true;
     }
     catch (...)
@@ -240,20 +445,46 @@ PanoramaDirectoryResourceProvider::PanoramaDirectoryResourceProvider(std::filesy
 
 bool PanoramaDirectoryResourceProvider::read(std::string_view path, PanoramaResource& out) const
 {
-    const std::optional<std::filesystem::path> file_path = resolve_file(path);
+    const std::string normalized = normalized_resource_key(path);
+    PanoramaResourceView view;
+    if (!read_view(normalized, view))
+    {
+        return false;
+    }
+    PanoramaResource resource;
+    const std::span<const unsigned char> bytes = view.bytes();
+    resource.bytes.assign(bytes.begin(), bytes.end());
+    resource.source = std::move(view.source);
+    out = std::move(resource);
+    return true;
+}
+
+bool PanoramaDirectoryResourceProvider::read_view(
+    std::string_view normalized_path,
+    PanoramaResourceView& out,
+    PanoramaResourceReadStats* stats) const
+{
+    const std::optional<std::filesystem::path> file_path =
+        resolve_normalized_file(root_, normalized_path);
     if (!file_path)
     {
         return false;
     }
-
-    std::ifstream file(*file_path, std::ios::binary);
-    if (!file)
+    std::vector<unsigned char> bytes = read_file_exact(*file_path, stats);
+    std::error_code size_error;
+    const std::uintmax_t expected_size = std::filesystem::file_size(*file_path, size_error);
+    if (size_error || expected_size != bytes.size())
     {
         return false;
     }
-
-    out.bytes.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
-    out.source = file_path->generic_string();
+    PanoramaResourceView view;
+    view.data = PanoramaSharedBytes::from_owned(std::move(bytes));
+    view.source = file_path->generic_string();
+    if (stats != nullptr)
+    {
+        ++stats->owned_fallback_hits;
+    }
+    out = std::move(view);
     return true;
 }
 
@@ -264,7 +495,7 @@ std::optional<std::filesystem::path> PanoramaDirectoryResourceProvider::resolve_
         return std::nullopt;
     }
 
-    for (const std::filesystem::path& relative : candidate_relative_paths(path))
+    for (const std::filesystem::path& relative : candidate_relative_paths(path, false))
     {
         const std::optional<std::filesystem::path> candidate = safe_join(root_, relative);
         if (!candidate)

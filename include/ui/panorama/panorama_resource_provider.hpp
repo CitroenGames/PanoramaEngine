@@ -28,6 +28,29 @@ struct PanoramaResource
     std::string source;
 };
 
+struct PanoramaResourceView
+{
+    PanoramaSharedBytes data;
+    std::string source;
+
+    [[nodiscard]] std::span<const unsigned char> bytes() const noexcept
+    {
+        return data.bytes();
+    }
+};
+
+struct PanoramaResourceReadStats
+{
+    std::size_t path_normalizations = 0;
+    std::size_t provider_lookups = 0;
+    std::size_t provider_fallthroughs = 0;
+    std::size_t zero_copy_hits = 0;
+    std::size_t owned_fallback_hits = 0;
+    std::size_t payload_copy_operations = 0;
+    std::size_t copied_payload_bytes = 0;
+    std::size_t file_buffer_allocations = 0;
+};
+
 // One resource backend. Implement `read()`; everything else has a usable
 // default. `path` arguments are Panorama-relative (already normalized by the
 // caller, e.g. via normalize_panorama_entry_path) — a provider does not need to
@@ -41,6 +64,13 @@ public:
     // at `path`; that is not an error; PanoramaResourceManager just moves on
     // to the next provider.
     [[nodiscard]] virtual bool read(std::string_view path, PanoramaResource& out) const = 0;
+    // Immutable owner-backed read. Legacy providers get a compatibility
+    // adapter through read(); stable providers override this to share their
+    // authoritative storage without copying it.
+    [[nodiscard]] virtual bool read_view(
+        std::string_view normalized_path,
+        PanoramaResourceView& out,
+        PanoramaResourceReadStats* stats = nullptr) const;
     // Exposes a real filesystem path for `path` when one exists, for consumers
     // that need to hand a path to an external API (e.g. a system font loader)
     // instead of reading bytes themselves. Default: unsupported (nullopt) — a
@@ -69,9 +99,20 @@ public:
     void clear();
 
     [[nodiscard]] bool read(std::string_view path, PanoramaResource& out) const;
+    [[nodiscard]] bool read(
+        std::string_view path,
+        PanoramaResource& out,
+        PanoramaResourceReadStats* stats) const;
+    [[nodiscard]] bool read_view(
+        std::string_view path,
+        PanoramaResourceView& out,
+        PanoramaResourceReadStats* stats = nullptr) const;
     // Convenience wrapper over read() that returns the bytes reinterpreted as
     // text, or nullopt if no provider has `path`.
     [[nodiscard]] std::optional<std::string> read_text(std::string_view path) const;
+    [[nodiscard]] std::optional<std::string> read_text(
+        std::string_view path,
+        PanoramaResourceReadStats* stats) const;
     // Ascending-priority order, same as read(): the first provider that
     // resolves `path` wins.
     [[nodiscard]] std::optional<std::filesystem::path> resolve_file(std::string_view path) const;
@@ -101,9 +142,23 @@ public:
     void add_text(std::string_view path, std::string_view text);
 
     [[nodiscard]] bool read(std::string_view path, PanoramaResource& out) const override;
+    [[nodiscard]] bool read_view(
+        std::string_view normalized_path,
+        PanoramaResourceView& out,
+        PanoramaResourceReadStats* stats = nullptr) const override;
 
 private:
-    std::unordered_map<std::string, PanoramaResource> resources_;
+    struct StoredResource
+    {
+        PanoramaSharedBytes data;
+        std::string source;
+    };
+
+    std::unordered_map<
+        std::string,
+        StoredResource,
+        PanoramaTransparentStringHash,
+        std::equal_to<>> resources_;
 };
 
 // Reads through an already-open PanoramaPackage (.pbin). Does not own the
@@ -114,6 +169,10 @@ public:
     explicit PanoramaPackageResourceProvider(const PanoramaPackage& package);
 
     [[nodiscard]] bool read(std::string_view path, PanoramaResource& out) const override;
+    [[nodiscard]] bool read_view(
+        std::string_view normalized_path,
+        PanoramaResourceView& out,
+        PanoramaResourceReadStats* stats = nullptr) const override;
 
 private:
     const PanoramaPackage* package_ = nullptr;
@@ -128,6 +187,10 @@ public:
     explicit PanoramaDirectoryResourceProvider(std::filesystem::path root);
 
     [[nodiscard]] bool read(std::string_view path, PanoramaResource& out) const override;
+    [[nodiscard]] bool read_view(
+        std::string_view normalized_path,
+        PanoramaResourceView& out,
+        PanoramaResourceReadStats* stats = nullptr) const override;
     [[nodiscard]] std::optional<std::filesystem::path> resolve_file(std::string_view path) const override;
     [[nodiscard]] const std::filesystem::path& root() const noexcept;
 

@@ -17,6 +17,20 @@
 // bridge after it had already had these bugs found and fixed once.
 namespace panorama
 {
+// Geometry is compiled in fixed-size triangle windows below the painter's
+// greedy draw batches. A local vertex table is built for each window, so an
+// edit in one leaf recompiles at most the chunks that reference that leaf
+// instead of replacing the entire oversized batch.
+inline constexpr std::size_t kPanoramaGeometryChunkIndexLimit = 768;
+
+[[nodiscard]] constexpr std::size_t panorama_geometry_chunk_count(std::size_t index_count) noexcept
+{
+    return index_count == 0
+        ? 0
+        : (index_count + kPanoramaGeometryChunkIndexLimit - 1) /
+              kPanoramaGeometryChunkIndexLimit;
+}
+
 // Content signature of a single draw command, scaled by `ui_scale` (geometry is
 // compiled in framebuffer pixels = design pixels * ui_scale, so the same command
 // at a different scale must not collide). Hashes ui_scale + texture + blend_mode
@@ -25,18 +39,19 @@ namespace panorama
 // in place on a signature match (see submit()), so a change to any of them must
 // NOT change the signature (a scissor-only change, for instance, must not force
 // a recompile). Two calls with an identical (command, ui_scale) always hash
-// equal; used by PanoramaGeometryCache to detect commands whose vertex/index
-// content did not change since the previous submit(). Exposed publicly so a
-// host or test can reason about cache behavior directly.
+// equal. PanoramaGeometryCache applies the same content rules to smaller
+// internal chunk signatures; this whole-command form remains exposed so a host
+// or test can reason about draw-list identity directly.
 [[nodiscard]] std::uint64_t panorama_geometry_signature(const PanoramaDrawCommand& command, float ui_scale);
 
 // Optional per-call cost/reuse report for submit() (a nullable out-param so the
 // pre-existing 3-argument call sites are unaffected). `commands` is every
 // non-blur, non-empty command submit() considered (reused + recompiled, plus
 // any that failed to compile); `uploaded_bytes` totals the vertex+index bytes
-// passed to compile_geometry for `recompiled` commands only (a reused command
-// uploads nothing). `hash_us`/`compile_us` are wall time measured with
-// std::chrono around exactly the panorama_geometry_signature and
+// passed to compile_geometry for recompiled chunks only. `chunks` and the
+// chunk-level counters make bounded one-edit amplification observable;
+// `max_chunk_uploaded_bytes` is the largest individual upload. `hash_us`/
+// `compile_us` are wall time around chunk preparation/signature work and
 // compile_geometry calls -- zero clock reads when a submit() call passes no
 // stats pointer, so a host that never profiles pays nothing extra. This type
 // (and submit()'s use of it) intentionally has no dependency on any host
@@ -49,7 +64,12 @@ struct PanoramaGeometrySubmitStats
     int commands = 0;
     int reused = 0;
     int recompiled = 0;
+    int chunks = 0;
+    int reused_chunks = 0;
+    int recompiled_chunks = 0;
+    std::size_t hashed_bytes = 0;
     std::size_t uploaded_bytes = 0;
+    std::size_t max_chunk_uploaded_bytes = 0;
 };
 
 // Owns the previous frame's compiled geometry and either replays it verbatim or
@@ -88,9 +108,10 @@ public:
     bool replay(PanoramaRenderBackend& backend) const;
 
     // Diffs `draw_list`'s commands against the previous submit() (by content
-    // signature -- see panorama_geometry_signature -- compared position by
-    // position) and issues render_geometry/compile_geometry/blur_region calls
-    // through `backend` for every command: unchanged commands are reused as-is
+    // fixed-size chunk signatures using the same content rules as
+    // panorama_geometry_signature) and issues render_geometry/
+    // compile_geometry/blur_region calls through `backend` for every command:
+    // unchanged chunks are reused as-is
     // (their scissor rect, blur params and PanoramaDrawConstants are copied onto
     // the reused entry in place, even if those changed -- see
     // panorama_geometry_signature's comment), changed or new ones are
@@ -158,9 +179,15 @@ public:
     void release();
 
 private:
-    struct Entry
+    struct Chunk
     {
         PanoramaCompiledGeometryHandle geometry = 0;
+        std::uint64_t signature = 0;
+    };
+
+    struct Entry
+    {
+        std::vector<Chunk> chunks;
         PanoramaTextureId texture = 0;
         PanoramaBlendMode blend_mode = PanoramaBlendMode::Normal;
         bool scissor = false;
@@ -169,7 +196,7 @@ private:
         int scissor_width = 0;
         int scissor_height = 0;
         std::uint64_t signature = 0;
-        // Backdrop-blur entry (geometry == 0, carries no compiled geometry):
+        // Backdrop-blur entry (chunks.empty(), carries no compiled geometry):
         // blur_region() the scissor rect in place instead of rendering a quad.
         float blur_std_x = 0.0F;
         float blur_std_y = 0.0F;
@@ -192,7 +219,7 @@ private:
         // `signature` -- same reasoning as `constants` above.
         const PanoramaNode* blur_source_node = nullptr;
 
-        [[nodiscard]] bool is_blur() const { return geometry == 0 && blur_passes > 0; }
+        [[nodiscard]] bool is_blur() const { return chunks.empty() && blur_passes > 0; }
     };
 
     std::vector<Entry> entries_;

@@ -258,12 +258,34 @@ struct PanoramaDrawList
     [[nodiscard]] std::size_t total_indices() const;
 };
 
+// Deterministic structural counters for paint amplification and pruning.
+// Reset at the start of every build that supplies PanoramaPaintScratch.
+struct PanoramaPaintStats
+{
+    std::uint64_t nodes_visited = 0;
+    std::uint64_t empty_clip_subtrees_pruned = 0;
+    std::uint64_t gradient_cells_emitted = 0;
+    std::uint64_t gradient_cells_clipped = 0;
+    std::uint64_t background_tiles_considered = 0;
+    std::uint64_t background_tiles_emitted = 0;
+    std::uint64_t radial_input_triangles = 0;
+    std::uint64_t radial_output_triangles = 0;
+    std::uint64_t radial_orphan_vertices_removed = 0;
+    std::uint64_t radial_scratch_growths = 0;
+    std::uint32_t maximum_rounded_corner_segments = 0;
+};
+
 // Scratch storage for repeated display-list builds. Keeping command buffers alive
 // across frames avoids reallocating every vertex/index vector while animated UI is
 // repainting.
 struct PanoramaPaintScratch
 {
     std::vector<PanoramaDrawCommand> reusable_commands;
+    std::vector<int> radial_indices;
+    std::vector<PanoramaPaintVertex> radial_source_vertices;
+    std::vector<PanoramaPaintVertex> radial_polygon;
+    std::vector<PanoramaPaintVertex> radial_polygon_scratch;
+    PanoramaPaintStats stats;
 };
 
 // A positioned, atlased glyph. Coordinates are relative to the pen position on
@@ -294,6 +316,8 @@ struct PanoramaGlyphSource
     std::function<bool(char32_t codepoint, float font_size, int font_weight, PanoramaGlyph& out)> glyph;
     // Ascent (pixels above baseline) for vertical placement of a text line.
     std::function<float(float font_size, int font_weight)> ascent;
+    // Must match PanoramaTextMeasure::generation for shared artifact lookup.
+    std::uint64_t generation = 0;
     // The texture id of the glyph atlas (passed through on text draw commands).
     PanoramaTextureId atlas_texture = 0;
 };

@@ -54,6 +54,37 @@ std::vector<PanoramaNode*> node_chain(PanoramaNode* node)
     return chain;
 }
 
+PanoramaNode* lowest_common_ancestor(PanoramaNode* first, PanoramaNode* second)
+{
+    std::size_t first_depth = 0;
+    std::size_t second_depth = 0;
+    for (PanoramaNode* node = first; node != nullptr; node = node->parent)
+    {
+        ++first_depth;
+    }
+    for (PanoramaNode* node = second; node != nullptr; node = node->parent)
+    {
+        ++second_depth;
+    }
+
+    while (first_depth > second_depth)
+    {
+        first = first->parent;
+        --first_depth;
+    }
+    while (second_depth > first_depth)
+    {
+        second = second->parent;
+        --second_depth;
+    }
+    while (first != second)
+    {
+        first = first->parent;
+        second = second->parent;
+    }
+    return first;
+}
+
 // Fires onmouseout up the chain left behind and onmouseover down the chain
 // entered (outermost first), skipping the common ancestry.
 void run_pointer_transition_handlers(PanoramaRuntime* runtime, PanoramaNode* old_hit, PanoramaNode* new_hit)
@@ -352,6 +383,12 @@ PanoramaNode* panorama_hit_test(PanoramaNode& root, float x, float y)
     {
         return nullptr;
     }
+    if (root.hit_test_subtree_bounds_valid && !point_inside(root.hit_test_subtree_bounds, x, y))
+    {
+        panorama_record_hit_test_visit(true);
+        return nullptr;
+    }
+    panorama_record_hit_test_visit(false);
     const PanoramaLayoutBox& b = root.layout;
 
     // overflow:scroll containers clip hit testing the way they clip paint
@@ -463,10 +500,11 @@ bool PanoramaInputController::update_pointer(
     if (hit != hover_node_)
     {
         PanoramaNode* old_hover = hover_node_;
+        PanoramaNode* common_ancestor = lowest_common_ancestor(old_hover, hit);
         // Only the nodes whose `hovered` value actually flips are marked dirty:
         // both chains share their ancestry above the divergence point, and those
         // common ancestors keep hovered == true.
-        for (PanoramaNode* n = hover_node_; n != nullptr; n = n->parent)
+        for (PanoramaNode* n = old_hover; n != common_ancestor; n = n->parent)
         {
             if (n->hovered)
             {
@@ -475,7 +513,7 @@ bool PanoramaInputController::update_pointer(
             }
         }
         hover_node_ = hit;
-        for (PanoramaNode* n = hit; n != nullptr; n = n->parent)
+        for (PanoramaNode* n = hit; n != common_ancestor; n = n->parent)
         {
             if (!n->hovered)
             {

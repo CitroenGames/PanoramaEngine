@@ -22,6 +22,9 @@ Useful options:
 - `PANORAMA_BUILD_TESTS=OFF` skips the dedicated standalone API test target and
   CTest registration (this already defaults to off when PanoramaEngine is
   added through `add_subdirectory`).
+- `PANORAMA_BUILD_PERFORMANCE_TESTS=ON` builds and registers the deterministic,
+  headless performance-regression harness. It defaults to `OFF`; see
+  [performance.md](performance.md) for check mode and optional timing output.
 - `PANORAMA_MSVC_STATIC_RUNTIME=OFF` uses CMake's default MSVC runtime. This
   defaults to `ON` for a top-level standalone build (matching sighmake) and
   `OFF` as a subdirectory, so PanoramaEngine follows the surrounding CMake

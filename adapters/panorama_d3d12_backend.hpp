@@ -39,15 +39,18 @@
 //   font_atlas.load(...);                         // uploads the glyph atlas now
 //
 //   // per frame, after OMSetRenderTargets on `cmd`:
-//   backend.new_frame(cmd, fb_width, fb_height);
+//   const auto ui_submission = backend.new_frame(cmd, fb_width, fb_height);
 //   geometry_cache.submit(draw_list, backend, ui_scale);   // or replay(backend)
-//   // ... then the host closes/executes/presents `cmd` as usual.
+//   // ... close `cmd`, then:
+//   queue->ExecuteCommandLists(...);
+//   backend.submit_frame(ui_submission); // MUST follow ExecuteCommandLists
+//   // ... present as usual.
 //
-// Lifetime: geometry/textures the engine releases mid-frame may still be
-// referenced by the previously submitted frame, so this backend defers their
-// destruction until an internal fence (signaled on `queue` each new_frame())
-// proves that frame's GPU work has completed. The host therefore must call
-// new_frame() once per frame for that reclamation to make progress.
+// Lifetime: geometry/textures the engine releases mid-frame are retired against
+// that frame's explicit submission identity. submit_frame() enqueues the
+// backend's fence signal after the host enqueues the command list, so no
+// resource can be reclaimed against a pre-submit signal. If recording is
+// discarded, call abandon_frame() instead.
 //
 // Threading: single-threaded, like the rest of the engine.
 
@@ -104,7 +107,7 @@ public:
     ~PanoramaD3D12Backend() override
     {
         flush(); // wait for the GPU so nothing below is still in use
-        reclaim_trash(fence_->GetCompletedValue());
+        reclaim_trash();
         if (fence_event_ != nullptr)
         {
             CloseHandle(fence_event_);
@@ -118,10 +121,22 @@ public:
     // target on `cmd` (OMSetRenderTargets). `cmd` is the command list the
     // geometry cache's render_geometry calls record into; it must stay open
     // until you finish issuing UI draws. `fb_width`/`fb_height` are the render
-    // target size in pixels. Signals the reclaim fence so deferred-freed GPU
-    // resources from earlier frames can be released once they are safe.
-    void new_frame(ID3D12GraphicsCommandList* cmd, std::uint32_t fb_width, std::uint32_t fb_height)
+    // target size in pixels. The returned identity must be passed to exactly one
+    // of submit_frame() or abandon_frame() before another frame is begun.
+    [[nodiscard]] panorama::PanoramaSubmissionId new_frame(
+        ID3D12GraphicsCommandList* cmd, std::uint32_t fb_width, std::uint32_t fb_height)
     {
+        if (cmd == nullptr)
+        {
+            throw std::runtime_error("PanoramaD3D12Backend: new_frame requires a command list");
+        }
+        poll_completed_submissions();
+        const panorama::PanoramaSubmissionId submission = submissions_.begin_submission();
+        if (!submission)
+        {
+            throw std::runtime_error(
+                "PanoramaD3D12Backend: previous frame was not submitted or abandoned");
+        }
         current_cmd_ = cmd;
         framebuffer_width_ = fb_width;
         framebuffer_height_ = fb_height;
@@ -140,26 +155,106 @@ public:
             0.0F, 0.0F, 0.0F, 1.0F,
         };
 
-        // Signal on the host queue: completion of this value means every frame
-        // submitted before now (whose command lists were already executed) is
-        // done, so their retired resources can be freed.
-        ++fence_value_;
-        check_hr(init_.queue->Signal(fence_.Get(), fence_value_), "queue Signal");
-        reclaim_trash(fence_->GetCompletedValue());
+        invalidate_state_cache();
+        ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
+        current_cmd_->SetDescriptorHeaps(1, heaps);
+        current_cmd_->SetGraphicsRootSignature(root_signature_.Get());
+        current_cmd_->SetGraphicsRoot32BitConstants(0, 16, projection_.data(), 0);
+        current_cmd_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        const D3D12_VIEWPORT viewport{
+            0.0F, 0.0F,
+            static_cast<float>(framebuffer_width_), static_cast<float>(framebuffer_height_),
+            0.0F, 1.0F};
+        current_cmd_->RSSetViewports(1, &viewport);
+
+        return submission;
+    }
+
+    // Call this after recording host-owned graphics state into the same command
+    // list between Panorama draws. The next draw will conservatively rebind all
+    // Panorama-owned dynamic/per-draw state.
+    void invalidate_state_cache() noexcept
+    {
+        bound_pipeline_ = nullptr;
+        bound_srv_.ptr = 0;
+        bound_geometry_ = 0;
+        bound_constants_valid_ = false;
+        bound_scissor_valid_ = false;
+    }
+
+    // Call immediately after the host successfully enqueues the command list
+    // passed to new_frame(). The signal issued here is ordered after that list.
+    [[nodiscard]] panorama::PanoramaSubmissionId submit_frame(
+        panorama::PanoramaSubmissionId submission)
+    {
+        if (!submission || submission != submissions_.recording())
+        {
+            throw std::runtime_error("PanoramaD3D12Backend: submit_frame identity mismatch");
+        }
+        const UINT64 completion_fence = ++fence_value_;
+        check_hr(init_.queue->Signal(fence_.Get(), completion_fence), "Signal(frame completion)");
+        if (!submissions_.mark_submitted(submission))
+        {
+            throw std::runtime_error("PanoramaD3D12Backend: invalid submission transition");
+        }
+        completion_points_.push_back(CompletionPoint{submission, completion_fence});
+        current_cmd_ = nullptr;
+        poll_completed_submissions();
+        return submission;
+    }
+
+    // Call when the command list was not submitted. Retirements conservatively
+    // made against the abandoned recording are rebased to the last real
+    // submission, which is the latest GPU work that could reference them.
+    void abandon_frame(panorama::PanoramaSubmissionId submission)
+    {
+        if (!submission || submission != submissions_.recording())
+        {
+            throw std::runtime_error("PanoramaD3D12Backend: abandon_frame identity mismatch");
+        }
+        const panorama::PanoramaSubmissionId fallback = submissions_.abandon_submission(submission);
+        for (Trash& trash : trash_)
+        {
+            if (trash.retire_after == submission)
+            {
+                trash.retire_after = fallback;
+            }
+        }
+        current_cmd_ = nullptr;
+        reclaim_trash();
     }
 
     // Blocks until all work submitted on the host queue so far has completed.
     void flush()
     {
+        if (const panorama::PanoramaSubmissionId recording = submissions_.recording())
+        {
+            abandon_frame(recording);
+        }
         ++fence_value_;
         if (FAILED(init_.queue->Signal(fence_.Get(), fence_value_)))
         {
             return;
         }
         wait_for_fence(fence_value_);
+        poll_completed_submissions();
     }
 
     // --- PanoramaRenderBackend ------------------------------------------------
+
+    [[nodiscard]] panorama::PanoramaRenderBackendCapabilities capabilities() const noexcept override
+    {
+        return {
+            panorama::kPanoramaRenderBackendContractVersion,
+            static_cast<std::uint32_t>(panorama::PanoramaRenderBackendFeature::DrawConstants) |
+                static_cast<std::uint32_t>(
+                    panorama::PanoramaRenderBackendFeature::ExplicitSubmissionCompletion) |
+                static_cast<std::uint32_t>(
+                    panorama::PanoramaRenderBackendFeature::CombinedGeometryAllocation) |
+                static_cast<std::uint32_t>(
+                    panorama::PanoramaRenderBackendFeature::RedundantStateSuppression),
+        };
+    }
 
     panorama::PanoramaTextureId generate_texture(std::span<const unsigned char> rgba, int width, int height) override
     {
@@ -215,37 +310,43 @@ public:
         std::span<const int> indices,
         float ui_scale) override
     {
-        // render_geometry() is never told ui_scale directly; remember it here so
-        // it can scale a PanoramaDrawConstants translation (design px) the same
-        // way vertex positions are about to be scaled below.
-        ui_scale_ = ui_scale;
         if (vertices.empty() || indices.empty())
         {
             return 0;
         }
         // Geometry is compiled in framebuffer pixels: scale the design-pixel
         // positions by ui_scale to match new_frame()'s projection.
-        std::vector<panorama::PanoramaPaintVertex> scaled(vertices.begin(), vertices.end());
-        for (panorama::PanoramaPaintVertex& vertex : scaled)
-        {
-            vertex.x *= ui_scale;
-            vertex.y *= ui_scale;
-        }
-        std::vector<std::uint32_t> index_data(indices.begin(), indices.end());
-
         Geometry geometry;
-        geometry.index_count = static_cast<UINT>(index_data.size());
-        const UINT64 vertex_bytes = scaled.size() * sizeof(panorama::PanoramaPaintVertex);
-        const UINT64 index_bytes = index_data.size() * sizeof(std::uint32_t);
+        geometry.index_count = static_cast<UINT>(indices.size());
+        geometry.ui_scale = ui_scale;
+        const UINT64 vertex_bytes = vertices.size() * sizeof(panorama::PanoramaPaintVertex);
+        const UINT64 index_bytes = indices.size() * sizeof(std::uint32_t);
+        const UINT64 index_offset = (vertex_bytes + 3U) & ~UINT64{3U};
+        geometry.buffer = create_upload_buffer(index_offset + index_bytes, nullptr);
 
-        geometry.vertex_buffer = create_upload_buffer(vertex_bytes, scaled.data());
-        geometry.index_buffer = create_upload_buffer(index_bytes, index_data.data());
+        std::uint8_t* mapped = nullptr;
+        const D3D12_RANGE no_read{0, 0};
+        check_hr(geometry.buffer->Map(0, &no_read, reinterpret_cast<void**>(&mapped)),
+            "Map(geometry arena)");
+        auto* scaled = reinterpret_cast<panorama::PanoramaPaintVertex*>(mapped);
+        for (std::size_t index = 0; index < vertices.size(); ++index)
+        {
+            scaled[index] = vertices[index];
+            scaled[index].x *= ui_scale;
+            scaled[index].y *= ui_scale;
+        }
+        auto* index_data = reinterpret_cast<std::uint32_t*>(mapped + index_offset);
+        for (std::size_t index = 0; index < indices.size(); ++index)
+        {
+            index_data[index] = static_cast<std::uint32_t>(indices[index]);
+        }
+        geometry.buffer->Unmap(0, nullptr);
 
-        geometry.vertex_view.BufferLocation = geometry.vertex_buffer->GetGPUVirtualAddress();
+        geometry.vertex_view.BufferLocation = geometry.buffer->GetGPUVirtualAddress();
         geometry.vertex_view.SizeInBytes = static_cast<UINT>(vertex_bytes);
         geometry.vertex_view.StrideInBytes = sizeof(panorama::PanoramaPaintVertex);
 
-        geometry.index_view.BufferLocation = geometry.index_buffer->GetGPUVirtualAddress();
+        geometry.index_view.BufferLocation = geometry.buffer->GetGPUVirtualAddress() + index_offset;
         geometry.index_view.SizeInBytes = static_cast<UINT>(index_bytes);
         geometry.index_view.Format = DXGI_FORMAT_R32_UINT;
 
@@ -300,35 +401,46 @@ public:
             }
         }
 
-        ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
-        current_cmd_->SetDescriptorHeaps(1, heaps);
-        current_cmd_->SetGraphicsRootSignature(root_signature_.Get());
-        current_cmd_->SetPipelineState(pipeline_for(current_blend_));
-        current_cmd_->SetGraphicsRoot32BitConstants(0, 16, projection_.data(), 0);
+        ID3D12PipelineState* const pipeline = pipeline_for(current_blend_);
+        if (pipeline != bound_pipeline_)
+        {
+            current_cmd_->SetPipelineState(pipeline);
+            bound_pipeline_ = pipeline;
+        }
         // Per-draw PanoramaDrawConstants, appended after the frame-constant
         // projection in the same root parameter (see create_root_signature).
         // a,b,c,d pass through unscaled; e,f are design px, scaled to
         // framebuffer px like the vertex positions compile_geometry already
         // scaled (see PanoramaDrawConstants's own comment on why only the
         // translation is scaled).
-        const std::array<float, 8> draw_constants{
-            constants.a, constants.b, constants.c, constants.d,
-            constants.e * ui_scale_, constants.f * ui_scale_, constants.opacity, 0.0F,
-        };
-        current_cmd_->SetGraphicsRoot32BitConstants(0, 8, draw_constants.data(), 16);
-        current_cmd_->SetGraphicsRootDescriptorTable(1, srv);
-        current_cmd_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-
-        const D3D12_VIEWPORT viewport{
-            0.0F, 0.0F,
-            static_cast<float>(framebuffer_width_), static_cast<float>(framebuffer_height_),
-            0.0F, 1.0F};
-        current_cmd_->RSSetViewports(1, &viewport);
+        const panorama::PanoramaGpuDrawConstants draw_constants =
+            panorama::panorama_pack_gpu_draw_constants(constants, mesh.ui_scale);
+        if (!bound_constants_valid_ ||
+            std::memcmp(&bound_constants_, &draw_constants, sizeof(draw_constants)) != 0)
+        {
+            current_cmd_->SetGraphicsRoot32BitConstants(0, 8, &draw_constants, 16);
+            bound_constants_ = draw_constants;
+            bound_constants_valid_ = true;
+        }
+        if (srv.ptr != bound_srv_.ptr)
+        {
+            current_cmd_->SetGraphicsRootDescriptorTable(1, srv);
+            bound_srv_ = srv;
+        }
         const D3D12_RECT scissor = current_scissor();
-        current_cmd_->RSSetScissorRects(1, &scissor);
-
-        current_cmd_->IASetVertexBuffers(0, 1, &mesh.vertex_view);
-        current_cmd_->IASetIndexBuffer(&mesh.index_view);
+        if (!bound_scissor_valid_ ||
+            std::memcmp(&bound_scissor_, &scissor, sizeof(scissor)) != 0)
+        {
+            current_cmd_->RSSetScissorRects(1, &scissor);
+            bound_scissor_ = scissor;
+            bound_scissor_valid_ = true;
+        }
+        if (geometry != bound_geometry_)
+        {
+            current_cmd_->IASetVertexBuffers(0, 1, &mesh.vertex_view);
+            current_cmd_->IASetIndexBuffer(&mesh.index_view);
+            bound_geometry_ = geometry;
+        }
         current_cmd_->DrawIndexedInstanced(mesh.index_count, 1, 0, 0, 0);
     }
 
@@ -339,13 +451,10 @@ public:
         {
             return;
         }
-        // Last used by the frame submitted before the most recent new_frame();
-        // defer the buffer release until that frame's fence has passed.
         Trash trash;
-        trash.resource_a = std::move(it->second.vertex_buffer);
-        trash.resource_b = std::move(it->second.index_buffer);
+        trash.resource_a = std::move(it->second.buffer);
         trash.srv_slot = kInvalidSlot;
-        trash.fence_value = fence_value_;
+        trash.retire_after = submissions_.retirement_horizon();
         trash_.push_back(std::move(trash));
         geometries_.erase(it);
     }
@@ -364,20 +473,26 @@ private:
 
     struct Geometry
     {
-        Microsoft::WRL::ComPtr<ID3D12Resource> vertex_buffer;
-        Microsoft::WRL::ComPtr<ID3D12Resource> index_buffer;
+        Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
         D3D12_VERTEX_BUFFER_VIEW vertex_view{};
         D3D12_INDEX_BUFFER_VIEW index_view{};
         UINT index_count = 0;
+        float ui_scale = 1.0F;
     };
 
     // A GPU resource retired while it may still be referenced by an in-flight
-    // frame; freed once `fence_value` completes.
+    // frame; freed once `retire_after` completes.
     struct Trash
     {
         Microsoft::WRL::ComPtr<ID3D12Resource> resource_a;
         Microsoft::WRL::ComPtr<ID3D12Resource> resource_b;
         std::uint32_t srv_slot = kInvalidSlot;
+        panorama::PanoramaSubmissionId retire_after{};
+    };
+
+    struct CompletionPoint
+    {
+        panorama::PanoramaSubmissionId submission{};
         UINT64 fence_value = 0;
     };
 
@@ -461,12 +576,30 @@ private:
         WaitForSingleObject(fence_event_, INFINITE);
     }
 
-    void reclaim_trash(UINT64 completed)
+    void poll_completed_submissions()
+    {
+        const UINT64 completed_fence = fence_->GetCompletedValue();
+        std::size_t completed_points = 0;
+        while (completed_points < completion_points_.size() &&
+               completion_points_[completed_points].fence_value <= completed_fence)
+        {
+            (void)submissions_.mark_completed(completion_points_[completed_points].submission);
+            ++completed_points;
+        }
+        if (completed_points != 0)
+        {
+            completion_points_.erase(
+                completion_points_.begin(), completion_points_.begin() + completed_points);
+        }
+        reclaim_trash();
+    }
+
+    void reclaim_trash()
     {
         std::size_t write = 0;
         for (std::size_t read = 0; read < trash_.size(); ++read)
         {
-            if (trash_[read].fence_value <= completed)
+            if (submissions_.can_reclaim(trash_[read].retire_after))
             {
                 if (trash_[read].srv_slot != kInvalidSlot)
                 {
@@ -491,7 +624,7 @@ private:
         Trash trash;
         trash.resource_a = std::move(texture.resource);
         trash.srv_slot = texture.srv_slot;
-        trash.fence_value = fence_value_;
+        trash.retire_after = submissions_.retirement_horizon();
         trash_.push_back(std::move(trash));
         texture.srv_slot = kInvalidSlot;
     }
@@ -951,11 +1084,11 @@ float4 PSMain(PSInput input) : SV_Target
     std::unordered_map<panorama::PanoramaTextureId, Texture> textures_;
     std::unordered_map<panorama::PanoramaCompiledGeometryHandle, Geometry> geometries_;
     std::vector<Trash> trash_;
+    std::vector<CompletionPoint> completion_points_;
+    panorama::PanoramaSubmissionTracker submissions_;
     Texture white_;
     panorama::PanoramaTextureId next_texture_id_ = 1;
     panorama::PanoramaCompiledGeometryHandle next_geometry_id_ = 1;
-    // ui_scale from the most recent compile_geometry() call (see its comment).
-    float ui_scale_ = 1.0F;
 
     // Per-frame state set by new_frame().
     ID3D12GraphicsCommandList* current_cmd_ = nullptr;
@@ -968,5 +1101,12 @@ float4 PSMain(PSInput input) : SV_Target
     int scissor_y_ = 0;
     int scissor_width_ = 0;
     int scissor_height_ = 0;
+    ID3D12PipelineState* bound_pipeline_ = nullptr;
+    D3D12_GPU_DESCRIPTOR_HANDLE bound_srv_{};
+    panorama::PanoramaCompiledGeometryHandle bound_geometry_ = 0;
+    panorama::PanoramaGpuDrawConstants bound_constants_{};
+    D3D12_RECT bound_scissor_{};
+    bool bound_constants_valid_ = false;
+    bool bound_scissor_valid_ = false;
 };
 }

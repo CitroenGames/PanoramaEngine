@@ -23,6 +23,18 @@ std::vector<PanoramaNodeLifetimeObserver*>& node_lifetime_observers()
     return observers;
 }
 
+struct DomCounterState
+{
+    bool enabled = false;
+    PanoramaDomStructuralCounters counters;
+};
+
+DomCounterState& dom_counter_state()
+{
+    static DomCounterState state;
+    return state;
+}
+
 // Tree guard (see panorama_dom.hpp). Same single-threaded-DOM assumption as the
 // observer registry above.
 struct TreeGuardDestroyedRecord
@@ -673,6 +685,12 @@ private:
 };
 }
 
+struct PanoramaDocumentIndex
+{
+    bool dirty = true;
+    std::unordered_map<std::string, std::vector<PanoramaNode*>> candidates;
+};
+
 void panorama_add_node_lifetime_observer(PanoramaNodeLifetimeObserver& observer)
 {
     auto& observers = node_lifetime_observers();
@@ -688,20 +706,158 @@ void panorama_remove_node_lifetime_observer(PanoramaNodeLifetimeObserver& observ
     observers.erase(std::remove(observers.begin(), observers.end(), &observer), observers.end());
 }
 
+PanoramaNodeLifetimeRegistration::PanoramaNodeLifetimeRegistration(
+    PanoramaNode& node,
+    Callback callback,
+    void* context)
+{
+    bind(node, callback, context);
+}
+
+PanoramaNodeLifetimeRegistration::~PanoramaNodeLifetimeRegistration()
+{
+    reset();
+}
+
+PanoramaNodeLifetimeRegistration::PanoramaNodeLifetimeRegistration(
+    PanoramaNodeLifetimeRegistration&& other) noexcept
+{
+    take_from(other);
+}
+
+PanoramaNodeLifetimeRegistration& PanoramaNodeLifetimeRegistration::operator=(
+    PanoramaNodeLifetimeRegistration&& other) noexcept
+{
+    if (this != &other)
+    {
+        reset();
+        take_from(other);
+    }
+    return *this;
+}
+
+void PanoramaNodeLifetimeRegistration::bind(PanoramaNode& node, Callback callback, void* context)
+{
+    reset();
+    node_ = &node;
+    callback_ = callback;
+    context_ = context;
+    next_ = node.lifetime_registrations;
+    if (next_ != nullptr)
+    {
+        next_->previous_ = this;
+    }
+    node.lifetime_registrations = this;
+}
+
+void PanoramaNodeLifetimeRegistration::reset() noexcept
+{
+    if (node_ != nullptr)
+    {
+        if (previous_ != nullptr)
+        {
+            previous_->next_ = next_;
+        }
+        else
+        {
+            node_->lifetime_registrations = next_;
+        }
+        if (next_ != nullptr)
+        {
+            next_->previous_ = previous_;
+        }
+    }
+    node_ = nullptr;
+    previous_ = nullptr;
+    next_ = nullptr;
+    callback_ = nullptr;
+    context_ = nullptr;
+}
+
+void PanoramaNodeLifetimeRegistration::take_from(PanoramaNodeLifetimeRegistration& other) noexcept
+{
+    node_ = other.node_;
+    previous_ = other.previous_;
+    next_ = other.next_;
+    callback_ = other.callback_;
+    context_ = other.context_;
+    if (node_ != nullptr)
+    {
+        if (previous_ != nullptr)
+        {
+            previous_->next_ = this;
+        }
+        else
+        {
+            node_->lifetime_registrations = this;
+        }
+        if (next_ != nullptr)
+        {
+            next_->previous_ = this;
+        }
+    }
+    other.node_ = nullptr;
+    other.previous_ = nullptr;
+    other.next_ = nullptr;
+    other.callback_ = nullptr;
+    other.context_ = nullptr;
+}
+
+void PanoramaNodeLifetimeRegistration::detach_for_notification() noexcept
+{
+    node_ = nullptr;
+    previous_ = nullptr;
+    next_ = nullptr;
+}
+
+void panorama_enable_dom_structural_counters(bool enabled) noexcept
+{
+    dom_counter_state().enabled = enabled;
+}
+
+void panorama_reset_dom_structural_counters() noexcept
+{
+    dom_counter_state().counters = {};
+}
+
+PanoramaDomStructuralCounters panorama_dom_structural_counters() noexcept
+{
+    return dom_counter_state().counters;
+}
+
+void panorama_record_hit_test_visit(bool pruned) noexcept
+{
+    DomCounterState& state = dom_counter_state();
+    if (!state.enabled)
+    {
+        return;
+    }
+    if (pruned)
+    {
+        ++state.counters.hit_test_subtrees_pruned;
+    }
+    else
+    {
+        ++state.counters.hit_test_nodes_visited;
+    }
+}
+
 PanoramaScopedNodeWatch::PanoramaScopedNodeWatch(std::vector<PanoramaNode*> nodes)
     : nodes_(std::move(nodes))
 {
-    panorama_add_node_lifetime_observer(*this);
+    registrations_.reserve(nodes_.size());
+    for (PanoramaNode*& node : nodes_)
+    {
+        if (node != nullptr)
+        {
+            registrations_.emplace_back(*node, &PanoramaScopedNodeWatch::null_slot, &node);
+        }
+    }
 }
 
-PanoramaScopedNodeWatch::~PanoramaScopedNodeWatch()
+void PanoramaScopedNodeWatch::null_slot(void* context, PanoramaNode&)
 {
-    panorama_remove_node_lifetime_observer(*this);
-}
-
-void PanoramaScopedNodeWatch::on_panorama_node_destroyed(PanoramaNode& node)
-{
-    std::replace(nodes_.begin(), nodes_.end(), &node, static_cast<PanoramaNode*>(nullptr));
+    *static_cast<PanoramaNode**>(context) = nullptr;
 }
 
 bool panorama_debug_tree_guard_enabled()
@@ -765,6 +921,8 @@ const PanoramaNode* panorama_debug_scan_dead_links(const PanoramaNode& root, std
     return nullptr;
 }
 
+PanoramaNode::PanoramaNode() = default;
+
 PanoramaNode::~PanoramaNode()
 {
     // Notify before members are destroyed: observers see a node whose identity
@@ -774,12 +932,46 @@ PanoramaNode::~PanoramaNode()
     {
         tree_guard_record_destroyed(*this);
     }
-    for (PanoramaNodeLifetimeObserver* observer : node_lifetime_observers())
+
+    // Detach before invoking: callbacks may destroy their own registration or
+    // other registrations attached to this node.
+    while (lifetime_registrations != nullptr)
     {
+        PanoramaNodeLifetimeRegistration* registration = lifetime_registrations;
+        lifetime_registrations = registration->next_;
+        if (lifetime_registrations != nullptr)
+        {
+            lifetime_registrations->previous_ = nullptr;
+        }
+        const PanoramaNodeLifetimeRegistration::Callback callback = registration->callback_;
+        void* context = registration->context_;
+        registration->detach_for_notification();
+        if (dom_counter_state().enabled)
+        {
+            ++dom_counter_state().counters.lifetime_attached_callbacks;
+        }
+        if (callback != nullptr)
+        {
+            callback(context, *this);
+        }
+    }
+
+    // Compatibility observers remain supported, but built-in variable-size
+    // registries use exact links above so their teardown does not rescan.
+    const std::vector<PanoramaNodeLifetimeObserver*> observers = node_lifetime_observers();
+    for (PanoramaNodeLifetimeObserver* observer : observers)
+    {
+        if (dom_counter_state().enabled)
+        {
+            ++dom_counter_state().counters.lifetime_global_callbacks;
+        }
         observer->on_panorama_node_destroyed(*this);
     }
     debug_liveness = kLivenessDead;
 }
+
+PanoramaNode::PanoramaNode(PanoramaNode&&) noexcept = default;
+PanoramaNode& PanoramaNode::operator=(PanoramaNode&&) noexcept = default;
 
 bool PanoramaNode::has_class(std::string_view klass) const
 {
@@ -789,12 +981,21 @@ bool PanoramaNode::has_class(std::string_view klass) const
 void PanoramaNode::mark_style_dirty()
 {
     style_dirty = true;
+    invalidate_hit_test_bounds();
     // Invariant: descendant_style_dirty set => set on every ancestor too, so the
     // upward walk can stop at the first already-flagged node.
     for (PanoramaNode* ancestor = parent; ancestor != nullptr && !ancestor->descendant_style_dirty;
          ancestor = ancestor->parent)
     {
         ancestor->descendant_style_dirty = true;
+    }
+}
+
+void PanoramaNode::invalidate_hit_test_bounds() noexcept
+{
+    for (PanoramaNode* node = this; node != nullptr; node = node->parent)
+    {
+        node->hit_test_subtree_bounds_valid = false;
     }
 }
 
@@ -1019,6 +1220,7 @@ void ensure_panorama_selection_control_internals(PanoramaNode& node)
         box->classes.emplace_back(box_class);
         box->parent = &node;
         node.children.insert(node.children.begin(), std::move(box));
+        panorama_notify_tree_structure_changed(node);
         node.mark_style_dirty();
     }
 
@@ -1034,6 +1236,7 @@ void ensure_panorama_selection_control_internals(PanoramaNode& node)
             owned->parent = &node;
             label = owned.get();
             node.children.push_back(std::move(owned));
+            panorama_notify_tree_structure_changed(node);
             node.mark_style_dirty();
         }
         if (label->text != node.text)
@@ -1080,6 +1283,7 @@ PanoramaNode& append_child_node(PanoramaNode& parent, const char* tag, const cha
     owned->parent = &parent;
     PanoramaNode& ref = *owned;
     parent.children.push_back(std::move(owned));
+    panorama_notify_tree_structure_changed(parent);
     return ref;
 }
 } // namespace
@@ -1326,6 +1530,7 @@ void append_scrollbar(PanoramaNode& node, const char* tag, const char* tag_lower
 
     // Appended last so the chrome paints over the scrolled content.
     node.children.push_back(std::move(bar));
+    panorama_notify_tree_structure_changed(node);
     node.mark_style_dirty();
 }
 }
@@ -1555,6 +1760,7 @@ void ensure_panorama_text_entry_placeholders(PanoramaNode& root, const PanoramaL
                 owned->parent = &root;
                 placeholder = owned.get();
                 root.children.push_back(std::move(owned));
+                panorama_notify_tree_structure_changed(root);
             }
             placeholder->text = localize ? localize(placeholder_attr->second) : placeholder_attr->second;
         }
@@ -1567,20 +1773,149 @@ void ensure_panorama_text_entry_placeholders(PanoramaNode& root, const PanoramaL
     }
 }
 
-PanoramaNode* PanoramaNode::find_by_id(std::string_view target_id)
+namespace
 {
-    if (id == target_id)
+PanoramaNode* tree_root(PanoramaNode& node)
+{
+    PanoramaNode* root = &node;
+    while (root->parent != nullptr)
     {
-        return this;
+        root = root->parent;
     }
-    for (const auto& child : children)
+    return root;
+}
+
+bool is_in_subtree(const PanoramaNode& candidate, const PanoramaNode& scope)
+{
+    for (const PanoramaNode* node = &candidate; node != nullptr; node = node->parent)
     {
-        if (PanoramaNode* found = child->find_by_id(target_id))
+        if (node == &scope)
         {
-            return found;
+            return true;
+        }
+    }
+    return false;
+}
+
+PanoramaNode* find_by_id_unindexed(PanoramaNode& scope, std::string_view target_id)
+{
+    std::vector<PanoramaNode*> stack;
+    stack.push_back(&scope);
+    while (!stack.empty())
+    {
+        PanoramaNode* node = stack.back();
+        stack.pop_back();
+        if (node->id == target_id)
+        {
+            return node;
+        }
+        for (auto child = node->children.rbegin(); child != node->children.rend(); ++child)
+        {
+            stack.push_back(child->get());
         }
     }
     return nullptr;
+}
+
+void rebuild_document_index(PanoramaNode& root, PanoramaDocumentIndex& index)
+{
+    index.candidates.clear();
+    std::vector<PanoramaNode*> stack;
+    stack.push_back(&root);
+    while (!stack.empty())
+    {
+        PanoramaNode* node = stack.back();
+        stack.pop_back();
+        if (!node->id.empty())
+        {
+            index.candidates[node->id].push_back(node);
+        }
+        if (dom_counter_state().enabled)
+        {
+            ++dom_counter_state().counters.id_index_rebuild_nodes;
+        }
+        for (auto child = node->children.rbegin(); child != node->children.rend(); ++child)
+        {
+            stack.push_back(child->get());
+        }
+    }
+    index.dirty = false;
+}
+}
+
+PanoramaNode* PanoramaNode::find_by_id(std::string_view target_id)
+{
+    // Empty IDs are unusual and potentially shared by most of the tree; keep
+    // their exact historical DFS semantics without bloating the index.
+    if (target_id.empty())
+    {
+        return find_by_id_unindexed(*this, target_id);
+    }
+
+    PanoramaNode* root = tree_root(*this);
+    if (!root->document_index)
+    {
+        root->document_index = std::make_unique<PanoramaDocumentIndex>();
+    }
+    PanoramaDocumentIndex& index = *root->document_index;
+    if (index.dirty)
+    {
+        rebuild_document_index(*root, index);
+    }
+    const auto found = index.candidates.find(std::string(target_id));
+    if (found == index.candidates.end())
+    {
+        return nullptr;
+    }
+    for (PanoramaNode* candidate : found->second)
+    {
+        if (dom_counter_state().enabled)
+        {
+            ++dom_counter_state().counters.id_index_candidate_checks;
+        }
+        if (is_in_subtree(*candidate, *this))
+        {
+            return candidate;
+        }
+    }
+    return nullptr;
+}
+
+const PanoramaNode* PanoramaNode::find_by_id(std::string_view target_id) const
+{
+    return const_cast<PanoramaNode*>(this)->find_by_id(target_id);
+}
+
+void PanoramaNode::set_id(std::string new_id)
+{
+    if (id == new_id)
+    {
+        return;
+    }
+    id = std::move(new_id);
+    PanoramaNode* root = tree_root(*this);
+    if (root->document_index)
+    {
+        root->document_index->dirty = true;
+    }
+    mark_style_dirty();
+}
+
+void panorama_notify_tree_structure_changed(PanoramaNode& node) noexcept
+{
+    PanoramaNode* previous = nullptr;
+    for (const auto& child : node.children)
+    {
+        child->parent = &node;
+        child->previous_sibling_node = previous;
+        previous = child.get();
+    }
+    node.invalidate_hit_test_bounds();
+    PanoramaNode* root = tree_root(node);
+    if (root->document_index)
+    {
+        root->document_index->dirty = true;
+    }
 }
 
 PanoramaNode* PanoramaDocument::find_by_id(std::string_view target_id) const
@@ -1591,6 +1926,21 @@ PanoramaNode* PanoramaDocument::find_by_id(std::string_view target_id) const
 PanoramaDocument parse_panorama_xml(std::string_view xml)
 {
     XmlParser parser(xml);
-    return parser.run();
+    PanoramaDocument document = parser.run();
+    if (document.root != nullptr)
+    {
+        std::vector<PanoramaNode*> pending{document.root.get()};
+        while (!pending.empty())
+        {
+            PanoramaNode* parent = pending.back();
+            pending.pop_back();
+            panorama_notify_tree_structure_changed(*parent);
+            for (const auto& child : parent->children)
+            {
+                pending.push_back(child.get());
+            }
+        }
+    }
+    return document;
 }
 }

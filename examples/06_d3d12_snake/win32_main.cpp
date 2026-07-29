@@ -895,7 +895,7 @@ public:
         snake_renderer.record(command_list_.Get(), frame_index_, width_, height_, game);
 
         // Panorama is a second pass used only for the transparent HUD/menu.
-        backend.new_frame(
+        const panorama::PanoramaSubmissionId ui_submission = backend.new_frame(
             command_list_.Get(), static_cast<std::uint32_t>(width_), static_cast<std::uint32_t>(height_));
         if (draw_list_changed || !geometry_cache.replay(backend))
         {
@@ -913,6 +913,7 @@ public:
 
         ID3D12CommandList* command_lists[] = {command_list_.Get()};
         queue_->ExecuteCommandLists(1, command_lists);
+        (void)backend.submit_frame(ui_submission);
         check_hr(swap_chain_->Present(1, 0), "IDXGISwapChain::Present");
 
         const UINT submitted_frame = frame_index_;

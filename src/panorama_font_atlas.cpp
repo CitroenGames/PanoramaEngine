@@ -431,7 +431,12 @@ struct PanoramaFontAtlas::Impl
         std::vector<unsigned char> memory;
         int weight = 400;
         int current_pixel_size = 0;
-        std::unordered_map<int, Metrics> metrics;
+        struct MetricEntry
+        {
+            Metrics value;
+            std::uint64_t last_use = 0;
+        };
+        std::unordered_map<int, MetricEntry> metrics;
     };
 
     FT_Library library = nullptr;
@@ -445,11 +450,20 @@ struct PanoramaFontAtlas::Impl
     int pen_y = kGlyphPadding;
     int row_height = 0;
     bool dirty = false;
+    bool dirty_full_page = false;
     bool atlas_full_logged = false;
     PanoramaTextureId texture = 0;
     PanoramaRenderBackend* texture_backend = nullptr;
 
     std::unordered_map<std::uint64_t, GlyphRecord> glyphs;
+    std::vector<PanoramaFontAtlasDirtyRect> dirty_rects;
+    PanoramaFontAtlasCacheBudgets budgets;
+    bool counters_enabled = false;
+    PanoramaFontAtlasStats counters;
+    std::uint64_t cache_clock = 0;
+    std::uint64_t metric_generation = 1;
+    std::uint64_t atlas_page_generation = 1;
+    std::uint64_t atlas_content_generation = 0;
 
     // Text-width cache (WebCore platform/graphics/WidthCache.h): the same label
     // strings are re-measured every layout pass (continuously while transitions
@@ -461,11 +475,12 @@ struct PanoramaFontAtlas::Impl
         float font_size = 0.0F;
         int font_weight = 0;
         float letter_spacing = 0.0F;
+        std::uint64_t generation = 0;
 
         bool operator==(const MeasureKey& other) const
         {
             return font_size == other.font_size && font_weight == other.font_weight &&
-                   letter_spacing == other.letter_spacing && text == other.text;
+                   letter_spacing == other.letter_spacing && generation == other.generation && text == other.text;
         }
     };
     struct MeasureKeyHash
@@ -476,10 +491,18 @@ struct PanoramaFontAtlas::Impl
             hash ^= std::hash<float>{}(key.font_size) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
             hash ^= std::hash<int>{}(key.font_weight) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
             hash ^= std::hash<float>{}(key.letter_spacing) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+            hash ^= std::hash<std::uint64_t>{}(key.generation) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
             return hash;
         }
     };
-    std::unordered_map<MeasureKey, std::pair<float, float>, MeasureKeyHash> measure_cache;
+    struct MeasureEntry
+    {
+        std::pair<float, float> value;
+        std::size_t bytes = 0;
+        std::uint64_t last_use = 0;
+    };
+    std::unordered_map<MeasureKey, MeasureEntry, MeasureKeyHash> measure_cache;
+    std::size_t measure_cache_bytes = 0;
     ~Impl()
     {
         release_texture();
@@ -514,6 +537,90 @@ struct PanoramaFontAtlas::Impl
     }
 
     [[nodiscard]] bool loaded() const { return !faces.empty(); }
+
+    void record_dirty_rect(int x, int y, int width, int height)
+    {
+        if (width <= 0 || height <= 0)
+        {
+            return;
+        }
+        ++atlas_content_generation;
+        dirty = true;
+        if (counters_enabled)
+        {
+            counters.dirty_pixels += static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height);
+        }
+        if (dirty_full_page)
+        {
+            return;
+        }
+        PanoramaFontAtlasDirtyRect incoming{x, y, width, height};
+        // Adjacent glyph rectangles in the same packed row become one upload
+        // region; keep disjoint rows separate for a future regional backend.
+        if (!dirty_rects.empty())
+        {
+            PanoramaFontAtlasDirtyRect& last = dirty_rects.back();
+            const bool same_rows = last.y == incoming.y && last.height == incoming.height;
+            if (same_rows && incoming.x <= last.x + last.width + kGlyphPadding)
+            {
+                const int right = std::max(last.x + last.width, incoming.x + incoming.width);
+                last.x = std::min(last.x, incoming.x);
+                last.width = right - last.x;
+                return;
+            }
+        }
+        dirty_rects.push_back(incoming);
+    }
+
+    void mark_full_page_dirty()
+    {
+        dirty = true;
+        dirty_full_page = true;
+        dirty_rects.clear();
+        dirty_rects.push_back({0, 0, atlas_size, atlas_size});
+        ++atlas_content_generation;
+        if (counters_enabled)
+        {
+            counters.dirty_pixels +=
+                static_cast<std::uint64_t>(atlas_size) * static_cast<std::uint64_t>(atlas_size);
+        }
+    }
+
+    void reset_atlas_page()
+    {
+        std::fill(atlas_rgba.begin(), atlas_rgba.end(), 0);
+        glyphs.clear();
+        pen_x = kGlyphPadding;
+        pen_y = kGlyphPadding;
+        row_height = 0;
+        atlas_full_logged = false;
+        ++atlas_page_generation;
+        if (counters_enabled)
+        {
+            ++counters.atlas_page_resets;
+        }
+        mark_full_page_dirty();
+    }
+
+    void evict_measure_cache_to_budget()
+    {
+        while ((!measure_cache.empty() && measure_cache.size() > budgets.measure_entries) ||
+            (!measure_cache.empty() && measure_cache_bytes > budgets.measure_bytes))
+        {
+            const auto oldest = std::min_element(measure_cache.begin(), measure_cache.end(),
+                [](const auto& a, const auto& b) { return a.second.last_use < b.second.last_use; });
+            if (oldest == measure_cache.end())
+            {
+                break;
+            }
+            measure_cache_bytes -= oldest->second.bytes;
+            measure_cache.erase(oldest);
+            if (counters_enabled)
+            {
+                ++counters.measure_evictions;
+            }
+        }
+    }
 
     [[nodiscard]] int pixel_size(float font_size) const
     {
@@ -595,7 +702,8 @@ struct PanoramaFontAtlas::Impl
         }
         if (const auto it = font->metrics.find(size); it != font->metrics.end())
         {
-            return it->second;
+            it->second.last_use = ++cache_clock;
+            return it->second.value;
         }
 
         Metrics result;
@@ -612,7 +720,24 @@ struct PanoramaFontAtlas::Impl
         {
             result.line_height_px = static_cast<float>(size) * 1.2F;
         }
-        font->metrics.emplace(size, result);
+        if (budgets.metrics_per_face == 0)
+        {
+            return result;
+        }
+        if (font->metrics.size() >= budgets.metrics_per_face)
+        {
+            const auto oldest = std::min_element(font->metrics.begin(), font->metrics.end(),
+                [](const auto& a, const auto& b) { return a.second.last_use < b.second.last_use; });
+            if (oldest != font->metrics.end())
+            {
+                font->metrics.erase(oldest);
+                if (counters_enabled)
+                {
+                    ++counters.metrics_evictions;
+                }
+            }
+        }
+        font->metrics.emplace(size, FontFace::MetricEntry{result, ++cache_clock});
         return result;
     }
 
@@ -655,7 +780,7 @@ struct PanoramaFontAtlas::Impl
         {
             update_record_uvs(record);
         }
-        dirty = true;
+        mark_full_page_dirty();
         return true;
     }
 
@@ -712,7 +837,7 @@ struct PanoramaFontAtlas::Impl
         update_record_uvs(record);
         pen_x += width + kGlyphPadding;
         row_height = std::max(row_height, height);
-        dirty = true;
+        record_dirty_rect(record.atlas_x, record.atlas_y, width, height);
         return true;
     }
 
@@ -728,7 +853,15 @@ struct PanoramaFontAtlas::Impl
         const std::uint64_t key = glyph_key(codepoint, size, font->weight);
         if (const auto it = glyphs.find(key); it != glyphs.end())
         {
+            if (counters_enabled)
+            {
+                ++counters.glyph_hits;
+            }
             return &it->second;
+        }
+        if (counters_enabled)
+        {
+            ++counters.glyph_misses;
         }
 
         if (codepoint == '\n' || codepoint == '\r')
@@ -817,9 +950,19 @@ struct PanoramaFontAtlas::Impl
         key.font_size = font_size;
         key.font_weight = font_weight;
         key.letter_spacing = letter_spacing;
+        key.generation = metric_generation;
         if (const auto cached = measure_cache.find(key); cached != measure_cache.end())
         {
-            return cached->second;
+            cached->second.last_use = ++cache_clock;
+            if (counters_enabled)
+            {
+                ++counters.measure_hits;
+            }
+            return cached->second.value;
+        }
+        if (counters_enabled)
+        {
+            ++counters.measure_misses;
         }
 
         const float letter_spacing_px = letter_spacing * ui_scale;
@@ -867,13 +1010,63 @@ struct PanoramaFontAtlas::Impl
         const float safe_scale = std::max(0.1F, ui_scale);
         const std::pair<float, float> result{
             max_width_px / safe_scale, (metric.line_height_px * static_cast<float>(lines)) / safe_scale};
-        constexpr std::size_t kMeasureCacheMaxEntries = 8192;
-        if (measure_cache.size() >= kMeasureCacheMaxEntries)
+        if (budgets.measure_entries != 0 && budgets.measure_bytes != 0)
         {
-            measure_cache.clear();
+            const std::size_t entry_bytes = sizeof(MeasureEntry) + sizeof(MeasureKey) + key.text.capacity();
+            auto [inserted, was_inserted] =
+                measure_cache.emplace(std::move(key), MeasureEntry{result, entry_bytes, ++cache_clock});
+            if (was_inserted)
+            {
+                measure_cache_bytes += inserted->second.bytes;
+            }
+            evict_measure_cache_to_budget();
         }
-        measure_cache.emplace(std::move(key), result);
         return result;
+    }
+
+    float shape_text(std::string_view text, float font_size, int font_weight, float letter_spacing,
+        std::vector<PanoramaTextShapedGlyph>& shaped)
+    {
+        const int size = pixel_size(font_size);
+        const Metrics metric = metrics_for(font_size, font_weight);
+        FontFace* font = face_for_weight(font_weight);
+        const float letter_spacing_px = letter_spacing * ui_scale;
+        const float safe_scale = std::max(0.1F, ui_scale);
+        FT_UInt previous_index = 0;
+        std::size_t offset = 0;
+        while (offset < text.size())
+        {
+            const std::size_t begin = offset;
+            const char32_t codepoint = next_codepoint(text, offset);
+            if (codepoint == '\n')
+            {
+                shaped.push_back({codepoint, begin, offset, 0.0F, 0.0F});
+                previous_index = 0;
+                continue;
+            }
+            const GlyphRecord* glyph = ensure_glyph_record(codepoint, font_size, font_weight);
+            if (glyph == nullptr)
+            {
+                shaped.push_back({codepoint, begin, offset, 0.0F, 0.0F});
+                previous_index = 0;
+                continue;
+            }
+            float kerning_px = 0.0F;
+            if (font != nullptr && FT_HAS_KERNING(font->face) && previous_index != 0 &&
+                glyph->glyph_index != 0 && set_size(*font, size))
+            {
+                FT_Vector kern{};
+                if (FT_Get_Kerning(font->face, previous_index, glyph->glyph_index, FT_KERNING_DEFAULT, &kern) == 0)
+                {
+                    kerning_px = static_cast<float>(kern.x) / 64.0F;
+                }
+            }
+            shaped.push_back({codepoint, begin, offset,
+                (kerning_px + glyph->advance_px + letter_spacing_px) / safe_scale,
+                kerning_px / safe_scale});
+            previous_index = glyph->glyph_index;
+        }
+        return metric.line_height_px / safe_scale;
     }
 
     void ensure_tree_text(PanoramaNode& node)
@@ -951,20 +1144,44 @@ struct PanoramaFontAtlas::Impl
 
         if (PanoramaRenderBackend* backend = panorama_render_backend())
         {
+            const std::span<const unsigned char> pixels(atlas_rgba.data(), atlas_rgba.size());
+            if (texture != 0 && texture_backend == backend &&
+                backend->update_texture(texture, pixels, atlas_size, atlas_size))
+            {
+                if (counters_enabled)
+                {
+                    ++counters.in_place_uploads;
+                    counters.uploaded_bytes += atlas_rgba.size();
+                }
+                dirty = false;
+                dirty_full_page = false;
+                dirty_rects.clear();
+                return;
+            }
+
             const PanoramaTextureId new_texture =
-                backend->generate_texture(std::span<const unsigned char>(atlas_rgba.data(), atlas_rgba.size()),
-                    atlas_size,
-                    atlas_size);
+                backend->generate_texture(pixels, atlas_size, atlas_size);
             if (new_texture == 0)
             {
                 pano_log_warning("Panorama font atlas: backend GenerateTexture failed");
                 return;
             }
 
+            if (texture != 0 && counters_enabled)
+            {
+                ++counters.texture_replacements;
+            }
             release_texture();
             texture = new_texture;
             texture_backend = backend;
+            if (counters_enabled)
+            {
+                ++counters.full_uploads;
+                counters.uploaded_bytes += atlas_rgba.size();
+            }
             dirty = false;
+            dirty_full_page = false;
+            dirty_rects.clear();
             return;
         }
 
@@ -1155,10 +1372,87 @@ void PanoramaFontAtlas::set_ui_scale(float ui_scale)
     const float clamped = std::clamp(ui_scale, 0.1F, 8.0F);
     if (clamped != impl_->ui_scale)
     {
-        // Pixel sizes, advances, and kerning all change with the scale.
-        impl_->measure_cache.clear();
+        // Pixel sizes, advances, hinting and UV residency all change with the
+        // scale. Retain old width entries under their metric generation until
+        // the LRU budget evicts them; reclaim the single atlas page immediately
+        // so old pixel-size glyphs cannot strand its fixed memory.
+        impl_->ui_scale = clamped;
+        ++impl_->metric_generation;
+        impl_->reset_atlas_page();
     }
-    impl_->ui_scale = clamped;
+}
+
+void PanoramaFontAtlas::set_cache_budgets(PanoramaFontAtlasCacheBudgets budgets)
+{
+    impl_->budgets = budgets;
+    impl_->evict_measure_cache_to_budget();
+    for (Impl::FontFace& face : impl_->faces)
+    {
+        while (face.metrics.size() > budgets.metrics_per_face)
+        {
+            const auto oldest = std::min_element(face.metrics.begin(), face.metrics.end(),
+                [](const auto& a, const auto& b) { return a.second.last_use < b.second.last_use; });
+            if (oldest == face.metrics.end())
+            {
+                break;
+            }
+            face.metrics.erase(oldest);
+            if (impl_->counters_enabled)
+            {
+                ++impl_->counters.metrics_evictions;
+            }
+        }
+    }
+}
+
+PanoramaFontAtlasCacheBudgets PanoramaFontAtlas::cache_budgets() const
+{
+    return impl_->budgets;
+}
+
+void PanoramaFontAtlas::enable_counters(bool enabled)
+{
+    impl_->counters_enabled = enabled;
+}
+
+void PanoramaFontAtlas::reset_counters()
+{
+    impl_->counters = {};
+}
+
+PanoramaFontAtlasStats PanoramaFontAtlas::stats() const
+{
+    return impl_->counters;
+}
+
+std::uint64_t PanoramaFontAtlas::metric_generation() const
+{
+    return impl_->metric_generation;
+}
+
+std::uint64_t PanoramaFontAtlas::atlas_page_generation() const
+{
+    return impl_->atlas_page_generation;
+}
+
+std::uint64_t PanoramaFontAtlas::atlas_content_generation() const
+{
+    return impl_->atlas_content_generation;
+}
+
+int PanoramaFontAtlas::atlas_width() const
+{
+    return impl_->atlas_size;
+}
+
+int PanoramaFontAtlas::atlas_height() const
+{
+    return impl_->atlas_size;
+}
+
+std::span<const PanoramaFontAtlasDirtyRect> PanoramaFontAtlas::dirty_rects() const
+{
+    return impl_->dirty_rects;
 }
 
 PanoramaTextMeasure PanoramaFontAtlas::text_measure()
@@ -1167,6 +1461,11 @@ PanoramaTextMeasure PanoramaFontAtlas::text_measure()
     measure.measure = [this](std::string_view text, float font_size, int font_weight, float letter_spacing) {
         return impl_->measure_text(text, font_size, font_weight, letter_spacing);
     };
+    measure.shape = [this](std::string_view text, float font_size, int font_weight, float letter_spacing,
+                        std::vector<PanoramaTextShapedGlyph>& glyphs) {
+        return impl_->shape_text(text, font_size, font_weight, letter_spacing, glyphs);
+    };
+    measure.generation = [this] { return impl_->metric_generation; };
     return measure;
 }
 
@@ -1189,6 +1488,7 @@ PanoramaGlyphSource PanoramaFontAtlas::glyph_source() const
     }
 
     source.atlas_texture = impl_->texture;
+    source.generation = impl_->metric_generation;
     source.ascent = [this](float font_size, int font_weight) {
         const Impl::Metrics metric = impl_->metrics_for(font_size, font_weight);
         return metric.ascent_px / std::max(0.1F, impl_->ui_scale);

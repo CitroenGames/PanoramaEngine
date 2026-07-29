@@ -767,13 +767,20 @@ void capture_node_values(PanoramaNode& node)
     }
 }
 
-void capture_node(PanoramaNode& node)
+void capture_node(PanoramaNode& node, PanoramaAnimCaptureResult* result)
 {
     node.style_fresh = false;
     capture_node_values(node);
+    if (result != nullptr)
+    {
+        result->any_transition_animating =
+            result->any_transition_animating || node.anim.any_channel_animating();
+        result->any_keyframe_candidate = result->any_keyframe_candidate ||
+            !node.computed.animation_name.empty() || !node.keyframe_anim.active_name.empty();
+    }
     for (const auto& child : node.children)
     {
-        capture_node(*child);
+        capture_node(*child, result);
     }
 }
 
@@ -834,8 +841,12 @@ void mark_recomposite_dirty(PanoramaNode& node, PanoramaRecompositeDirtyTracker*
 // still advances its timelines/values normally but reports no dirt (see the
 // suppression block below).
 PanoramaAnimationAdvanceResult advance_node(PanoramaNode& node, float dt, std::vector<PanoramaTransitionEnd>& ends,
-    PanoramaRecompositeDirtyTracker* dirty_tracker, bool ancestor_unreachable)
+    PanoramaRecompositeDirtyTracker* dirty_tracker, PanoramaAnimationWorkStats* work_stats, bool ancestor_unreachable)
 {
+    if (work_stats != nullptr)
+    {
+        ++work_stats->transition_nodes_visited;
+    }
     PanoramaAnimState& a = node.anim;
     PanoramaAnimationAdvanceResult result;
 
@@ -853,7 +864,7 @@ PanoramaAnimationAdvanceResult advance_node(PanoramaNode& node, float dt, std::v
         const bool unreachable = ancestor_unreachable || panorama_node_paint_unreachable(node);
         for (const auto& child : node.children)
         {
-            merge_result(result, advance_node(*child, dt, ends, dirty_tracker, unreachable));
+            merge_result(result, advance_node(*child, dt, ends, dirty_tracker, work_stats, unreachable));
         }
         return result;
     }
@@ -1087,7 +1098,7 @@ PanoramaAnimationAdvanceResult advance_node(PanoramaNode& node, float dt, std::v
 
     for (const auto& child : node.children)
     {
-        merge_result(result, advance_node(*child, dt, ends, dirty_tracker, unreachable));
+        merge_result(result, advance_node(*child, dt, ends, dirty_tracker, work_stats, unreachable));
     }
 
     return result;
@@ -1096,7 +1107,14 @@ PanoramaAnimationAdvanceResult advance_node(PanoramaNode& node, float dt, std::v
 
 void panorama_capture_anim_targets(PanoramaNode& root)
 {
-    capture_node(root);
+    capture_node(root, nullptr);
+}
+
+PanoramaAnimCaptureResult panorama_capture_anim_targets_with_result(PanoramaNode& root)
+{
+    PanoramaAnimCaptureResult result;
+    capture_node(root, &result);
+    return result;
 }
 
 PanoramaAnimCaptureResult panorama_capture_anim_targets_recomputed(PanoramaNode& root)
@@ -1117,10 +1135,11 @@ void panorama_sync_anim_dimensions(PanoramaNode& node)
     a.height = PanoramaPropAnim{};
 }
 
-PanoramaAnimationAdvanceResult panorama_advance_anim(PanoramaNode& root, float dt, PanoramaRecompositeDirtyTracker* dirty_tracker)
+PanoramaAnimationAdvanceResult panorama_advance_anim(PanoramaNode& root, float dt,
+    PanoramaRecompositeDirtyTracker* dirty_tracker, PanoramaAnimationWorkStats* work_stats)
 {
     std::vector<PanoramaTransitionEnd> ends;
-    PanoramaAnimationAdvanceResult result = advance_node(root, dt, ends, dirty_tracker, false);
+    PanoramaAnimationAdvanceResult result = advance_node(root, dt, ends, dirty_tracker, work_stats, false);
     result.transition_ends = std::move(ends);
     return result;
 }
@@ -1375,8 +1394,13 @@ KeyframeApplyResult apply_keyframes_at(
 // without needing to share call state.
 PanoramaAnimationAdvanceResult advance_keyframe_node(PanoramaNode& node,
     const std::unordered_map<std::string, PanoramaKeyframes>& registry, float dt, std::uint64_t sheet_instance,
-    std::uint64_t sheet_generation, PanoramaRecompositeDirtyTracker* dirty_tracker, bool ancestor_unreachable)
+    std::uint64_t sheet_generation, PanoramaRecompositeDirtyTracker* dirty_tracker,
+    PanoramaAnimationWorkStats* work_stats, bool ancestor_unreachable)
 {
+    if (work_stats != nullptr)
+    {
+        ++work_stats->keyframe_nodes_visited;
+    }
     PanoramaAnimationAdvanceResult result;
     PanoramaNode::PanoramaKeyframeRuntime& runtime = node.keyframe_anim;
     const PanoramaComputedStyle& style = node.computed;
@@ -1390,7 +1414,7 @@ PanoramaAnimationAdvanceResult advance_keyframe_node(PanoramaNode& node,
         for (const auto& child : node.children)
         {
             merge_result(result, advance_keyframe_node(
-                *child, registry, dt, sheet_instance, sheet_generation, dirty_tracker, unreachable));
+                *child, registry, dt, sheet_instance, sheet_generation, dirty_tracker, work_stats, unreachable));
         }
         return result;
     }
@@ -1609,7 +1633,7 @@ PanoramaAnimationAdvanceResult advance_keyframe_node(PanoramaNode& node,
     for (const auto& child : node.children)
     {
         merge_result(result, advance_keyframe_node(
-            *child, registry, dt, sheet_instance, sheet_generation, dirty_tracker, unreachable));
+            *child, registry, dt, sheet_instance, sheet_generation, dirty_tracker, work_stats, unreachable));
     }
     return result;
 }
@@ -1617,16 +1641,17 @@ PanoramaAnimationAdvanceResult advance_keyframe_node(PanoramaNode& node,
 
 PanoramaAnimationAdvanceResult panorama_advance_keyframes(PanoramaNode& root,
     const std::unordered_map<std::string, PanoramaKeyframes>& keyframes, float dt,
-    PanoramaRecompositeDirtyTracker* dirty_tracker)
+    PanoramaRecompositeDirtyTracker* dirty_tracker, PanoramaAnimationWorkStats* work_stats)
 {
-    return advance_keyframe_node(root, keyframes, dt, 0, 0, dirty_tracker, false);
+    return advance_keyframe_node(root, keyframes, dt, 0, 0, dirty_tracker, work_stats, false);
 }
 
 PanoramaAnimationAdvanceResult panorama_advance_keyframes(
-    PanoramaNode& root, const PanoramaStyleSheet& sheet, float dt, PanoramaRecompositeDirtyTracker* dirty_tracker)
+    PanoramaNode& root, const PanoramaStyleSheet& sheet, float dt, PanoramaRecompositeDirtyTracker* dirty_tracker,
+    PanoramaAnimationWorkStats* work_stats)
 {
     return advance_keyframe_node(
-        root, sheet.keyframes(), dt, sheet.instance_id(), sheet.generation(), dirty_tracker, false);
+        root, sheet.keyframes(), dt, sheet.instance_id(), sheet.generation(), dirty_tracker, work_stats, false);
 }
 
 namespace
@@ -1644,8 +1669,13 @@ constexpr int kScrollMaxIterations = 400;    // safety cap: 400 * 4ms = 1.6s per
 constexpr float kScrollPosEpsilon = 1.0F;    // px
 constexpr float kScrollVelEpsilon = 0.02F;   // px/ms
 
-PanoramaAnimationAdvanceResult advance_scroll_node(PanoramaNode& node, float dt_ms)
+PanoramaAnimationAdvanceResult advance_scroll_node(
+    PanoramaNode& node, float dt_ms, PanoramaAnimationWorkStats* work_stats)
 {
+    if (work_stats != nullptr)
+    {
+        ++work_stats->scroll_nodes_visited;
+    }
     PanoramaAnimationAdvanceResult result;
     auto& anim = node.scroll_anim;
     if (anim.active)
@@ -1712,14 +1742,15 @@ PanoramaAnimationAdvanceResult advance_scroll_node(PanoramaNode& node, float dt_
 
     for (const auto& child : node.children)
     {
-        merge_result(result, advance_scroll_node(*child, dt_ms));
+        merge_result(result, advance_scroll_node(*child, dt_ms, work_stats));
     }
     return result;
 }
 }
 
-PanoramaAnimationAdvanceResult panorama_advance_scroll_animations(PanoramaNode& root, float dt)
+PanoramaAnimationAdvanceResult panorama_advance_scroll_animations(
+    PanoramaNode& root, float dt, PanoramaAnimationWorkStats* work_stats)
 {
-    return advance_scroll_node(root, dt * 1000.0F);
+    return advance_scroll_node(root, dt * 1000.0F, work_stats);
 }
 }

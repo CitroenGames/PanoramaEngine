@@ -1,7 +1,7 @@
 #include "ui/panorama/panorama_source_cooker.hpp"
 
 #include <fstream>
-#include <iterator>
+#include <limits>
 #include <map>
 #include <stdexcept>
 #include <system_error>
@@ -13,14 +13,41 @@ namespace panorama
 {
 namespace
 {
-std::vector<unsigned char> read_source_file(const std::filesystem::path& path)
+PanoramaSharedBytes read_source_file(
+    const std::filesystem::path& path, PanoramaSourceCookStats& stats)
 {
-    std::ifstream file(path, std::ios::binary);
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file)
     {
         throw std::runtime_error("failed to read Panorama source '" + path.string() + "'");
     }
-    return {std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+    const std::streamoff end = file.tellg();
+    if (end < 0 ||
+        static_cast<std::uintmax_t>(end) >
+            static_cast<std::uintmax_t>(std::numeric_limits<std::size_t>::max()))
+    {
+        throw std::runtime_error(
+            "failed to determine Panorama source size '" + path.string() + "'");
+    }
+    const std::size_t size = static_cast<std::size_t>(end);
+    if (size > static_cast<std::size_t>(std::numeric_limits<std::streamsize>::max()))
+    {
+        throw std::runtime_error(
+            "Panorama source is too large to read '" + path.string() + "'");
+    }
+    std::vector<unsigned char> bytes(size);
+    ++stats.source_file_allocations;
+    stats.source_payload_bytes += size;
+    file.seekg(0, std::ios::beg);
+    if (size != 0)
+    {
+        file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size));
+        if (!file || static_cast<std::size_t>(file.gcount()) != size)
+        {
+            throw std::runtime_error("failed to read Panorama source '" + path.string() + "'");
+        }
+    }
+    return PanoramaSharedBytes::from_owned(std::move(bytes));
 }
 
 void count_source(PanoramaSourceCookStats& stats, PanoramaSourceKind kind)
@@ -70,13 +97,21 @@ bool cook_panorama_source_tree(
         }
 
         // std::map fixes serialized entry order regardless of filesystem iteration order.
-        std::map<std::string, std::vector<unsigned char>> resources;
+        std::map<std::string, PanoramaSharedBytes> resources;
         if (base_package != nullptr)
         {
             for (const std::string& entry : base_package->entries())
             {
-                resources[normalize_panorama_entry_path(entry)] = base_package->read(entry);
+                const std::string normalized = normalize_panorama_entry_path(entry);
+                PanoramaSharedBytes data;
+                if (!base_package->try_read_normalized(normalized, data))
+                {
+                    throw std::runtime_error(
+                        "panorama package entry not found: " + entry);
+                }
+                resources[normalized] = std::move(data);
                 ++cooked_stats.base_resources;
+                ++cooked_stats.shared_base_payloads;
             }
         }
 
@@ -123,7 +158,7 @@ bool cook_panorama_source_tree(
                     "duplicate normalized Panorama source path: " + resource_path);
             }
 
-            resources[resource_path] = read_source_file(source_file);
+            resources[resource_path] = read_source_file(source_file, cooked_stats);
             count_source(cooked_stats, classify_panorama_source_path(source_file));
         }
 
@@ -133,18 +168,26 @@ bool cook_panorama_source_tree(
                 "Panorama source tree contains no JS, XML, CSS, or base-package resources");
         }
 
-        std::vector<std::pair<std::string, std::vector<unsigned char>>> package_resources;
+        std::vector<PanoramaPackageResource> package_resources;
         package_resources.reserve(resources.size());
-        for (auto& [path, bytes] : resources)
+        for (auto& [path, data] : resources)
         {
-            package_resources.emplace_back(path, std::move(bytes));
+            cooked_stats.final_payload_bytes += data.size();
+            package_resources.push_back(
+                PanoramaPackageResource{path, std::move(data)});
         }
 
         std::string package_error;
-        if (!output.open_resources(package_resources, source_root, &package_error))
+        PanoramaPackageStorageStats package_stats;
+        if (!output.open_resources(
+                std::move(package_resources), source_root, &package_error, &package_stats))
         {
             throw std::runtime_error(package_error);
         }
+        cooked_stats.peak_live_payload_bytes = package_stats.peak_live_payload_bytes;
+        cooked_stats.payload_copy_operations = package_stats.payload_copy_operations;
+        cooked_stats.copied_payload_bytes = package_stats.copied_payload_bytes;
+        cooked_stats.adopted_payloads = package_stats.adopted_payloads;
         if (stats != nullptr)
         {
             *stats = cooked_stats;

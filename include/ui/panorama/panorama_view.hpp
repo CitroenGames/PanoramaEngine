@@ -8,7 +8,10 @@
 #include "ui/panorama/panorama_paint.hpp"
 #include "ui/panorama/panorama_runtime.hpp"
 
+#include <cstddef>
+#include <cstdint>
 #include <string_view>
+#include <vector>
 
 namespace panorama
 {
@@ -18,6 +21,68 @@ struct PanoramaViewLoadOptions
 {
     PanoramaDocumentSessionOptions document;
     bool enable_scripting = true;
+};
+
+enum class PanoramaViewStyleWork : std::uint8_t
+{
+    None,
+    Incremental,
+    Full,
+};
+
+enum class PanoramaViewVisualWork : std::uint8_t
+{
+    None,
+    Recomposite,
+    Rebuild,
+};
+
+// The actual work classes selected for one update. This is intentionally more
+// precise than the compatibility booleans in PanoramaViewUpdateResult.
+struct PanoramaViewWorkPlan
+{
+    bool runtime_pumped = false;
+    PanoramaViewStyleWork style = PanoramaViewStyleWork::None;
+    bool transitions_advanced = false;
+    bool keyframes_advanced = false;
+    bool scroll_animations_advanced = false;
+    bool layout = false;
+    PanoramaViewVisualWork visual = PanoramaViewVisualWork::None;
+};
+
+// Opt-in counters for regression tests and profilers. update() resets the
+// supplied object before recording one frame; no object means no counter work.
+struct PanoramaViewWorkStats
+{
+    std::uint64_t full_style_passes = 0;
+    std::uint64_t incremental_style_passes = 0;
+    std::uint64_t transition_passes = 0;
+    std::uint64_t keyframe_passes = 0;
+    std::uint64_t scroll_animation_passes = 0;
+    std::uint64_t transition_nodes_visited = 0;
+    std::uint64_t keyframe_nodes_visited = 0;
+    std::uint64_t scroll_nodes_visited = 0;
+    std::uint64_t layout_passes = 0;
+    std::uint64_t draw_list_builds = 0;
+    std::uint64_t recomposite_patches = 0;
+    std::uint64_t recomposite_fallbacks = 0;
+};
+
+enum class PanoramaViewUpdateMode : std::uint8_t
+{
+    Incremental,
+    ForcedFull,
+};
+
+struct PanoramaViewUpdateOptions
+{
+    // ForcedFull is a compatibility/reference oracle: dirty style uses a full
+    // cascade and all three animation trees are visited.
+    PanoramaViewUpdateMode mode = PanoramaViewUpdateMode::Incremental;
+    // Existing hosts key redraws on draw_list_rebuilt. Keep their behavior by
+    // default; an aware host can opt into retained-list constants patching.
+    bool allow_recomposite_only = false;
+    PanoramaViewWorkStats* work_stats = nullptr;
 };
 
 // Describes the work performed by PanoramaView::update(). This is useful to
@@ -31,6 +96,10 @@ struct PanoramaViewUpdateResult
     bool visual_changed = false;
     bool draw_list_rebuilt = false;
     bool animation_active = false;
+    bool recomposite_only = false;
+    std::size_t recomposite_dirty_node_count = 0;
+    std::uint32_t recomposite_generation = 0;
+    PanoramaViewWorkPlan work;
 };
 
 // Owns the host-independent parts of one live Panorama surface and sequences
@@ -103,6 +172,7 @@ public:
     // Pumps scripts and animations, then conditionally recomputes styles,
     // layout, and the renderer-independent draw list. dt is in seconds.
     [[nodiscard]] PanoramaViewUpdateResult update(float dt_seconds);
+    [[nodiscard]] PanoramaViewUpdateResult update(float dt_seconds, PanoramaViewUpdateOptions options);
 
     // Use these after native code mutates the DOM without going through input
     // or PanoramaRuntime. invalidate_style() also marks the root for cascade.
@@ -111,13 +181,18 @@ public:
     void invalidate_visual();
 
     [[nodiscard]] const PanoramaDrawList& draw_list() const noexcept;
+    // Stable until the next update()/unload(). Useful with recomposite_only to
+    // patch a host-side geometry cache without scanning the whole node tree.
+    [[nodiscard]] const std::vector<PanoramaNode*>& recomposite_dirty_nodes() const noexcept;
 
 private:
     void configure_runtime_bridges();
     void run_added_scripts(const PanoramaDocumentLoadResult& result);
-    void recompute_styles();
+    void request_local_style_update(bool content_layout_changed = false);
+    bool recompute_styles(bool forced_full);
     void relayout();
     void rebuild_draw_list();
+    bool patch_recomposite_draw_list();
 
     // Declaration order is intentional: input/runtime observers are destroyed
     // before the session-owned node tree.
@@ -135,5 +210,12 @@ private:
     bool style_dirty_ = false;
     bool layout_dirty_ = false;
     bool visual_dirty_ = false;
+    bool force_full_style_dirty_ = false;
+    bool transitions_active_ = false;
+    bool keyframes_active_ = false;
+    bool scroll_animations_active_ = false;
+    std::vector<PanoramaNode*> recomposite_dirty_nodes_;
+    std::vector<PanoramaDrawConstants> recomposite_contexts_;
+    std::uint32_t recomposite_generation_ = 0;
 };
 }

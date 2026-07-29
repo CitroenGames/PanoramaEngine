@@ -197,7 +197,7 @@ public:
         return true;
     }
 
-    void render(
+    [[nodiscard]] bool render(
         panorama_adapters::PanoramaD3D12Backend& backend,
         panorama::PanoramaGeometryCache& geometry_cache,
         const panorama::PanoramaDrawList& draw_list,
@@ -224,7 +224,7 @@ public:
         };
         command_list_->ClearRenderTargetView(rtv, clear_color, 0, nullptr);
 
-        backend.new_frame(
+        const panorama::PanoramaSubmissionId ui_submission = backend.new_frame(
             command_list_.Get(), static_cast<std::uint32_t>(width_), static_cast<std::uint32_t>(height_));
         if (draw_list_changed || !geometry_cache.replay(backend))
         {
@@ -242,13 +242,30 @@ public:
 
         ID3D12CommandList* command_lists[] = {command_list_.Get()};
         queue_->ExecuteCommandLists(1, command_lists);
-        check_hr(swap_chain_->Present(1, 0), "IDXGISwapChain::Present");
+        (void)backend.submit_frame(ui_submission);
+        const HRESULT present_result = swap_chain_->Present(1, 0);
+        if (present_result != DXGI_STATUS_OCCLUDED)
+        {
+            check_hr(present_result, "IDXGISwapChain::Present");
+        }
 
         const UINT submitted_frame = frame_index_;
         const UINT64 fence_value = next_fence_value_++;
         check_hr(queue_->Signal(fence_.Get(), fence_value), "ID3D12CommandQueue::Signal(frame)");
         frame_fence_values_[submitted_frame] = fence_value;
         frame_index_ = swap_chain_->GetCurrentBackBufferIndex();
+        return present_result != DXGI_STATUS_OCCLUDED;
+    }
+
+    [[nodiscard]] bool probe_visibility()
+    {
+        const HRESULT result = swap_chain_->Present(0, DXGI_PRESENT_TEST);
+        if (result == DXGI_STATUS_OCCLUDED)
+        {
+            return false;
+        }
+        check_hr(result, "IDXGISwapChain::Present(test)");
+        return true;
     }
 
     void wait_for_gpu()
@@ -454,6 +471,7 @@ public:
         draw_list_changed_ = true;
         initialized_ = true;
         last_update_ = FrameClock::now();
+        render_requested_ = true;
         render();
     }
 
@@ -495,7 +513,35 @@ public:
         last_update_ = now;
         const panorama::PanoramaViewUpdateResult result = view_.update(dt_seconds);
         draw_list_changed_ = draw_list_changed_ || result.draw_list_rebuilt;
-        render();
+        continuous_ = result.animation_active;
+
+        panorama::PanoramaDemandFrameInput demand;
+        demand.invalidated = render_requested_;
+        demand.visual_changed = result.visual_changed;
+        demand.animation_active = result.animation_active;
+        demand.exposed = exposed_;
+        demand.resized = resized_;
+        demand.continuous = continuous_;
+        demand.occluded = occluded_;
+        exposed_ = false;
+        resized_ = false;
+
+        panorama::PanoramaDemandFrameAction action =
+            panorama::panorama_choose_demand_frame_action(demand);
+        if (action == panorama::PanoramaDemandFrameAction::ProbeOcclusion)
+        {
+            if (!graphics_.probe_visibility())
+            {
+                return;
+            }
+            occluded_ = false;
+            render_requested_ = true;
+            action = panorama::PanoramaDemandFrameAction::Render;
+        }
+        if (action == panorama::PanoramaDemandFrameAction::Render)
+        {
+            render();
+        }
     }
 
     void resize(int width, int height)
@@ -505,21 +551,50 @@ public:
             return;
         }
         view_.set_viewport(static_cast<float>(width), static_cast<float>(height));
-        const panorama::PanoramaViewUpdateResult result = view_.update(0.0F);
-        draw_list_changed_ = draw_list_changed_ || result.draw_list_rebuilt;
-        render();
+        resized_ = true;
+        render_requested_ = true;
+        tick();
     }
 
-    bool update_pointer(float x, float y, bool down) { return view_.update_pointer(x, y, down); }
-    bool update_wheel(float x, float y, float ticks) { return view_.update_wheel(x, y, ticks); }
-    bool handle_key_down(const panorama::PanoramaKeyEvent& event) { return view_.handle_key_down(event); }
-    bool handle_text_input(std::string_view text) { return view_.handle_text_input(text); }
+    void request_expose()
+    {
+        exposed_ = true;
+        render_requested_ = true;
+    }
+
+    bool update_pointer(float x, float y, bool down)
+    {
+        const bool handled = view_.update_pointer(x, y, down);
+        render_requested_ = render_requested_ || handled;
+        return handled;
+    }
+    bool update_wheel(float x, float y, float ticks)
+    {
+        const bool handled = view_.update_wheel(x, y, ticks);
+        render_requested_ = render_requested_ || handled;
+        return handled;
+    }
+    bool handle_key_down(const panorama::PanoramaKeyEvent& event)
+    {
+        const bool handled = view_.handle_key_down(event);
+        render_requested_ = render_requested_ || handled;
+        return handled;
+    }
+    bool handle_text_input(std::string_view text)
+    {
+        const bool handled = view_.handle_text_input(text);
+        render_requested_ = render_requested_ || handled;
+        return handled;
+    }
 
 private:
     void render()
     {
-        graphics_.render(*backend_, geometry_cache_, view_.draw_list(), draw_list_changed_);
+        const bool presented =
+            graphics_.render(*backend_, geometry_cache_, view_.draw_list(), draw_list_changed_);
         draw_list_changed_ = false;
+        occluded_ = !presented;
+        render_requested_ = occluded_;
     }
 
     D3D12WindowHost graphics_;
@@ -530,6 +605,11 @@ private:
     FrameClock::time_point last_update_ = FrameClock::now();
     bool draw_list_changed_ = true;
     bool initialized_ = false;
+    bool render_requested_ = true;
+    bool exposed_ = false;
+    bool resized_ = false;
+    bool continuous_ = false;
+    bool occluded_ = false;
 };
 
 struct AppState
@@ -637,6 +717,11 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
         PAINTSTRUCT paint{};
         BeginPaint(hwnd, &paint);
         EndPaint(hwnd, &paint);
+        if (state != nullptr && state->app.initialized())
+        {
+            state->app.request_expose();
+            refresh(hwnd, *state);
+        }
         return 0;
     }
 

@@ -179,34 +179,73 @@ void measure_intrinsic(PanoramaNode& node, const PanoramaTextMeasure& tm)
     {
         std::string transformed_storage;
         const std::string_view display = panorama_transform_text_view(node.text, s.text_transform, transformed_storage);
-        if (node.is_html_text())
+        if (tm.shape)
         {
-            // html="true" labels carry inline <b>/<i> markup: measure each styled run
-            // at its own weight and sum the advances so bold spans size correctly. The
-            // tag characters themselves are excluded (they are not part of any run).
-            float tw = 0.0F;
-            float th = 0.0F;
-            for (const PanoramaTextRun& run : panorama_parse_inline_markup(display))
+            std::vector<PanoramaTextRun> markup_runs;
+            std::vector<PanoramaTextArtifactRunInput> runs;
+            if (node.is_html_text())
             {
-                const int weight = panorama_run_font_weight(s.font_weight, run.bold);
-                const auto [rw, rh] = tm.measure(run.text, s.font_size, weight, s.letter_spacing);
-                tw += rw;
-                th = std::max(th, rh);
+                markup_runs = panorama_parse_inline_markup(display);
+                runs.reserve(markup_runs.size());
+                for (const PanoramaTextRun& run : markup_runs)
+                {
+                    runs.push_back({run.text, panorama_run_font_weight(s.font_weight, run.bold),
+                        run.italic || s.font_italic});
+                }
             }
-            content_w = std::max(content_w, tw);
-            content_h = std::max(content_h, s.line_height > 0.0F ? s.line_height : th);
-            text_w = tw;
-            node.intrinsic_text_width = tw;
-            node.intrinsic_text_height = th;
+            else
+            {
+                runs.push_back({display, s.font_weight, s.font_italic});
+            }
+            PanoramaTextArtifactRequest request;
+            request.source_text = node.text;
+            request.display_text = display;
+            request.runs = runs;
+            request.font_size = s.font_size;
+            request.font_weight = s.font_weight;
+            request.letter_spacing = s.letter_spacing;
+            request.line_height = s.line_height;
+            request.available_width = -1.0F;
+            request.text_transform = static_cast<int>(s.text_transform);
+            request.text_overflow = static_cast<int>(s.text_overflow);
+            request.html = node.is_html_text();
+            request.font_generation = tm.generation ? tm.generation() : 0;
+            const std::shared_ptr<const PanoramaTextArtifact> artifact =
+                panorama_prepare_text_artifact(request, tm.shape);
+            content_w = std::max(content_w, artifact->width);
+            content_h = std::max(content_h, s.line_height > 0.0F ? s.line_height : artifact->height);
+            text_w = artifact->width;
+            node.intrinsic_text_width = artifact->width;
+            node.intrinsic_text_height = artifact->height;
         }
         else
         {
-            const auto [tw, th] = tm.measure(display, s.font_size, s.font_weight, s.letter_spacing);
-            content_w = std::max(content_w, tw);
-            content_h = std::max(content_h, s.line_height > 0.0F ? s.line_height : th);
-            text_w = tw;
-            node.intrinsic_text_width = tw;
-            node.intrinsic_text_height = th;
+            if (node.is_html_text())
+            {
+                float tw = 0.0F;
+                float th = 0.0F;
+                for (const PanoramaTextRun& run : panorama_parse_inline_markup(display))
+                {
+                    const int weight = panorama_run_font_weight(s.font_weight, run.bold);
+                    const auto [rw, rh] = tm.measure(run.text, s.font_size, weight, s.letter_spacing);
+                    tw += rw;
+                    th = std::max(th, rh);
+                }
+                content_w = std::max(content_w, tw);
+                content_h = std::max(content_h, s.line_height > 0.0F ? s.line_height : th);
+                text_w = tw;
+                node.intrinsic_text_width = tw;
+                node.intrinsic_text_height = th;
+            }
+            else
+            {
+                const auto [tw, th] = tm.measure(display, s.font_size, s.font_weight, s.letter_spacing);
+                content_w = std::max(content_w, tw);
+                content_h = std::max(content_h, s.line_height > 0.0F ? s.line_height : th);
+                text_w = tw;
+                node.intrinsic_text_width = tw;
+                node.intrinsic_text_height = th;
+            }
         }
     }
 
@@ -1056,19 +1095,53 @@ void apply_text_wrap(PanoramaNode& node, const PanoramaTextMeasure& tm, float pa
         runs.push_back({display, s.font_weight});
     }
 
-    const auto measure_segment = [&](int run, std::size_t begin, std::size_t end) {
-        return tm
-            .measure(runs[static_cast<std::size_t>(run)].text.substr(begin, end - begin), s.font_size,
-                runs[static_cast<std::size_t>(run)].font_weight, s.letter_spacing)
-            .first;
-    };
-    std::vector<PanoramaTextWrapLine> lines = panorama_wrap_text_lines(runs, available, measure_segment);
+    std::vector<PanoramaTextWrapLine> lines;
+    std::shared_ptr<const PanoramaTextArtifact> artifact;
+    if (tm.shape)
+    {
+        std::vector<PanoramaTextArtifactRunInput> artifact_runs;
+        artifact_runs.reserve(runs.size());
+        for (std::size_t i = 0; i < runs.size(); ++i)
+        {
+            const bool italic = node.is_html_text() && i < markup_runs.size()
+                ? markup_runs[i].italic || s.font_italic
+                : s.font_italic;
+            artifact_runs.push_back({runs[i].text, runs[i].font_weight, italic});
+        }
+        PanoramaTextArtifactRequest request;
+        request.source_text = node.text;
+        request.display_text = display;
+        request.runs = artifact_runs;
+        request.font_size = s.font_size;
+        request.font_weight = s.font_weight;
+        request.letter_spacing = s.letter_spacing;
+        request.line_height = s.line_height;
+        request.available_width = available;
+        request.text_transform = static_cast<int>(s.text_transform);
+        request.text_overflow = static_cast<int>(s.text_overflow);
+        request.html = node.is_html_text();
+        request.wrap = true;
+        request.font_generation = tm.generation ? tm.generation() : 0;
+        artifact = panorama_prepare_text_artifact(request, tm.shape);
+        lines = artifact->lines;
+    }
+    else
+    {
+        const auto measure_segment = [&](int run, std::size_t begin, std::size_t end) {
+            return tm
+                .measure(runs[static_cast<std::size_t>(run)].text.substr(begin, end - begin), s.font_size,
+                    runs[static_cast<std::size_t>(run)].font_weight, s.letter_spacing)
+                .first;
+        };
+        lines = panorama_wrap_text_lines(runs, available, measure_segment);
+    }
     if (lines.size() <= 1)
     {
         return;
     }
 
-    const float line_box = s.line_height > 0.0F ? s.line_height : node.intrinsic_text_height;
+    const float line_box = artifact ? artifact->line_advance :
+        (s.line_height > 0.0F ? s.line_height : node.intrinsic_text_height);
     node.text_line_advance = line_box;
     node.text_lines = std::move(lines);
 
@@ -1476,6 +1549,73 @@ void clear_popup_layouts(PanoramaNode& node)
         clear_popup_layouts(*child);
     }
 }
+
+bool finite_nonnegative_box(const PanoramaLayoutBox& box)
+{
+    return std::isfinite(box.x) && std::isfinite(box.y) && std::isfinite(box.width) &&
+        std::isfinite(box.height) && box.width >= 0.0F && box.height >= 0.0F;
+}
+
+void union_box(PanoramaLayoutBox& bounds, bool& has_bounds, const PanoramaLayoutBox& box)
+{
+    if (!has_bounds)
+    {
+        bounds = {box.x, box.y, box.width, box.height};
+        has_bounds = true;
+        return;
+    }
+    const float left = std::min(bounds.x, box.x);
+    const float top = std::min(bounds.y, box.y);
+    const float right = std::max(bounds.x + bounds.width, box.x + box.width);
+    const float bottom = std::max(bounds.y + bounds.height, box.y + box.height);
+    bounds.x = left;
+    bounds.y = top;
+    bounds.width = right - left;
+    bounds.height = bottom - top;
+}
+
+bool hit_bounds_are_transform_uncertain(const PanoramaNode& node)
+{
+    const PanoramaComputedStyle& style = node.computed;
+    const bool authored_transform =
+        !style.transform.empty() || style.pre_scale_x != 1.0F || style.pre_scale_y != 1.0F ||
+        style.ui_scale_x != 1.0F || style.ui_scale_y != 1.0F || style.pre_rotate != 0.0F;
+    const bool animated_transform =
+        node.anim.transform.animating ||
+        (!style.animation_name.empty() && style.animation_name != "none");
+    return authored_transform || animated_transform || node.has_popup_layout;
+}
+
+bool rebuild_hit_test_subtree_bounds(PanoramaNode& node)
+{
+    PanoramaLayoutBox bounds;
+    bool has_bounds = false;
+    bool safe = node.computed.visible && finite_nonnegative_box(node.layout) &&
+        !hit_bounds_are_transform_uncertain(node);
+    if (safe)
+    {
+        union_box(bounds, has_bounds, node.layout);
+    }
+
+    for (const auto& child : node.children)
+    {
+        const bool child_safe = rebuild_hit_test_subtree_bounds(*child);
+        if (!child->computed.visible)
+        {
+            continue;
+        }
+        if (!child_safe)
+        {
+            safe = false;
+            continue;
+        }
+        union_box(bounds, has_bounds, child->hit_test_subtree_bounds);
+    }
+
+    node.hit_test_subtree_bounds = bounds;
+    node.hit_test_subtree_bounds_valid = safe && has_bounds;
+    return node.hit_test_subtree_bounds_valid;
+}
 }
 
 PanoramaTextMeasure default_text_measure()
@@ -1489,6 +1629,34 @@ PanoramaTextMeasure default_text_measure()
         const float height = font_size * 1.2F;
         return std::pair<float, float>{width, height};
     };
+    measure.shape = [](std::string_view text, float font_size, int, float letter_spacing,
+                        std::vector<PanoramaTextShapedGlyph>& glyphs) {
+        std::size_t offset = 0;
+        while (offset < text.size())
+        {
+            const std::size_t begin = offset;
+            const unsigned char lead = static_cast<unsigned char>(text[offset++]);
+            int extra = (lead & 0xE0U) == 0xC0U ? 1 : (lead & 0xF0U) == 0xE0U ? 2 :
+                (lead & 0xF8U) == 0xF0U ? 3 : 0;
+            char32_t codepoint = lead < 0x80U ? lead :
+                lead & (extra == 1 ? 0x1FU : extra == 2 ? 0x0FU : 0x07U);
+            for (int i = 0; i < extra && offset < text.size(); ++i)
+            {
+                const unsigned char continuation = static_cast<unsigned char>(text[offset]);
+                if ((continuation & 0xC0U) != 0x80U)
+                {
+                    break;
+                }
+                codepoint = (codepoint << 6U) | (continuation & 0x3FU);
+                ++offset;
+            }
+            const float advance =
+                static_cast<float>(offset - begin) * (font_size * 0.5F + letter_spacing);
+            glyphs.push_back({codepoint, begin, offset, advance, 0.0F});
+        }
+        return font_size * 1.2F;
+    };
+    measure.generation = [] { return std::uint64_t{1}; };
     return measure;
 }
 
@@ -1512,5 +1680,6 @@ void layout_panorama_tree(
     // wraps here; descendants wrap inside resolve_node step 3.75.
     apply_text_wrap(root, text_measure, viewport_width, viewport_height);
     resolve_node(root, text_measure);
+    rebuild_hit_test_subtree_bounds(root);
 }
 }

@@ -6,6 +6,7 @@
 #include "ui/panorama/panorama_style.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -39,6 +40,16 @@ struct PanoramaDocumentLoadResult
     std::vector<PanoramaScriptInclude> scripts_added;
 };
 
+struct PanoramaDocumentSourceStats
+{
+    std::uint64_t resource_reads = 0;
+    std::uint64_t layout_parses = 0;
+    std::uint64_t style_parses = 0;
+    std::uint64_t layout_cache_hits = 0;
+    std::uint64_t style_cache_hits = 0;
+    std::uint64_t invalidations = 0;
+};
+
 [[nodiscard]] std::unique_ptr<PanoramaNode> clone_panorama_node(
     const PanoramaNode& source,
     PanoramaNode* parent = nullptr);
@@ -46,18 +57,14 @@ struct PanoramaDocumentLoadResult
 // Owns the reusable Panorama document-loading state: resource providers,
 // localization, parsed/expanded DOM, collected snippets, script includes, and
 // stylesheet cascade. Hosts still decide rendering, input, and native APIs.
-class PanoramaDocumentSession : public PanoramaNodeLifetimeObserver
+class PanoramaDocumentSession
 {
 public:
     PanoramaDocumentSession();
-    ~PanoramaDocumentSession() override;
+    ~PanoramaDocumentSession();
 
     PanoramaDocumentSession(const PanoramaDocumentSession&) = delete;
     PanoramaDocumentSession& operator=(const PanoramaDocumentSession&) = delete;
-
-    // PanoramaNodeLifetimeObserver: nulls script_refs_ contexts whose layout
-    // root is destroyed (scripts then run against the document root).
-    void on_panorama_node_destroyed(PanoramaNode& node) override;
 
     [[nodiscard]] PanoramaResourceManager& resources() noexcept;
     [[nodiscard]] const PanoramaResourceManager& resources() const noexcept;
@@ -75,6 +82,14 @@ public:
     // registered resource providers. load() calls this itself, so hosts only
     // need it directly when re-loading without touching resources().
     void clear_document();
+
+    // Parsed XML/CSS templates survive clear_document()/load() and are keyed by
+    // normalized resource path plus this explicit identity generation. Call this
+    // after changing a mutable provider in place; clear() calls it automatically.
+    void invalidate_source_cache();
+    [[nodiscard]] std::uint64_t source_cache_generation() const noexcept { return source_cache_generation_; }
+    [[nodiscard]] const PanoramaDocumentSourceStats& source_stats() const noexcept { return source_stats_; }
+    void reset_source_stats() noexcept { source_stats_ = {}; }
 
     // Loads `document_path` as the session's root document: resets prior
     // document state (clear_document()), reloads localization from
@@ -134,6 +149,20 @@ public:
     [[nodiscard]] const std::vector<PanoramaScriptInclude>& script_refs() const noexcept { return script_refs_; }
 
 private:
+    struct ScriptContextRegistration
+    {
+        PanoramaNodeLifetimeRegistration lifetime;
+        std::vector<std::size_t> script_indices;
+    };
+
+    static void script_context_destroyed(void* context, PanoramaNode& node);
+    void add_script_reference(PanoramaScriptInclude script);
+    [[nodiscard]] PanoramaDocument load_cached_layout(std::string_view normalized_path);
+    [[nodiscard]] const PanoramaParsedStyleSource* load_cached_style(std::string_view cache_key, std::string_view path);
+    [[nodiscard]] const PanoramaParsedStyleSource* cache_inline_style(
+        std::string cache_key,
+        std::string_view css);
+
     void expand_frames(
         PanoramaNode& parent,
         std::string_view base_path,
@@ -148,6 +177,7 @@ private:
     // keeps its first cascade position (no re-append; csgostyles.css must not
     // jump behind a module's own sheet) and only widens its layout-scope set.
     std::unordered_map<std::string, std::uint16_t> loaded_stylesheets_;
+    std::unordered_map<std::string, std::uint16_t> loaded_inline_styles_;
     // Layout file path -> layout scope id (PanoramaNode::style_scope_mark).
     // The initially loaded document is kRootLayoutScope (its sheets style the
     // whole tree); every other layout file gets its own scope so its sheets
@@ -156,8 +186,13 @@ private:
     std::unordered_map<std::string, std::uint16_t> layout_scopes_;
     std::uint16_t next_layout_scope_ = PanoramaStyleSheet::kRootLayoutScope + 1;
     std::vector<PanoramaScriptInclude> script_refs_;
+    std::unordered_map<PanoramaNode*, ScriptContextRegistration> script_context_registrations_;
     std::filesystem::path resource_root_;
     std::size_t max_depth_ = 8;
     bool localize_text_ = true;
+    std::unordered_map<std::string, PanoramaDocument> parsed_layout_cache_;
+    std::unordered_map<std::string, PanoramaParsedStyleSource> parsed_style_cache_;
+    std::uint64_t source_cache_generation_ = 1;
+    PanoramaDocumentSourceStats source_stats_;
 };
 }

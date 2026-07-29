@@ -82,6 +82,14 @@ struct PanoramaSourceCookStats
     std::size_t javascript_files = 0;
     std::size_t xml_files = 0;
     std::size_t css_files = 0;
+    std::size_t source_payload_bytes = 0;
+    std::size_t final_payload_bytes = 0;
+    std::size_t peak_live_payload_bytes = 0;
+    std::size_t source_file_allocations = 0;
+    std::size_t shared_base_payloads = 0;
+    std::size_t payload_copy_operations = 0;
+    std::size_t copied_payload_bytes = 0;
+    std::size_t adopted_payloads = 0;
 
     [[nodiscard]] std::size_t source_files() const noexcept
     {

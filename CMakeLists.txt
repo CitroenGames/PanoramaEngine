@@ -4,6 +4,7 @@ project(PanoramaEngine VERSION 0.1.0 LANGUAGES C CXX)
 
 set(PANORAMA_BUILD_EXAMPLES_DEFAULT OFF)
 set(PANORAMA_BUILD_TESTS_DEFAULT OFF)
+set(PANORAMA_BUILD_PERFORMANCE_TESTS_DEFAULT OFF)
 set(PANORAMA_MSVC_STATIC_RUNTIME_DEFAULT OFF)
 if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
     set(PANORAMA_BUILD_EXAMPLES_DEFAULT ON)
@@ -14,10 +15,13 @@ endif()
 option(PANORAMA_BUILD_EXAMPLES "Build the standalone PanoramaEngine examples" ${PANORAMA_BUILD_EXAMPLES_DEFAULT})
 option(PANORAMA_BUILD_WINDOW_EXAMPLE "Build the native Win32/X11 raster example" ON)
 option(PANORAMA_BUILD_D3D12_EXAMPLE "Build the native Win32 Direct3D 12 examples" ON)
-option(PANORAMA_BUILD_TESTS "Register the headless standalone lifecycle smoke test" ${PANORAMA_BUILD_TESTS_DEFAULT})
+option(PANORAMA_BUILD_TESTS "Build and register the deterministic headless regression tests" ${PANORAMA_BUILD_TESTS_DEFAULT})
+option(PANORAMA_BUILD_PERFORMANCE_TESTS
+    "Build the opt-in deterministic performance-regression harness"
+    ${PANORAMA_BUILD_PERFORMANCE_TESTS_DEFAULT})
 option(PANORAMA_MSVC_STATIC_RUNTIME "Use the static MSVC runtime, matching the sighmake build" ${PANORAMA_MSVC_STATIC_RUNTIME_DEFAULT})
 
-if(PANORAMA_BUILD_TESTS)
+if(PANORAMA_BUILD_TESTS OR PANORAMA_BUILD_PERFORMANCE_TESTS)
     enable_testing()
 endif()
 
@@ -83,19 +87,108 @@ else()
     target_compile_options(PanoramaEngine PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-if(PANORAMA_BUILD_TESTS)
-    add_executable(PanoramaStandaloneTests tests/standalone_tests.cpp)
-    target_compile_features(PanoramaStandaloneTests PRIVATE cxx_std_20)
-    target_link_libraries(PanoramaStandaloneTests PRIVATE PanoramaEngine::PanoramaEngine)
-    target_compile_definitions(PanoramaStandaloneTests PRIVATE
+function(panorama_add_test_executable target source)
+    add_executable(${target} ${source})
+    target_compile_features(${target} PRIVATE cxx_std_20)
+    target_link_libraries(${target} PRIVATE PanoramaEngine::PanoramaEngine)
+    target_compile_definitions(${target} PRIVATE
         PANORAMA_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
     )
     if(MSVC)
-        target_compile_options(PanoramaStandaloneTests PRIVATE /W4)
+        target_compile_options(${target} PRIVATE /W4)
     else()
-        target_compile_options(PanoramaStandaloneTests PRIVATE -Wall -Wextra -Wpedantic)
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
     endif()
+endfunction()
+
+if(PANORAMA_BUILD_TESTS)
+    panorama_add_test_executable(PanoramaStandaloneTests tests/standalone_tests.cpp)
     add_test(NAME PanoramaStandaloneApi COMMAND PanoramaStandaloneTests)
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/render_backend_contract_tests.cpp")
+        panorama_add_test_executable(
+            PanoramaRenderBackendContractTests
+            tests/render_backend_contract_tests.cpp)
+        add_test(NAME PanoramaRenderBackendContract COMMAND PanoramaRenderBackendContractTests)
+    else()
+        message(STATUS "tests/render_backend_contract_tests.cpp is absent; skipping its regression target")
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_optimization_regression_tests.cpp")
+        panorama_add_test_executable(
+            PanoramaRuntimeOptimizationRegressionTests
+            tests/runtime_optimization_regression_tests.cpp)
+        add_test(NAME PanoramaRuntimeOptimizationRegression COMMAND PanoramaRuntimeOptimizationRegressionTests)
+    else()
+        message(STATUS "tests/runtime_optimization_regression_tests.cpp is absent; skipping its regression target")
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/frame_plan_regression_tests.cpp")
+        panorama_add_test_executable(
+            PanoramaFramePlanRegressionTests
+            tests/frame_plan_regression_tests.cpp)
+        add_test(NAME PanoramaFramePlanRegression COMMAND PanoramaFramePlanRegressionTests)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/resource_ownership_regression_tests.cpp")
+        panorama_add_test_executable(
+            PanoramaResourceOwnershipRegressionTests
+            tests/resource_ownership_regression_tests.cpp)
+        add_test(NAME PanoramaResourceOwnershipRegression COMMAND PanoramaResourceOwnershipRegressionTests)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/dom_scaling_regression_tests.cpp")
+        panorama_add_test_executable(
+            PanoramaDomScalingRegressionTests
+            tests/dom_scaling_regression_tests.cpp)
+        add_test(NAME PanoramaDomScalingRegression COMMAND PanoramaDomScalingRegressionTests)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/style_source_regression_tests.cpp")
+        panorama_add_test_executable(
+            PanoramaStyleSourceRegressionTests
+            tests/style_source_regression_tests.cpp)
+        add_test(NAME PanoramaStyleSourceRegression COMMAND PanoramaStyleSourceRegressionTests)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/geometry_submission_regression_tests.cpp")
+        panorama_add_test_executable(
+            PanoramaGeometrySubmissionRegressionTests
+            tests/geometry_submission_regression_tests.cpp)
+        add_test(NAME PanoramaGeometrySubmissionRegression COMMAND PanoramaGeometrySubmissionRegressionTests)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/text_pipeline_regression_tests.cpp")
+        panorama_add_test_executable(
+            PanoramaTextPipelineRegressionTests
+            tests/text_pipeline_regression_tests.cpp)
+        add_test(NAME PanoramaTextPipelineRegression COMMAND PanoramaTextPipelineRegressionTests)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/paint_damage_regression_tests.cpp")
+        panorama_add_test_executable(
+            PanoramaPaintDamageRegressionTests
+            tests/paint_damage_regression_tests.cpp)
+        target_include_directories(
+            PanoramaPaintDamageRegressionTests
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        add_test(NAME PanoramaPaintDamageRegression COMMAND PanoramaPaintDamageRegressionTests)
+    endif()
+endif()
+
+if(PANORAMA_BUILD_PERFORMANCE_TESTS)
+    panorama_add_test_executable(
+        PanoramaPerformanceRegression
+        tests/performance_regression_tests.cpp)
+    target_compile_definitions(PanoramaPerformanceRegression PRIVATE
+        PANORAMA_PERF_BUILD_CONFIG="$<CONFIG>"
+    )
+    add_test(
+        NAME PanoramaPerformanceDeterministic
+        COMMAND PanoramaPerformanceRegression --check --iterations 2 --format text --label ctest)
+    set_tests_properties(PanoramaPerformanceDeterministic PROPERTIES
+        LABELS "deterministic;performance"
+    )
 endif()
 
 if(PANORAMA_BUILD_EXAMPLES)

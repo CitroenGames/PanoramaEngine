@@ -574,6 +574,11 @@ struct ClipRect
     float x1 = 0.0F;
     float y1 = 0.0F;
     bool patchable = true;
+
+    [[nodiscard]] bool empty() const
+    {
+        return active && (x1 <= x0 || y1 <= y0);
+    }
 };
 
 constexpr float kClipInfinity = 1000000.0F;
@@ -637,6 +642,43 @@ ClipRect overflow_content_clip(
         out.patchable = false;
     }
     return out;
+}
+
+// Narrows a local-space primitive to the active framebuffer clip when the
+// emitted matrix is axis aligned and therefore exactly invertible per axis.
+// Returns whether the bounds changed. Whole candidate cells/tiles can then be
+// reduced without changing any pixel inside the scissor. Rotated/skewed/uncertain transforms
+// conservatively retain the original bounds.
+bool intersect_local_rect_with_clip(
+    const ClipRect& clip, const Matrix2D& matrix,
+    float& x0, float& y0, float& x1, float& y1)
+{
+    if (!clip.active || matrix.b != 0.0F || matrix.c != 0.0F ||
+        matrix.a == 0.0F || matrix.d == 0.0F)
+    {
+        return false;
+    }
+    float local_x0 = (clip.x0 - matrix.e) / matrix.a;
+    float local_x1 = (clip.x1 - matrix.e) / matrix.a;
+    float local_y0 = (clip.y0 - matrix.f) / matrix.d;
+    float local_y1 = (clip.y1 - matrix.f) / matrix.d;
+    if (local_x1 < local_x0)
+    {
+        std::swap(local_x0, local_x1);
+    }
+    if (local_y1 < local_y0)
+    {
+        std::swap(local_y0, local_y1);
+    }
+    const float old_x0 = x0;
+    const float old_y0 = y0;
+    const float old_x1 = x1;
+    const float old_y1 = y1;
+    x0 = std::max(x0, local_x0);
+    y0 = std::max(y0, local_y0);
+    x1 = std::min(x1, local_x1);
+    y1 = std::min(y1, local_y1);
+    return x0 != old_x0 || y0 != old_y0 || x1 != old_x1 || y1 != old_y1;
 }
 
 // Per-corner border radii in CSS corner order (WebCore FloatRoundedRect::Radii).
@@ -871,8 +913,22 @@ class DrawListBuilder
 {
 public:
     DrawListBuilder(PanoramaDrawList& list, const PanoramaGlyphSource& glyphs, PanoramaPaintScratch* scratch)
-        : list_(list), glyphs_(glyphs), scratch_(scratch)
+        : list_(list), glyphs_(glyphs), scratch_(scratch),
+          stats_(scratch != nullptr ? &scratch->stats : nullptr)
     {
+        if (scratch_ != nullptr)
+        {
+            const std::size_t old_polygon_capacity = scratch_->radial_polygon.capacity();
+            const std::size_t old_scratch_capacity = scratch_->radial_polygon_scratch.capacity();
+            scratch_->radial_polygon.reserve(8);
+            scratch_->radial_polygon_scratch.reserve(8);
+            if (stats_ != nullptr &&
+                (scratch_->radial_polygon.capacity() != old_polygon_capacity ||
+                    scratch_->radial_polygon_scratch.capacity() != old_scratch_capacity))
+            {
+                ++stats_->radial_scratch_growths;
+            }
+        }
     }
 
     // The document root, used to resolve CSGOBlurTarget `blurrects` names (ids or
@@ -945,6 +1001,12 @@ public:
 
         constexpr float kPi = 3.1415926535F;
         const int segments = std::clamp(static_cast<int>(std::ceil(r.max_radius() / 2.0F)), 2, 16);
+        if (stats_ != nullptr)
+        {
+            stats_->maximum_rounded_corner_segments = std::max(
+                stats_->maximum_rounded_corner_segments,
+                static_cast<std::uint32_t>(segments));
+        }
         const int center_index = static_cast<int>(cmd.vertices.size());
 
         push(x + w * 0.5F, y + h * 0.5F); // fan center
@@ -1018,23 +1080,66 @@ public:
         }
         const int cols = std::clamp(static_cast<int>(std::ceil(w / 8.0F)), 4, 64);
         const int rows = std::clamp(static_cast<int>(std::ceil(h / 8.0F)), 4, 64);
+        int first_col = 0;
+        int first_row = 0;
+        int end_col = cols;
+        int end_row = rows;
+        if (legacy_bake_ || current_context_id_ == 0)
+        {
+            float visible_x0 = x;
+            float visible_y0 = y;
+            float visible_x1 = x + w;
+            float visible_y1 = y + h;
+            if (intersect_local_rect_with_clip(
+                    clip_, matrix, visible_x0, visible_y0, visible_x1, visible_y1))
+            {
+                if (visible_x1 <= visible_x0 || visible_y1 <= visible_y0)
+                {
+                    if (stats_ != nullptr)
+                    {
+                        stats_->gradient_cells_clipped +=
+                            static_cast<std::uint64_t>(cols) * static_cast<std::uint64_t>(rows);
+                    }
+                    return;
+                }
+                first_col = std::clamp(
+                    static_cast<int>(std::floor((visible_x0 - x) / w * cols)), 0, cols - 1);
+                first_row = std::clamp(
+                    static_cast<int>(std::floor((visible_y0 - y) / h * rows)), 0, rows - 1);
+                end_col = std::clamp(
+                    static_cast<int>(std::ceil((visible_x1 - x) / w * cols)), first_col + 1, cols);
+                end_row = std::clamp(
+                    static_cast<int>(std::ceil((visible_y1 - y) / h * rows)), first_row + 1, rows);
+            }
+        }
+        const int emitted_cols = end_col - first_col;
+        const int emitted_rows = end_row - first_row;
+        if (stats_ != nullptr)
+        {
+            const std::uint64_t total =
+                static_cast<std::uint64_t>(cols) * static_cast<std::uint64_t>(rows);
+            const std::uint64_t emitted =
+                static_cast<std::uint64_t>(emitted_cols) * static_cast<std::uint64_t>(emitted_rows);
+            stats_->gradient_cells_emitted += emitted;
+            stats_->gradient_cells_clipped += total - emitted;
+        }
         PanoramaDrawCommand& cmd = current_command(0);
         const int base = static_cast<int>(cmd.vertices.size());
-        for (int j = 0; j <= rows; ++j)
+        for (int j = first_row; j <= end_row; ++j)
         {
             const float fy = static_cast<float>(j) / static_cast<float>(rows);
             const float py = y + h * fy;
-            for (int i = 0; i <= cols; ++i)
+            for (int i = first_col; i <= end_col; ++i)
             {
                 const float fx = static_cast<float>(i) / static_cast<float>(cols);
                 const float px = x + w * fx;
                 cmd.vertices.push_back(transform_vertex(px, py, fx, fy, color_at(px, py), matrix));
             }
         }
-        const int stride = cols + 1;
-        for (int j = 0; j < rows; ++j)
+        const int stride = emitted_cols + 1;
+        for (int j = 0; j < emitted_rows; ++j)
         {
-            for (int i = 0; i < cols; ++i)
+            for (int i = 0; i < emitted_cols; ++i)
             {
                 const int tl = base + j * stride + i;
                 cmd.indices.push_back(tl);
@@ -1060,6 +1165,12 @@ public:
         }
         const int segments =
             std::clamp(static_cast<int>(std::ceil(std::max(iradii.max_radius(), oradii.max_radius()) / 2.0F)), 2, 16);
+        if (stats_ != nullptr)
+        {
+            stats_->maximum_rounded_corner_segments = std::max(
+                stats_->maximum_rounded_corner_segments,
+                static_cast<std::uint32_t>(segments));
+        }
         std::vector<std::pair<float, float>> inner_pts;
         std::vector<std::pair<float, float>> outer_pts;
         rounded_contour_points(ix, iy, iw, ih, iradii, segments, inner_pts);
@@ -1131,7 +1242,51 @@ public:
         // real content does not combine tiling with border-radius.
         const bool single = tx.count == 1 && ty.count == 1;
         const CornerRadii tile_radii = single ? radii : CornerRadii{};
-        for (int iy = 0; iy < ty.count; ++iy)
+        int first_tile_x = 0;
+        int first_tile_y = 0;
+        int end_tile_x = tx.count;
+        int end_tile_y = ty.count;
+        if ((legacy_bake_ || current_context_id_ == 0) && clip_.active)
+        {
+            float visible_x0 = bx;
+            float visible_y0 = by;
+            float visible_x1 = bx + bw;
+            float visible_y1 = by + bh;
+            if (intersect_local_rect_with_clip(
+                    clip_, matrix, visible_x0, visible_y0, visible_x1, visible_y1))
+            {
+                if (visible_x1 <= visible_x0 || visible_y1 <= visible_y0)
+                {
+                    if (stats_ != nullptr)
+                    {
+                        stats_->background_tiles_considered +=
+                            static_cast<std::uint64_t>(tx.count) *
+                            static_cast<std::uint64_t>(ty.count);
+                    }
+                    return;
+                }
+                const float local_x0 = visible_x0 - bx;
+                const float local_y0 = visible_y0 - by;
+                const float local_x1 = visible_x1 - bx;
+                const float local_y1 = visible_y1 - by;
+                first_tile_x = std::clamp(
+                    static_cast<int>(std::floor((local_x0 - tx.start) / tx.step)), 0, tx.count - 1);
+                first_tile_y = std::clamp(
+                    static_cast<int>(std::floor((local_y0 - ty.start) / ty.step)), 0, ty.count - 1);
+                end_tile_x = std::clamp(
+                    static_cast<int>(std::floor((local_x1 - tx.start) / tx.step)) + 1,
+                    first_tile_x + 1, tx.count);
+                end_tile_y = std::clamp(
+                    static_cast<int>(std::floor((local_y1 - ty.start) / ty.step)) + 1,
+                    first_tile_y + 1, ty.count);
+            }
+        }
+        if (stats_ != nullptr)
+        {
+            stats_->background_tiles_considered +=
+                static_cast<std::uint64_t>(tx.count) * static_cast<std::uint64_t>(ty.count);
+        }
+        for (int iy = first_tile_y; iy < end_tile_y; ++iy)
         {
             const float y = ty.start + static_cast<float>(iy) * ty.step;
             const float cy0 = std::max(y, 0.0F);
@@ -1142,7 +1297,7 @@ public:
             }
             const float v0 = (cy0 - y) / ty.tile;
             const float v1 = (cy1 - y) / ty.tile;
-            for (int ix = 0; ix < tx.count; ++ix)
+            for (int ix = first_tile_x; ix < end_tile_x; ++ix)
             {
                 const float x = tx.start + static_cast<float>(ix) * tx.step;
                 const float cx0 = std::max(x, 0.0F);
@@ -1155,6 +1310,10 @@ public:
                 const float u1 = (cx1 - x) / tx.tile;
                 add_rounded_rect(bx + cx0, by + cy0, cx1 - cx0, cy1 - cy0, tile_radii, tint, node.background_texture,
                     matrix, u0, v0, u1, v1);
+                if (stats_ != nullptr)
+                {
+                    ++stats_->background_tiles_emitted;
+                }
             }
         }
     }
@@ -1631,6 +1790,18 @@ public:
     void paint(const PanoramaNode& node, float opacity, const Matrix2D& parent_transform, const ClipRect& clip,
         const PaintLayerState& layer)
     {
+        if (stats_ != nullptr)
+        {
+            ++stats_->nodes_visited;
+        }
+        if (clip.empty())
+        {
+            if (stats_ != nullptr)
+            {
+                ++stats_->empty_clip_subtrees_pruned;
+            }
+            return;
+        }
         const PanoramaComputedStyle& s = node.computed;
         if (!s.visible)
         {
@@ -1767,6 +1938,10 @@ public:
             float ry1 = box.y + box.height * (s.clip.rect_bottom / 100.0F);
             if (rx1 <= rx0 || ry1 <= ry0)
             {
+                if (stats_ != nullptr)
+                {
+                    ++stats_->empty_clip_subtrees_pruned;
+                }
                 return; // empty visible rect: the panel is fully wiped
             }
             if (!is_identity(transform))
@@ -1780,13 +1955,23 @@ public:
             {
                 self_clip.patchable = false;
             }
+            if (self_clip.empty())
+            {
+                if (stats_ != nullptr)
+                {
+                    ++stats_->empty_clip_subtrees_pruned;
+                }
+                return;
+            }
         }
         std::size_t radial_cmd_start = 0;
         std::size_t radial_back_index_start = 0;
+        std::size_t radial_back_vertex_start = 0;
         if (radial_clip)
         {
             radial_cmd_start = list_.commands.size();
             radial_back_index_start = radial_cmd_start > 0 ? list_.commands.back().indices.size() : 0;
+            radial_back_vertex_start = radial_cmd_start > 0 ? list_.commands.back().vertices.size() : 0;
         }
 
         // This node's own background/border/text/image paint within the inherited clip
@@ -1904,7 +2089,7 @@ public:
         // Image content (e.g. a rasterized SVG icon) fills the content box. CS:GO
         // icons are white masks tinted by the (inherited) wash-color and brightness,
         // which is how nav buttons recolour their icon on hover/select.
-        if (node.paint_texture != 0)
+        if (!content_clip.empty() && node.paint_texture != 0)
         {
             set_clip(content_clip);
             // `scaling=` placement: where inside the content box the texture quad
@@ -1995,7 +2180,9 @@ public:
 
         // A focused TextEntry paints even when empty so its caret still shows.
         const bool focused_text_entry = node.focused && node.tag_lower == "textentry";
-        if ((!node.text.empty() || focused_text_entry) && panorama_node_paints_own_text(node))
+        if (!content_clip.empty() &&
+            (!node.text.empty() || focused_text_entry) &&
+            panorama_node_paints_own_text(node))
         {
             // Toggle/radio buttons render their text via the internal control
             // label child (ensure_panorama_selection_control_internals).
@@ -2013,43 +2200,56 @@ public:
         // siblings only (no full CSS stacking contexts); this covers Panorama's use of
         // z-index to layer popups/tooltips/dropdowns over their siblings.
         const PaintLayerState child_layer{node_context, legacy_bake_here, node_local_transform, node_local_opacity};
-        bool needs_sort = false;
-        for (const auto& child : node.children)
+        if (content_clip.empty())
         {
-            if (child->computed.z_index != 0)
+            if (!node.children.empty() && stats_ != nullptr)
             {
-                needs_sort = true;
-                break;
-            }
-        }
-        if (!needs_sort)
-        {
-            for (const auto& child : node.children)
-            {
-                if (is_open_dropdown_popup_child(node, *child) && !paints_in_normal_dropdown_flow(node, *child))
-                {
-                    continue;
-                }
-                paint(*child, node_opacity, transform, child_clip, child_layer);
+                ++stats_->empty_clip_subtrees_pruned;
             }
         }
         else
         {
-            std::vector<const PanoramaNode*> ordered;
-            ordered.reserve(node.children.size());
+            bool needs_sort = false;
             for (const auto& child : node.children)
             {
-                ordered.push_back(child.get());
-            }
-            std::stable_sort(ordered.begin(), ordered.end(),
-                [](const PanoramaNode* a, const PanoramaNode* b) { return a->computed.z_index < b->computed.z_index; });
-            for (const PanoramaNode* child : ordered)
-            {
-                if (is_open_dropdown_popup_child(node, *child) && !paints_in_normal_dropdown_flow(node, *child))
+                if (child->computed.z_index != 0)
                 {
-                    continue;
+                    needs_sort = true;
+                    break;
                 }
-                paint(*child, node_opacity, transform, child_clip, child_layer);
+            }
+            if (!needs_sort)
+            {
+                for (const auto& child : node.children)
+                {
+                    if (is_open_dropdown_popup_child(node, *child) && !paints_in_normal_dropdown_flow(node, *child))
+                    {
+                        continue;
+                    }
+                    paint(*child, node_opacity, transform, child_clip, child_layer);
+                }
+            }
+            else
+            {
+                std::vector<const PanoramaNode*> ordered;
+                ordered.reserve(node.children.size());
+                for (const auto& child : node.children)
+                {
+                    ordered.push_back(child.get());
+                }
+                std::stable_sort(ordered.begin(), ordered.end(),
+                    [](const PanoramaNode* a, const PanoramaNode* b) {
+                        return a->computed.z_index < b->computed.z_index;
+                    });
+                for (const PanoramaNode* child : ordered)
+                {
+                    if (is_open_dropdown_popup_child(node, *child) &&
+                        !paints_in_normal_dropdown_flow(node, *child))
+                    {
+                        continue;
+                    }
+                    paint(*child, node_opacity, transform, child_clip, child_layer);
+                }
             }
         }
 
@@ -2152,7 +2352,9 @@ public:
         // its own appended range on the way out).
         if (radial_clip)
         {
-            apply_radial_clip(node, transform, radial_cmd_start, radial_back_index_start);
+            apply_radial_clip(
+                node, transform, radial_cmd_start,
+                radial_back_index_start, radial_back_vertex_start);
         }
     }
 
@@ -2271,7 +2473,9 @@ private:
     // subtree painted: every triangle is clipped to the VISIBLE region (the
     // complement of the hidden wedge), decomposed into <= 2 convex wedges.
     void apply_radial_clip(
-        const PanoramaNode& node, const Matrix2D& transform, std::size_t cmd_start, std::size_t back_index_start)
+        const PanoramaNode& node, const Matrix2D& transform,
+        std::size_t cmd_start, std::size_t back_index_start,
+        std::size_t back_vertex_start)
     {
         const PanoramaClip& c = node.computed.clip;
         const PanoramaLayoutBox& box = node.layout;
@@ -2301,10 +2505,11 @@ private:
         const float wcy = map_y(cx, cy);
 
         // Visible wedge = [start + sweep, start + 360], split into convex spans.
-        std::vector<WedgePlanes> wedges;
+        std::array<WedgePlanes, 2> wedges{};
+        std::size_t wedge_count = 0;
         float angle = c.radial_start + c.radial_sweep;
         float remaining = visible;
-        while (remaining > 0.0F && wedges.size() < 2)
+        while (remaining > 0.0F && wedge_count < wedges.size())
         {
             const float span = std::min(remaining, 180.0F);
             const float ax = map_x(cx + dir_x(angle), cy + dir_y(angle)) - wcx;
@@ -2314,47 +2519,93 @@ private:
             WedgePlanes planes;
             planes[0] = {wcx, wcy, -ay * flip, ax * flip}; // clockwise side of the opening ray
             planes[1] = {wcx, wcy, by * flip, -bx * flip}; // counter-clockwise side of the closing ray
-            wedges.push_back(planes);
+            wedges[wedge_count++] = planes;
             angle += span;
             remaining -= span;
         }
 
         if (cmd_start > 0)
         {
-            clip_command_range(list_.commands[cmd_start - 1], back_index_start, wedges);
+            clip_command_range(
+                list_.commands[cmd_start - 1], back_index_start,
+                back_vertex_start, wedges, wedge_count);
         }
         for (std::size_t i = cmd_start; i < list_.commands.size(); ++i)
         {
-            clip_command_range(list_.commands[i], 0, wedges);
+            clip_command_range(list_.commands[i], 0, 0, wedges, wedge_count);
         }
     }
 
     // Rebuilds the triangles of `cmd` from `index_start` on, keeping only the parts
     // inside any of the visible wedges. Clipped vertices are appended (the original
     // appended vertices may go unreferenced, which is harmless).
-    static void clip_command_range(
-        PanoramaDrawCommand& cmd, std::size_t index_start, const std::vector<WedgePlanes>& wedges)
+    void clip_command_range(
+        PanoramaDrawCommand& cmd, std::size_t index_start, std::size_t vertex_start,
+        const std::array<WedgePlanes, 2>& wedges, std::size_t wedge_count)
     {
-        if (cmd.is_backdrop_blur() || cmd.indices.size() <= index_start)
+        if (cmd.is_backdrop_blur() || cmd.indices.size() <= index_start ||
+            vertex_start > cmd.vertices.size())
         {
             return;
         }
-        const std::vector<int> tris(cmd.indices.begin() + static_cast<std::ptrdiff_t>(index_start), cmd.indices.end());
+        std::vector<int>& tris =
+            scratch_ != nullptr ? scratch_->radial_indices : radial_indices_;
+        std::vector<PanoramaPaintVertex>& poly =
+            scratch_ != nullptr ? scratch_->radial_polygon : radial_polygon_;
+        std::vector<PanoramaPaintVertex>& polygon_scratch =
+            scratch_ != nullptr ? scratch_->radial_polygon_scratch : radial_polygon_scratch_;
+        std::vector<PanoramaPaintVertex>& source_vertices =
+            scratch_ != nullptr ? scratch_->radial_source_vertices : radial_source_vertices_;
+        const std::size_t old_index_capacity = tris.capacity();
+        const std::size_t old_vertex_capacity = source_vertices.capacity();
+        tris.assign(
+            cmd.indices.begin() + static_cast<std::ptrdiff_t>(index_start),
+            cmd.indices.end());
+        source_vertices.assign(
+            cmd.vertices.begin() + static_cast<std::ptrdiff_t>(vertex_start),
+            cmd.vertices.end());
+        if (stats_ != nullptr &&
+            (tris.capacity() != old_index_capacity ||
+                source_vertices.capacity() != old_vertex_capacity))
+        {
+            ++stats_->radial_scratch_growths;
+        }
+        const std::size_t previous_vertex_count = cmd.vertices.size();
         cmd.indices.resize(index_start);
-        std::vector<PanoramaPaintVertex> poly;
-        std::vector<PanoramaPaintVertex> scratch;
+        cmd.vertices.resize(vertex_start);
+        if (stats_ != nullptr)
+        {
+            stats_->radial_input_triangles += tris.size() / 3;
+            stats_->radial_orphan_vertices_removed +=
+                previous_vertex_count - vertex_start;
+        }
         for (std::size_t t = 0; t + 2 < tris.size(); t += 3)
         {
-            for (const WedgePlanes& planes : wedges)
+            for (std::size_t wedge_index = 0; wedge_index < wedge_count; ++wedge_index)
             {
+                const WedgePlanes& planes = wedges[wedge_index];
                 poly.clear();
-                poly.push_back(cmd.vertices[static_cast<std::size_t>(tris[t])]);
-                poly.push_back(cmd.vertices[static_cast<std::size_t>(tris[t + 1])]);
-                poly.push_back(cmd.vertices[static_cast<std::size_t>(tris[t + 2])]);
-                clip_polygon_against_plane(poly, scratch, planes[0]);
+                const std::size_t i0 = static_cast<std::size_t>(tris[t]);
+                const std::size_t i1 = static_cast<std::size_t>(tris[t + 1]);
+                const std::size_t i2 = static_cast<std::size_t>(tris[t + 2]);
+                if (i0 >= previous_vertex_count || i1 >= previous_vertex_count ||
+                    i2 >= previous_vertex_count)
+                {
+                    continue;
+                }
+                const auto source_vertex = [&](std::size_t index)
+                    -> const PanoramaPaintVertex& {
+                    return index < vertex_start
+                        ? cmd.vertices[index]
+                        : source_vertices[index - vertex_start];
+                };
+                poly.push_back(source_vertex(i0));
+                poly.push_back(source_vertex(i1));
+                poly.push_back(source_vertex(i2));
+                clip_polygon_against_plane(poly, polygon_scratch, planes[0]);
                 if (poly.size() >= 3)
                 {
-                    clip_polygon_against_plane(poly, scratch, planes[1]);
+                    clip_polygon_against_plane(poly, polygon_scratch, planes[1]);
                 }
                 if (poly.size() < 3)
                 {
@@ -2367,6 +2618,10 @@ private:
                     cmd.indices.push_back(base);
                     cmd.indices.push_back(base + static_cast<int>(k));
                     cmd.indices.push_back(base + static_cast<int>(k) + 1);
+                    if (stats_ != nullptr)
+                    {
+                        ++stats_->radial_output_triangles;
+                    }
                 }
             }
         }
@@ -2526,28 +2781,47 @@ private:
         // string_views below reference `display`, which outlives this function body.
         struct TextRun
         {
+            struct CachedGlyph
+            {
+                std::size_t begin = 0;
+                std::size_t end = 0;
+                PanoramaGlyph glyph;
+                float advance = 0.0F;
+            };
             std::string_view text;
             int weight;
             bool italic;
+            std::vector<CachedGlyph> glyphs;
         };
         std::vector<TextRun> runs;
         if (html)
         {
             for (const PanoramaTextRun& run : panorama_parse_inline_markup(display))
             {
-                runs.push_back({run.text, panorama_run_font_weight(s.font_weight, run.bold), run.italic || s.font_italic});
+                runs.push_back(
+                    {run.text, panorama_run_font_weight(s.font_weight, run.bold), run.italic || s.font_italic, {}});
             }
         }
         else
         {
-            runs.push_back({display, s.font_weight, s.font_italic});
+            runs.push_back({display, s.font_weight, s.font_italic, {}});
         }
 
         const auto measure_runs = [&](float f) {
             float width = 0.0F;
             for (const TextRun& run : runs)
             {
-                width += measure_run(run.text, f, run.weight);
+                if (!run.glyphs.empty())
+                {
+                    for (const TextRun::CachedGlyph& glyph : run.glyphs)
+                    {
+                        width += glyph.advance;
+                    }
+                }
+                else
+                {
+                    width += measure_run(run.text, f, run.weight);
+                }
             }
             return width;
         };
@@ -2588,7 +2862,79 @@ private:
             transformed_storage = std::move(fitted);
             display = transformed_storage;
             runs.clear();
-            runs.push_back({display, s.font_weight, s.font_italic});
+            runs.push_back({display, s.font_weight, s.font_italic, {}});
+        }
+
+        PanoramaTextArtifactRequest artifact_request;
+        artifact_request.source_text = node.text;
+        artifact_request.font_size = s.font_size;
+        artifact_request.font_weight = s.font_weight;
+        artifact_request.letter_spacing = s.letter_spacing;
+        artifact_request.line_height = s.line_height;
+        artifact_request.available_width = multiline ? available : -1.0F;
+        artifact_request.text_transform = static_cast<int>(s.text_transform);
+        artifact_request.text_overflow = static_cast<int>(s.text_overflow);
+        artifact_request.html = html;
+        artifact_request.wrap = multiline;
+        artifact_request.font_generation = glyphs_.generation;
+        std::shared_ptr<const PanoramaTextArtifact> artifact =
+            panorama_find_text_artifact(artifact_request);
+        if (font != s.font_size || (artifact && artifact->display_text != display) ||
+            (artifact && artifact->runs.size() != runs.size()))
+        {
+            artifact.reset();
+        }
+        if (artifact)
+        {
+            for (std::size_t i = 0; i < runs.size(); ++i)
+            {
+                const PanoramaTextArtifactRun& shaped = artifact->runs[i];
+                const std::string_view shaped_text(artifact->display_text.data() + shaped.display_begin,
+                    shaped.display_end - shaped.display_begin);
+                if (shaped_text != runs[i].text)
+                {
+                    artifact.reset();
+                    break;
+                }
+            }
+        }
+
+        // Resolve each glyph exactly once for this paint. Shadow taps, normal
+        // emission, decorations and caret/selection prefixes reuse these
+        // records and the authoritative shaped advances.
+        for (std::size_t run_index = 0; run_index < runs.size(); ++run_index)
+        {
+            TextRun& run = runs[run_index];
+            const PanoramaTextArtifactRun* shaped =
+                artifact && run_index < artifact->runs.size() ? &artifact->runs[run_index] : nullptr;
+            if (shaped != nullptr && shaped->glyphs.size() != 0)
+            {
+                run.glyphs.reserve(shaped->glyphs.size());
+                for (const PanoramaTextShapedGlyph& shaped_glyph : shaped->glyphs)
+                {
+                    PanoramaGlyph glyph;
+                    if (glyphs_.glyph(shaped_glyph.codepoint, font, run.weight, glyph))
+                    {
+                        run.glyphs.push_back(
+                            {shaped_glyph.begin, shaped_glyph.end, glyph, shaped_glyph.advance});
+                    }
+                }
+            }
+            else
+            {
+                std::size_t offset = 0;
+                while (offset < run.text.size())
+                {
+                    const std::size_t begin = offset;
+                    const char32_t codepoint = next_codepoint(run.text, offset);
+                    PanoramaGlyph glyph;
+                    if (glyphs_.glyph(codepoint, font, run.weight, glyph))
+                    {
+                        run.glyphs.push_back(
+                            {begin, offset, glyph, glyph.advance + s.letter_spacing});
+                    }
+                }
+            }
         }
 
         const float ascent = glyphs_.ascent ? glyphs_.ascent(font, s.font_weight) : font * 0.8F;
@@ -2640,24 +2986,23 @@ private:
         const Matrix2D italic_transform = italic_about(baseline_y);
 
         // Emits one glyph run from `pen` on `baseline`, returning the advanced pen.
-        const auto draw_glyphs = [&](std::string_view text, int weight, const Matrix2D& run_transform, float pen,
-                                     float baseline, float dx, float dy, PanoramaColor run_color) {
-            std::size_t i = 0;
-            while (i < text.size())
+        const auto draw_glyphs = [&](const TextRun& run, std::size_t begin, std::size_t end,
+                                     const Matrix2D& run_transform, float pen, float baseline, float dx, float dy,
+                                     PanoramaColor run_color) {
+            for (const TextRun::CachedGlyph& cached : run.glyphs)
             {
-                const char32_t cp = next_codepoint(text, i);
-                PanoramaGlyph g;
-                if (!glyphs_.glyph(cp, font, weight, g))
+                if (cached.begin < begin || cached.end > end)
                 {
                     continue;
                 }
+                const PanoramaGlyph& g = cached.glyph;
                 if (g.valid)
                 {
                     const float gx = pen + g.bearing_x + dx;
                     const float gy = baseline - g.bearing_y + dy;
                     add_rect(gx, gy, g.width, g.height, run_color, glyphs_.atlas_texture, run_transform, g.u0, g.v0, g.u1, g.v1);
                 }
-                pen += g.advance + s.letter_spacing;
+                pen += cached.advance;
             }
             return pen;
         };
@@ -2677,8 +3022,8 @@ private:
                 float pen = pen_x;
                 for (const TextRun& run : runs)
                 {
-                    pen = draw_glyphs(
-                        run.text, run.weight, run.italic ? italic_transform : transform, pen, baseline_y, dx, dy, run_color);
+                    pen = draw_glyphs(run, 0, run.text.size(), run.italic ? italic_transform : transform,
+                        pen, baseline_y, dx, dy, run_color);
                 }
                 if (s.text_decoration_line_through)
                 {
@@ -2714,8 +3059,8 @@ private:
                     {
                         continue;
                     }
-                    pen = draw_glyphs(run.text.substr(seg.begin, seg.end - seg.begin), run.weight,
-                        run.italic ? line_italic : transform, pen, baseline, dx, dy, run_color);
+                    pen = draw_glyphs(run, seg.begin, seg.end, run.italic ? line_italic : transform,
+                        pen, baseline, dx, dy, run_color);
                 }
                 if (s.text_decoration_line_through)
                 {
@@ -2765,7 +3110,23 @@ private:
         const float caret_height = font;
         const auto prefix_width = [&](int offset) {
             const int clamped = std::clamp(offset, 0, static_cast<int>(node.text.size()));
-            return measure_run(std::string_view(node.text).substr(0, static_cast<std::size_t>(clamped)), font, s.font_weight);
+            if (artifact && !artifact->runs.empty())
+            {
+                return panorama_text_artifact_prefix_width(*artifact, 0, static_cast<std::size_t>(clamped));
+            }
+            float width = 0.0F;
+            if (!runs.empty())
+            {
+                for (const TextRun::CachedGlyph& glyph : runs.front().glyphs)
+                {
+                    if (glyph.end > static_cast<std::size_t>(clamped))
+                    {
+                        break;
+                    }
+                    width += glyph.advance;
+                }
+            }
+            return width;
         };
         // The selection wash paints for a focused TextEntry (editing) OR for any
         // text node the host flagged selection_active (the console's cross-label
@@ -2810,10 +3171,16 @@ private:
                         const float slack = available - line.width;
                         line_start += s.text_align == PanoramaHAlign::Center ? slack * 0.5F : slack;
                     }
-                    const float x0 = line_start +
-                        measure_run(display.substr(line_begin, static_cast<std::size_t>(a) - line_begin), font, s.font_weight);
-                    const float x1 = line_start +
-                        measure_run(display.substr(line_begin, static_cast<std::size_t>(b) - line_begin), font, s.font_weight);
+                    const float x0 = line_start + (artifact
+                            ? panorama_text_artifact_segment_width(
+                                  *artifact, 0, line_begin, static_cast<std::size_t>(a))
+                            : measure_run(display.substr(line_begin, static_cast<std::size_t>(a) - line_begin),
+                                  font, s.font_weight));
+                    const float x1 = line_start + (artifact
+                            ? panorama_text_artifact_segment_width(
+                                  *artifact, 0, line_begin, static_cast<std::size_t>(b))
+                            : measure_run(display.substr(line_begin, static_cast<std::size_t>(b) - line_begin),
+                                  font, s.font_weight));
                     const float baseline = baseline_y + static_cast<float>(li) * node.text_line_advance;
                     add_rect(x0, baseline - ascent, x1 - x0, caret_height, sel, 0, transform);
                 }
@@ -2833,7 +3200,12 @@ private:
     PanoramaDrawList& list_;
     const PanoramaGlyphSource& glyphs_;
     PanoramaPaintScratch* scratch_ = nullptr;
+    PanoramaPaintStats* stats_ = nullptr;
     std::size_t reused_command_index_ = 0;
+    std::vector<int> radial_indices_;
+    std::vector<PanoramaPaintVertex> radial_source_vertices_;
+    std::vector<PanoramaPaintVertex> radial_polygon_;
+    std::vector<PanoramaPaintVertex> radial_polygon_scratch_;
     ClipRect clip_;
     PanoramaBlendMode blend_ = PanoramaBlendMode::Normal;
     const PanoramaNode* document_root_ = nullptr;
@@ -2968,6 +3340,7 @@ void build_panorama_draw_list(
 {
     if (scratch != nullptr)
     {
+        scratch->stats = {};
         scratch->reusable_commands.clear();
         scratch->reusable_commands.swap(out.commands);
         out.commands.reserve(scratch->reusable_commands.size());

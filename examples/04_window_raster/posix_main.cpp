@@ -67,13 +67,24 @@ private:
 };
 
 void pack_framebuffer(
-    const panorama_example::Framebuffer& fb, const PixelPacker& packer, std::vector<std::uint32_t>& out)
+    const panorama_example::Framebuffer& fb, const PixelPacker& packer,
+    std::vector<std::uint32_t>& out,
+    const panorama_example::RasterDamage& damage)
 {
     const std::size_t pixel_count = static_cast<std::size_t>(fb.width) * static_cast<std::size_t>(fb.height);
     out.resize(pixel_count);
-    for (std::size_t i = 0; i < pixel_count; ++i)
+    for (int y = damage.top; y < damage.bottom; ++y)
     {
-        out[i] = packer.pack(fb.rgba[i * 4 + 0], fb.rgba[i * 4 + 1], fb.rgba[i * 4 + 2]);
+        for (int x = damage.left; x < damage.right; ++x)
+        {
+            const std::size_t i =
+                static_cast<std::size_t>(y) *
+                    static_cast<std::size_t>(fb.width) +
+                static_cast<std::size_t>(x);
+            out[i] = packer.pack(
+                fb.rgba[i * 4 + 0], fb.rgba[i * 4 + 1],
+                fb.rgba[i * 4 + 2]);
+        }
     }
 }
 
@@ -112,23 +123,32 @@ public:
 
     ~X11Surface() { reset(); }
 
-    bool update(const panorama_example::Framebuffer& framebuffer, const PixelPacker& packer)
+    bool update(const panorama_example::Framebuffer& framebuffer,
+        const PixelPacker& packer,
+        const panorama_example::RasterDamage& damage)
     {
         if (!resize(framebuffer.width, framebuffer.height))
         {
             return false;
         }
-        pack_framebuffer(framebuffer, packer, pixels_);
+        pack_framebuffer(framebuffer, packer, pixels_, damage);
         return true;
     }
 
-    void blit(Window window, GC gc) const
+    void blit(Window window, GC gc,
+        panorama_example::RasterDamage damage) const
     {
-        if (image_ != nullptr)
+        damage.left = std::clamp(damage.left, 0, width_);
+        damage.top = std::clamp(damage.top, 0, height_);
+        damage.right = std::clamp(damage.right, damage.left, width_);
+        damage.bottom = std::clamp(damage.bottom, damage.top, height_);
+        if (image_ != nullptr && !damage.empty())
         {
             XPutImage(
-                display_, window, gc, image_, 0, 0, 0, 0,
-                static_cast<unsigned int>(width_), static_cast<unsigned int>(height_));
+                display_, window, gc, image_,
+                damage.left, damage.top, damage.left, damage.top,
+                static_cast<unsigned int>(damage.right - damage.left),
+                static_cast<unsigned int>(damage.bottom - damage.top));
         }
     }
 
@@ -244,13 +264,14 @@ int main(int argc, char** argv)
     float mouse_x = 0.0F;
     float mouse_y = 0.0F;
     bool mouse_down = false;
-    if (!surface.update(document.framebuffer(), packer))
+    if (!surface.update(
+            document.framebuffer(), packer, document.last_damage()))
     {
         std::fprintf(stderr, "failed to create X11 image surface\n");
         XCloseDisplay(display);
         return 1;
     }
-    surface.blit(window, gc);
+    surface.blit(window, gc, document.last_damage());
 
     // X11 text input context for composed text (IME / dead keys).
     XIM xim = XOpenIM(display, nullptr, nullptr, nullptr);
@@ -282,6 +303,7 @@ int main(int argc, char** argv)
 
         bool update_requested = false;
         bool blit_requested = false;
+        panorama_example::RasterDamage blit_damage;
         while (running && XPending(display) > 0)
         {
             XEvent event;
@@ -290,6 +312,14 @@ int main(int argc, char** argv)
             switch (event.type)
             {
             case Expose:
+                panorama_example::unite_damage(
+                    blit_damage,
+                    panorama_example::RasterDamage{
+                        event.xexpose.x,
+                        event.xexpose.y,
+                        event.xexpose.x + event.xexpose.width,
+                        event.xexpose.y + event.xexpose.height,
+                        false});
                 blit_requested |= event.xexpose.count == 0;
                 break;
 
@@ -391,12 +421,16 @@ int main(int argc, char** argv)
             last_update = now;
             if (document.update_frame(width, height, dt_seconds))
             {
-                blit_requested = surface.update(document.framebuffer(), packer);
+                const panorama_example::RasterDamage damage =
+                    document.last_damage();
+                blit_requested =
+                    surface.update(document.framebuffer(), packer, damage);
+                panorama_example::unite_damage(blit_damage, damage);
             }
         }
         if (running && blit_requested)
         {
-            surface.blit(window, gc);
+            surface.blit(window, gc, blit_damage);
         }
     }
 
