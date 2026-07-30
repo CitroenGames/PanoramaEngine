@@ -174,6 +174,22 @@ if(PANORAMA_BUILD_TESTS)
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         add_test(NAME PanoramaPaintDamageRegression COMMAND PanoramaPaintDamageRegressionTests)
     endif()
+
+    if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/d3d12_backend_pixel_tests.cpp")
+        panorama_add_test_executable(
+            PanoramaD3D12BackendPixelTests
+            tests/d3d12_backend_pixel_tests.cpp)
+        target_include_directories(
+            PanoramaD3D12BackendPixelTests
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_definitions(
+            PanoramaD3D12BackendPixelTests
+            PRIVATE UNICODE _UNICODE)
+        target_link_libraries(
+            PanoramaD3D12BackendPixelTests
+            PRIVATE dxgi d3d12 d3dcompiler)
+        add_test(NAME PanoramaD3D12BackendPixels COMMAND PanoramaD3D12BackendPixelTests)
+    endif()
 endif()
 
 if(PANORAMA_BUILD_PERFORMANCE_TESTS)

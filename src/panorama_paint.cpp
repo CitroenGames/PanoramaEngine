@@ -2446,8 +2446,13 @@ private:
             popup_node.computed = child.computed;
             popup_node.layout = child.popup_layout;
             popup_node.paint_texture = child.paint_texture;
+            popup_node.paint_texture_scaling = child.paint_texture_scaling;
+            popup_node.paint_texture_natural_width = child.paint_texture_natural_width;
+            popup_node.paint_texture_natural_height = child.paint_texture_natural_height;
             popup_node.background_texture = child.background_texture;
             popup_node.background_texture_aspect = child.background_texture_aspect;
+            popup_node.background_texture_natural_width = child.background_texture_natural_width;
+            popup_node.background_texture_natural_height = child.background_texture_natural_height;
             popup_node.shrink_font_size = child.shrink_font_size;
             popup_node.visibility_override = child.visibility_override;
             popup_node.hovered = child.hovered;
@@ -2787,6 +2792,7 @@ private:
                 std::size_t end = 0;
                 PanoramaGlyph glyph;
                 float advance = 0.0F;
+                float leading_kerning = 0.0F;
             };
             std::string_view text;
             int weight;
@@ -2915,8 +2921,8 @@ private:
                     PanoramaGlyph glyph;
                     if (glyphs_.glyph(shaped_glyph.codepoint, font, run.weight, glyph))
                     {
-                        run.glyphs.push_back(
-                            {shaped_glyph.begin, shaped_glyph.end, glyph, shaped_glyph.advance});
+                        run.glyphs.push_back({shaped_glyph.begin, shaped_glyph.end, glyph,
+                            shaped_glyph.advance, shaped_glyph.leading_kerning});
                     }
                 }
             }
@@ -2931,7 +2937,7 @@ private:
                     if (glyphs_.glyph(codepoint, font, run.weight, glyph))
                     {
                         run.glyphs.push_back(
-                            {begin, offset, glyph, glyph.advance + s.letter_spacing});
+                            {begin, offset, glyph, glyph.advance + s.letter_spacing, 0.0F});
                     }
                 }
             }
@@ -2989,6 +2995,7 @@ private:
         const auto draw_glyphs = [&](const TextRun& run, std::size_t begin, std::size_t end,
                                      const Matrix2D& run_transform, float pen, float baseline, float dx, float dy,
                                      PanoramaColor run_color) {
+            bool first = true;
             for (const TextRun::CachedGlyph& cached : run.glyphs)
             {
                 if (cached.begin < begin || cached.end > end)
@@ -2996,13 +3003,21 @@ private:
                     continue;
                 }
                 const PanoramaGlyph& g = cached.glyph;
+                // FreeType reports kerning before the current glyph. The shaped
+                // advance includes that kerning so measurement/prefix sums retain
+                // the correct total width, but the glyph quad itself must also be
+                // shifted by it. A sliced wrap segment suppresses the first
+                // glyph's kerning because its preceding glyph is on another line;
+                // panorama_text_artifact_segment_width applies the same rule.
+                const float leading_kerning = first ? 0.0F : cached.leading_kerning;
                 if (g.valid)
                 {
-                    const float gx = pen + g.bearing_x + dx;
+                    const float gx = pen + leading_kerning + g.bearing_x + dx;
                     const float gy = baseline - g.bearing_y + dy;
                     add_rect(gx, gy, g.width, g.height, run_color, glyphs_.atlas_texture, run_transform, g.u0, g.v0, g.u1, g.v1);
                 }
-                pen += cached.advance;
+                pen += cached.advance - (first ? cached.leading_kerning : 0.0F);
+                first = false;
             }
             return pen;
         };

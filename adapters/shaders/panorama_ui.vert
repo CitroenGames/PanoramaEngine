@@ -16,8 +16,11 @@ layout(location = 1) out vec4 v_color;
 void main()
 {
     v_uv = in_uv;
-    v_color = in_color;
-    v_color.a *= pc.u_translate_opacity.z;
+    // Paint vertices are straight-alpha; image/font textures are
+    // premultiplied. Premultiply the vertex modulation exactly once and apply
+    // layer opacity to all channels before the fragment shader combines them.
+    v_color = vec4(in_color.rgb * in_color.a, in_color.a) *
+        pc.u_translate_opacity.z;
     vec2 local = vec2(
         pc.u_linear_ab.x * in_pos.x + pc.u_linear_ab.z * in_pos.y + pc.u_translate_opacity.x,
         pc.u_linear_ab.y * in_pos.x + pc.u_linear_ab.w * in_pos.y + pc.u_translate_opacity.y);

@@ -12,9 +12,9 @@ directory holds the GLSL sources and the generated SPIR-V that the header
 
 The pipeline is intentionally tiny: the vertex shader applies
 `PanoramaDrawConstants`' affine transform, framebuffer-scaled translation, and
-opacity before the push-constant orthographic projection. It passes UV +
-straight (non-premultiplied) RGBA vertex color through; the fragment shader
-returns `color * texture(uv)`. Blending is fixed-function (set per
+opacity before the push-constant orthographic projection. It passes UV and
+premultiplied RGBA vertex color through; the fragment shader multiplies that by
+the premultiplied texture sample. Blending is fixed-function (set per
 `PanoramaBlendMode`).
 
 ## Regenerate after editing the GLSL

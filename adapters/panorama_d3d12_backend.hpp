@@ -262,6 +262,12 @@ public:
         {
             return 0;
         }
+        const std::size_t required =
+            static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4U;
+        if (rgba.size() < required)
+        {
+            return 0;
+        }
         Texture texture = create_texture(width, height);
         upload_texture(texture, rgba, /*already_shader_readable=*/false);
         const panorama::PanoramaTextureId id = next_texture_id_++;
@@ -272,7 +278,11 @@ public:
     bool update_texture(panorama::PanoramaTextureId texture, std::span<const unsigned char> rgba, int width, int height) override
     {
         const auto it = textures_.find(texture);
-        if (it == textures_.end() || it->second.width != width || it->second.height != height)
+        const std::size_t required = width > 0 && height > 0
+            ? static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4U
+            : 0;
+        if (it == textures_.end() || it->second.width != width || it->second.height != height ||
+            required == 0 || rgba.size() < required)
         {
             return false;
         }
@@ -368,18 +378,6 @@ public:
         // fast path can patch its constants through zero, see paint()'s
         // opacity<=0 early-out) contributes nothing to the framebuffer, so
         // skip the draw call entirely instead of submitting a no-op blend.
-        // TODO: for the Screen/Multiply/Opaque blend states below, `opacity`
-        // only ever scales alpha in the shader (uTranslateOpacity.z multiplies
-        // output.col.a, see the HLSL below) over STRAIGHT (non-premultiplied)
-        // vertex colors; those three states' color equations never reference
-        // source alpha (Screen = ONE/INV_SRC_COLOR, Multiply = DEST_COLOR/ZERO,
-        // Opaque = ONE/ZERO, all ignoring src alpha), so for any opacity in
-        // (0, 1) -- not just the <= 0 case handled here -- the draw is fully
-        // visible RGB-wise instead of fading; this adapter is a reference/
-        // example (not part of the OpenStrike build graph -- the game's
-        // RhiUiRenderInterface path is unaffected, see its own premultiplied
-        // whole-rgba multiply), so it is left as a documented gap rather than
-        // fixed here.
         if (constants.opacity <= 0.0F)
         {
             return;
@@ -729,11 +727,14 @@ PSInput VSMain(VSInput input)
         uLinearAB.y * input.pos.x + uLinearAB.w * input.pos.y + uTranslateOpacity.y);
     output.pos = mul(uProj, float4(local, 0.0f, 1.0f));
     output.uv = input.uv;
+    // Panorama paint vertices are straight-alpha, while generated image/font
+    // textures are premultiplied. Premultiply the vertex modulation exactly
+    // once, then apply layer opacity to the whole premultiplied result. Keeping
+    // opacity out of RGB made glyph coverage square under straight-alpha
+    // blending and made non-normal modes ignore fades.
     output.col = input.col;
-    // Vertex colour is straight (non-premultiplied) alpha here (see the blend
-    // states below), so opacity scales alpha only -- scaling RGB too would
-    // incorrectly darken it.
-    output.col.a *= uTranslateOpacity.z;
+    output.col.rgb *= input.col.a;
+    output.col *= uTranslateOpacity.z;
     return output;
 }
 
@@ -773,17 +774,19 @@ float4 PSMain(PSInput input) : SV_Target
         blend.BlendOp = D3D12_BLEND_OP_ADD;
         blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
         blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-        // Straight (non-premultiplied) alpha, matching PanoramaDrawList colors.
+        // The vertex shader converts the straight PanoramaPaintVertex colour
+        // to premultiplied alpha before it is combined with the already-
+        // premultiplied texture.
         switch (mode)
         {
         case panorama::PanoramaBlendMode::Normal:
-            blend.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+            blend.SrcBlend = D3D12_BLEND_ONE;
             blend.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
             blend.SrcBlendAlpha = D3D12_BLEND_ONE;
             blend.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
             break;
         case panorama::PanoramaBlendMode::Additive:
-            blend.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+            blend.SrcBlend = D3D12_BLEND_ONE;
             blend.DestBlend = D3D12_BLEND_ONE;
             blend.SrcBlendAlpha = D3D12_BLEND_ONE;
             blend.DestBlendAlpha = D3D12_BLEND_ONE;
@@ -796,9 +799,9 @@ float4 PSMain(PSInput input) : SV_Target
             break;
         case panorama::PanoramaBlendMode::Multiply:
             blend.SrcBlend = D3D12_BLEND_DEST_COLOR;
-            blend.DestBlend = D3D12_BLEND_ZERO;
-            blend.SrcBlendAlpha = D3D12_BLEND_DEST_ALPHA;
-            blend.DestBlendAlpha = D3D12_BLEND_ZERO;
+            blend.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+            blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+            blend.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
             break;
         case panorama::PanoramaBlendMode::Opaque:
             blend.BlendEnable = FALSE;

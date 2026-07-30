@@ -5,6 +5,7 @@
 #include "ui/panorama/panorama_text_break.hpp"
 #include "ui/panorama/panorama_text_edit.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -36,6 +37,7 @@ public:
     {
         ++generates;
         uploaded_bytes += pixels.size();
+        last_pixels.assign(pixels.begin(), pixels.end());
         last_width = width;
         last_height = height;
         return ++next_texture;
@@ -45,6 +47,7 @@ public:
     {
         ++updates;
         uploaded_bytes += pixels.size();
+        last_pixels.assign(pixels.begin(), pixels.end());
         return texture != 0 && width == last_width && height == last_height;
     }
     void release_texture(panorama::PanoramaTextureId) override { ++releases; }
@@ -61,6 +64,7 @@ public:
     std::size_t updates = 0;
     std::size_t releases = 0;
     std::size_t uploaded_bytes = 0;
+    std::vector<unsigned char> last_pixels;
     int last_width = 0;
     int last_height = 0;
     panorama::PanoramaTextureId next_texture = 100;
@@ -136,6 +140,71 @@ void text_artifact_checks()
         "caret/selection did not use cached prefix advances");
 }
 
+void default_utf8_measure_checks()
+{
+    using namespace panorama;
+    const PanoramaTextMeasure measure = default_text_measure();
+    const std::string text = "\xC3\xA9" "A"; // U+00E9 plus one ASCII glyph.
+    const auto [width, height] = measure.measure(text, 10.0F, 400, 1.0F);
+    expect(width == 12.0F && height == 12.0F,
+        "default text measure counted UTF-8 bytes instead of codepoints");
+
+    std::vector<PanoramaTextShapedGlyph> shaped;
+    expect(measure.shape(text, 10.0F, 400, 1.0F, shaped) == 12.0F &&
+            shaped.size() == 2 && shaped[0].begin == 0 && shaped[0].end == 2 &&
+            shaped[1].begin == 2 && shaped[1].end == 3 &&
+            shaped[0].advance == 6.0F && shaped[1].advance == 6.0F,
+        "default UTF-8 shaping advance disagreed with codepoint measurement");
+}
+
+void kerning_geometry_checks()
+{
+    using namespace panorama;
+    PanoramaTextMeasure measure;
+    measure.measure = [](std::string_view, float, int, float) {
+        return std::pair<float, float>{18.0F, 12.0F};
+    };
+    measure.shape = [](std::string_view text, float, int, float,
+                        std::vector<PanoramaTextShapedGlyph>& glyphs) {
+        expect(text == "AV", "kerning fixture shaped unexpected text");
+        glyphs.push_back({U'A', 0, 1, 10.0F, 0.0F});
+        // FreeType attaches the -2px A/V kerning to V's leading edge.
+        glyphs.push_back({U'V', 1, 2, 8.0F, -2.0F});
+        return 12.0F;
+    };
+    measure.generation = [] { return std::uint64_t{0xA11CE}; };
+
+    PanoramaNode label;
+    label.tag = label.tag_lower = "label";
+    label.text = "AV";
+    label.computed.width = {PanoramaLengthType::Pixels, 40.0F};
+    label.computed.height = {PanoramaLengthType::Pixels, 20.0F};
+    label.computed.font_size = 10.0F;
+    label.computed.color = {255, 255, 255, 255};
+    layout_panorama_tree(label, 40.0F, 20.0F, measure);
+
+    PanoramaGlyphSource glyphs;
+    glyphs.generation = 0xA11CE;
+    glyphs.atlas_texture = 77;
+    glyphs.ascent = [](float, int) { return 8.0F; };
+    glyphs.glyph = [](char32_t, float, int, PanoramaGlyph& glyph) {
+        glyph.advance = 10.0F;
+        glyph.width = 2.0F;
+        glyph.height = 4.0F;
+        glyph.valid = true;
+        return true;
+    };
+
+    PanoramaDrawList draw;
+    build_panorama_draw_list(draw, label, glyphs);
+    const auto command = std::find_if(draw.commands.begin(), draw.commands.end(),
+        [](const PanoramaDrawCommand& candidate) { return candidate.texture == 77; });
+    expect(command != draw.commands.end() && command->vertices.size() == 8,
+        "kerning fixture did not emit two glyph quads");
+    expect(command->vertices[0].x == 0.0F && command->vertices[4].x == 8.0F,
+        "leading kerning changed measured width but did not position the current glyph quad");
+}
+
 void atlas_checks()
 {
     using namespace panorama;
@@ -158,6 +227,21 @@ void atlas_checks()
     atlas.upload_if_dirty();
     const PanoramaTextureId identity = atlas.glyph_source().atlas_texture;
     expect(identity != 0 && backend.generates == 1, "initial atlas upload failed");
+    bool found_antialiased_texel = false;
+    for (std::size_t i = 0; i + 3 < backend.last_pixels.size(); i += 4)
+    {
+        const unsigned char alpha = backend.last_pixels[i + 3];
+        if (alpha > 0 && alpha < 255)
+        {
+            found_antialiased_texel = true;
+            expect(backend.last_pixels[i + 0] == alpha &&
+                    backend.last_pixels[i + 1] == alpha &&
+                    backend.last_pixels[i + 2] == alpha,
+                "glyph atlas coverage is not premultiplied RGBA");
+            break;
+        }
+    }
+    expect(found_antialiased_texel, "font fixture produced no antialiased atlas texel");
 
     (void)measure.measure("\xE4\xB8\xAD", 18.0F, 400, 0.0F);
     expect(!atlas.dirty_rects().empty(), "CJK/fallback glyph arrival did not dirty the atlas");
@@ -244,6 +328,8 @@ void edit_checks()
 int main()
 {
     text_artifact_checks();
+    default_utf8_measure_checks();
+    kerning_geometry_checks();
     atlas_checks();
     edit_checks();
     std::cout << "text pipeline regression checks passed\n";

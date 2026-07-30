@@ -303,6 +303,12 @@ public:
         {
             return 0;
         }
+        const std::size_t required =
+            static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4U;
+        if (rgba.size() < required)
+        {
+            return 0;
+        }
         Texture texture = create_texture(width, height);
         upload_texture(texture, rgba);
         const panorama::PanoramaTextureId id = next_texture_id_++;
@@ -313,7 +319,11 @@ public:
     bool update_texture(panorama::PanoramaTextureId texture, std::span<const unsigned char> rgba, int width, int height) override
     {
         const auto it = textures_.find(texture);
-        if (it == textures_.end() || it->second.width != width || it->second.height != height)
+        const std::size_t required = width > 0 && height > 0
+            ? static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4U
+            : 0;
+        if (it == textures_.end() || it->second.width != width || it->second.height != height ||
+            required == 0 || rgba.size() < required)
         {
             return false;
         }
@@ -824,17 +834,19 @@ private:
         state.blendEnable = VK_TRUE;
         state.colorBlendOp = VK_BLEND_OP_ADD;
         state.alphaBlendOp = VK_BLEND_OP_ADD;
-        // Straight (non-premultiplied) alpha, matching PanoramaDrawList colors.
+        // The vertex shader converts the straight PanoramaPaintVertex colour
+        // to premultiplied alpha before it is combined with the already-
+        // premultiplied texture.
         switch (mode)
         {
         case panorama::PanoramaBlendMode::Normal:
-            state.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+            state.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
             state.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
             state.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
             state.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
             break;
         case panorama::PanoramaBlendMode::Additive:
-            state.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+            state.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
             state.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
             state.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
             state.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
@@ -847,9 +859,9 @@ private:
             break;
         case panorama::PanoramaBlendMode::Multiply:
             state.srcColorBlendFactor = VK_BLEND_FACTOR_DST_COLOR;
-            state.dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
-            state.srcAlphaBlendFactor = VK_BLEND_FACTOR_DST_ALPHA;
-            state.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+            state.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            state.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            state.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
             break;
         case panorama::PanoramaBlendMode::Opaque:
             state.blendEnable = VK_FALSE;

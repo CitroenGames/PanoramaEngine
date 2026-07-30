@@ -1,7 +1,10 @@
 #include "examples/04_window_raster/raster_view.hpp"
 #include "ui/panorama/panorama_paint.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cstdio>
+#include <cmath>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -143,6 +146,87 @@ void test_radial_clip_reuses_scratch_and_removes_orphans()
         "radial scratch reuse changed geometry shape");
 }
 
+void test_dropdown_popup_preserves_image_region_metadata()
+{
+    panorama::PanoramaNode dropdown;
+    dropdown.tag = "DropDown";
+    dropdown.tag_lower = "dropdown";
+    dropdown.classes.push_back("DropDownMenuVisible");
+    dropdown.has_popup_layout = true;
+    set_box(dropdown, 0.0F, 0.0F, 100.0F, 20.0F);
+    dropdown.popup_layout = dropdown.layout;
+    dropdown.popup_layout.y = 20.0F;
+    dropdown.popup_layout.height = 40.0F;
+
+    auto option = std::make_unique<panorama::PanoramaNode>();
+    option->tag = "Image";
+    option->tag_lower = "image";
+    option->parent = &dropdown;
+    option->selected = true;
+    option->has_popup_layout = true;
+    set_box(*option, 0.0F, 0.0F, 100.0F, 40.0F);
+    option->popup_layout = option->layout;
+    option->popup_layout.y = 20.0F;
+    option->paint_texture = 41;
+    option->paint_texture_scaling = panorama::PanoramaImageScaling::None;
+    option->paint_texture_natural_width = 10.0F;
+    option->paint_texture_natural_height = 6.0F;
+    option->background_texture = 42;
+    option->background_texture_aspect = 2.0F;
+    option->background_texture_natural_width = 8.0F;
+    option->background_texture_natural_height = 4.0F;
+    option->computed.background_repeat.x = panorama::PanoramaBackgroundRepeat::NoRepeat;
+    option->computed.background_repeat.y = panorama::PanoramaBackgroundRepeat::NoRepeat;
+    dropdown.children.push_back(std::move(option));
+
+    panorama::PanoramaDrawList list;
+    panorama::build_panorama_draw_list(list, dropdown);
+
+    const auto command_for = [&](panorama::PanoramaTextureId texture)
+        -> const panorama::PanoramaDrawCommand* {
+        // The selected option also paints once in the collapsed dropdown header. Popup
+        // commands are appended afterward, so inspect the last matching textured command.
+        for (auto it = list.commands.rbegin(); it != list.commands.rend(); ++it)
+        {
+            if (it->texture == texture)
+            {
+                return &*it;
+            }
+        }
+        return nullptr;
+    };
+    const auto bounds = [](const panorama::PanoramaDrawCommand& command) {
+        float min_x = command.vertices.front().x;
+        float min_y = command.vertices.front().y;
+        float max_x = min_x;
+        float max_y = min_y;
+        for (const panorama::PanoramaPaintVertex& vertex : command.vertices)
+        {
+            min_x = std::min(min_x, vertex.x);
+            min_y = std::min(min_y, vertex.y);
+            max_x = std::max(max_x, vertex.x);
+            max_y = std::max(max_y, vertex.y);
+        }
+        return std::array<float, 4>{min_x, min_y, max_x, max_y};
+    };
+
+    const panorama::PanoramaDrawCommand* image = command_for(41);
+    expect(image != nullptr && !image->vertices.empty(),
+        "dropdown popup lost its image texture");
+    const std::array<float, 4> image_bounds = bounds(*image);
+    expect(std::fabs((image_bounds[2] - image_bounds[0]) - 10.0F) < 0.001F &&
+            std::fabs((image_bounds[3] - image_bounds[1]) - 6.0F) < 0.001F,
+        "dropdown popup lost image natural size/scaling metadata");
+
+    const panorama::PanoramaDrawCommand* background = command_for(42);
+    expect(background != nullptr && !background->vertices.empty(),
+        "dropdown popup lost its background texture");
+    const std::array<float, 4> background_bounds = bounds(*background);
+    expect(std::fabs((background_bounds[2] - background_bounds[0]) - 8.0F) < 0.001F &&
+            std::fabs((background_bounds[3] - background_bounds[1]) - 4.0F) < 0.001F,
+        "dropdown popup lost background natural-size metadata");
+}
+
 void test_local_damage_matches_forced_full_oracle()
 {
     panorama::PanoramaDrawList original;
@@ -202,6 +286,7 @@ int main()
         test_empty_nested_clip_prunes_subtree();
         test_large_gradient_and_repeat_are_clip_bounded();
         test_radial_clip_reuses_scratch_and_removes_orphans();
+        test_dropdown_popup_preserves_image_region_metadata();
         test_local_damage_matches_forced_full_oracle();
     }
     catch (const std::exception& error)

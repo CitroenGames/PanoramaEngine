@@ -17,6 +17,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -425,9 +426,13 @@ struct PanoramaFontAtlas::Impl
         // face name for a byte-provided one (which has no path at all).
         std::string identity;
         // Non-empty only for a provider-served face. FreeType does NOT copy the buffer passed
-        // to FT_New_Memory_Face, so it has to outlive the FT_Face; owning it here ties the two
-        // lifetimes together (this is the same ownership Unreal gives FFreeTypeFace::Memory,
-        // Engine/Source/Runtime/SlateCore/Private/Fonts/FontCacheFreeType.cpp:445-455).
+        // to FT_New_Memory_Face — its stream (and every extracted frame, including the whole
+        // cmap and glyf tables) points straight into these bytes for the FT_Face's entire
+        // lifetime. The two are therefore inseparable: FontFace is move-only, the move
+        // transfers face+memory together, and the destructor closes the face. A copy would
+        // duplicate the buffer at a NEW address while the FT_Face kept reading the doomed
+        // original — exactly the vector-reallocation use-after-free that silently killed the
+        // weight-500 face (std::move_if_noexcept fell back to the copy constructor).
         std::vector<unsigned char> memory;
         int weight = 400;
         int current_pixel_size = 0;
@@ -437,7 +442,52 @@ struct PanoramaFontAtlas::Impl
             std::uint64_t last_use = 0;
         };
         std::unordered_map<int, MetricEntry> metrics;
+
+        FontFace() = default;
+        FontFace(const FontFace&) = delete;
+        FontFace& operator=(const FontFace&) = delete;
+        // unordered_map's move constructor is not noexcept (MSVC's allocates), which is what
+        // pushed vector reallocation onto the copy path in the first place — swap instead,
+        // which IS noexcept, so relocation is guaranteed to move.
+        FontFace(FontFace&& other) noexcept
+            : face(std::exchange(other.face, nullptr)),
+              path(std::move(other.path)),
+              identity(std::move(other.identity)),
+              memory(std::move(other.memory)),
+              weight(other.weight),
+              current_pixel_size(other.current_pixel_size)
+        {
+            metrics.swap(other.metrics);
+        }
+        FontFace& operator=(FontFace&& other) noexcept
+        {
+            if (this != &other)
+            {
+                if (face != nullptr)
+                {
+                    FT_Done_Face(face);
+                }
+                face = std::exchange(other.face, nullptr);
+                path = std::move(other.path);
+                identity = std::move(other.identity);
+                memory = std::move(other.memory);
+                weight = other.weight;
+                current_pixel_size = other.current_pixel_size;
+                metrics.clear();
+                metrics.swap(other.metrics);
+            }
+            return *this;
+        }
+        ~FontFace()
+        {
+            if (face != nullptr)
+            {
+                FT_Done_Face(face);
+            }
+        }
     };
+    static_assert(!std::is_copy_constructible_v<FontFace> && std::is_nothrow_move_constructible_v<FontFace>,
+        "FontFace lends its byte buffer to FreeType; it must never be copied and must relocate by move");
 
     FT_Library library = nullptr;
     float ui_scale = 1.0F;
@@ -506,14 +556,8 @@ struct PanoramaFontAtlas::Impl
     ~Impl()
     {
         release_texture();
-        for (FontFace& font : faces)
-        {
-            if (font.face != nullptr)
-            {
-                FT_Done_Face(font.face);
-                font.face = nullptr;
-            }
-        }
+        // FontFace's destructor closes each FT_Face; every face must be gone before the
+        // library they were opened against is shut down.
         faces.clear();
         if (library != nullptr)
         {
@@ -1337,7 +1381,11 @@ bool PanoramaFontAtlas::load(const PanoramaFontAtlasLoadOptions& options)
 
         font.face = face;
         impl_->faces.push_back(std::move(font));
-        pano_log_info("Panorama font atlas: loaded '{}' for weight {}", source.identity, weight);
+        // A face can open successfully yet be unusable (no charmap => every lookup returns
+        // glyph 0 and its text silently collapses) — surface glyph/charmap counts here so a
+        // dead face is visible at load instead of as blank labels later.
+        pano_log_info("Panorama font atlas: loaded '{}' for weight {} ({} glyphs, {} charmaps)",
+            source.identity, weight, static_cast<long>(face->num_glyphs), face->num_charmaps);
         return true;
     };
 

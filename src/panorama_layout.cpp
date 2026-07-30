@@ -1625,7 +1625,27 @@ PanoramaTextMeasure default_text_measure()
         // Metrics-free approximation: ~0.5em advance, 1.2em line height. Good
         // enough for deterministic layout; PanoramaFontAtlas provides a real
         // FreeType-backed measurer for pixel accuracy.
-        const float width = static_cast<float>(text.size()) * (font_size * 0.5F + letter_spacing);
+        std::size_t glyph_count = 0;
+        std::size_t offset = 0;
+        while (offset < text.size())
+        {
+            const unsigned char lead = static_cast<unsigned char>(text[offset++]);
+            const int extra = (lead & 0xE0U) == 0xC0U ? 1 :
+                (lead & 0xF0U) == 0xE0U ? 2 :
+                (lead & 0xF8U) == 0xF0U ? 3 : 0;
+            for (int i = 0; i < extra && offset < text.size(); ++i)
+            {
+                const unsigned char continuation = static_cast<unsigned char>(text[offset]);
+                if ((continuation & 0xC0U) != 0x80U)
+                {
+                    break;
+                }
+                ++offset;
+            }
+            ++glyph_count;
+        }
+        const float width =
+            static_cast<float>(glyph_count) * (font_size * 0.5F + letter_spacing);
         const float height = font_size * 1.2F;
         return std::pair<float, float>{width, height};
     };
@@ -1650,8 +1670,10 @@ PanoramaTextMeasure default_text_measure()
                 codepoint = (codepoint << 6U) | (continuation & 0x3FU);
                 ++offset;
             }
-            const float advance =
-                static_cast<float>(offset - begin) * (font_size * 0.5F + letter_spacing);
+            // The approximation is per glyph, not per encoded byte. Keeping
+            // this equal to measure() prevents a multi-byte UTF-8 codepoint
+            // from creating a gap before the next glyph at paint time.
+            const float advance = font_size * 0.5F + letter_spacing;
             glyphs.push_back({codepoint, begin, offset, advance, 0.0F});
         }
         return font_size * 1.2F;
