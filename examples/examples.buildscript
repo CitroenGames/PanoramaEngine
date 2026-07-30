@@ -319,7 +319,11 @@ intdir = ../build/obj/x64/Release/PanoramaExampleWindowD3D12
 [project:PanoramaExampleD3D12Snake]
 type = exe
 std = 20
-sources = 06_d3d12_snake/win32_main.cpp
+sources = {
+    06_d3d12_snake/win32_main.cpp
+    06_d3d12_snake/native_snake_world.cpp
+}
+headers = 06_d3d12_snake/native_snake_world.hpp
 includes = ../include, ..
 warning_level = Level4
 multiprocessor = true

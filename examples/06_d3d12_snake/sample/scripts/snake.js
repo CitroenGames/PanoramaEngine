@@ -1,5 +1,5 @@
-// Panorama is the GUI/controller bridge only. The host receives these actions
-// and updates the native game model; the JS never creates game-board panels.
+// This script is only the GUI/controller bridge. The host receives these
+// actions and updates the native model; JS never creates level or snake panels.
 function SnakeAction(action)
 {
     $.__host('snake', action);

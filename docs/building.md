@@ -114,7 +114,7 @@ host. See [../examples/README.md](../examples/README.md) for both window paths.
 | `PanoramaExampleScriptedUi` | `PanoramaView` high-level lifecycle + synthetic clicks mutating the DOM through QuickJS |
 | `PanoramaExampleWindowRaster` | Dirty-tracked `PanoramaView` updates, an optimized CPU rasterizer, and paced Win32/X11 presentation from XML on disk |
 | `PanoramaExampleWindowD3D12` | Win32 input, DXGI swap-chain ownership, D3D12 frame synchronization, the optional D3D12 adapter, and incremental geometry replay |
-| `PanoramaExampleD3D12Snake` | Native D3D12 game rendering followed by a transparent, interactive Panorama HUD pass |
+| `PanoramaExampleD3D12Snake` | Panorama-free native game/level code and D3D12 rendering followed by a transparent, interactive Panorama HUD pass |
 
 ## Tests
 

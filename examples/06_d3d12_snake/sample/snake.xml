@@ -7,8 +7,8 @@
     </scripts>
 
     <!--
-        Panorama owns this transparent HUD only. The board, food, and snake are
-        submitted by NativeSnakeRenderer through a separate D3D12 pipeline.
+        This document owns only the transparent HUD. The level, food, and snake
+        come from the separate native_snake world module and D3D12 pipeline.
     -->
     <Panel id="SnakeHud" class="snake-hud">
         <Panel id="TopHud" class="top-hud">

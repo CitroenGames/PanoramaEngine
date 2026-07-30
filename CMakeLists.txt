@@ -209,7 +209,7 @@ endif()
 
 if(PANORAMA_BUILD_EXAMPLES)
     function(panorama_add_console_example target source)
-        add_executable(${target} ${source})
+        add_executable(${target} ${source} ${ARGN})
         target_compile_features(${target} PRIVATE cxx_std_20)
         target_link_libraries(${target} PRIVATE PanoramaEngine::PanoramaEngine)
         if(MSVC)
@@ -249,7 +249,10 @@ if(PANORAMA_BUILD_EXAMPLES)
         target_compile_definitions(PanoramaExampleWindowD3D12 PRIVATE UNICODE _UNICODE)
         target_link_libraries(PanoramaExampleWindowD3D12 PRIVATE user32 dxgi d3d12 d3dcompiler)
 
-        panorama_add_console_example(PanoramaExampleD3D12Snake examples/06_d3d12_snake/win32_main.cpp)
+        panorama_add_console_example(
+            PanoramaExampleD3D12Snake
+            examples/06_d3d12_snake/win32_main.cpp
+            examples/06_d3d12_snake/native_snake_world.cpp)
         target_include_directories(PanoramaExampleD3D12Snake PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_compile_definitions(PanoramaExampleD3D12Snake PRIVATE UNICODE _UNICODE)
         target_link_libraries(PanoramaExampleD3D12Snake PRIVATE user32 dxgi d3d12 d3dcompiler)
