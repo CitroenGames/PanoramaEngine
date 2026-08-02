@@ -1385,17 +1385,33 @@ void resolve_node(PanoramaNode& node, const PanoramaTextMeasure& tm)
         return;
     }
 
-    // Panorama honours a flow child's `horizontal-align` ALONG a horizontal flow
-    // as an offset into the flow's LEFTOVER space: every child keeps its
-    // flow-order position, and centre/right-aligned children are additionally
-    // shifted by half/all of the unused row space. CS:GO's toolbars rely on it
-    // (the `horizontal-align-right` button group of a left-right-flow settings
-    // row sits at the row's right edge; the GO button centres its label panel
-    // inside a min-width flow-children:right button). The vertical counterpart
-    // is asymmetric in real Panorama: `vertical-align: bottom` on a down-flow
+    // Flow-axis alignment is asymmetric in real Panorama, on BOTH axes: the END
+    // alignment is an offset into the flow's leftover space, and CENTER is
+    // ignored outright.
+    //
+    // `horizontal-align: right` on a right-flow child keeps its flow-order
+    // position and is additionally shifted by the unused row space. CS:GO's
+    // toolbars rely on it — the `horizontal-align-right` utility class is
+    // applied to buttons in multi-child flow-children:right rows precisely to
+    // pin them to the row's right edge (friendslist's #PartyCancelBtn /
+    // #PartyLeaveBtn, crafting's #CraftItemBtn), and the loading screen's
+    // `.loading-screen__mapicon` sits at the right edge of its flow-right
+    // `.loading-screen-content__info-container`.
+    //
+    // `horizontal-align: center` is NOT an offset — it is a no-op along the
+    // flow. The shipped corpus settles it: whole toolbars of sibling
+    // RadioButtons carry a centred shared button class inside one flow-right
+    // row (controlslibrary's twelve #JsControl* tabs, friendslist's six
+    // #JsFriendsList-lobbies-toolbar-button-* tabs). A leftover offset would
+    // shift every one of them by the SAME half-row and stack them on top of
+    // each other instead of laying out the row. Same story on the loading
+    // screen, where `.loading-screen-hint__icon` must stay at its 20px inset
+    // ahead of the hint text rather than fly to the middle of the bar.
+    //
+    // The vertical counterpart matches: `vertical-align: bottom` on a down-flow
     // child IS a leftover offset (the HUD's #HudWeaponPanel/#HudWeaponSelection
     // pin to the bottom of the full-height flow-children:down #HudBottomRight)
-    // — applied AFTER the children resolve, see below — but `vertical-align:
+    // — applied AFTER the children resolve, see below — while `vertical-align:
     // center` is IGNORED (CS:GO's content-navbar--dropdown row and the play
     // menu's presets title sit at the top of their height:100% columns in the
     // real client despite their stray `vertical-align: center`).
@@ -1414,9 +1430,7 @@ void resolve_node(PanoramaNode& node, const PanoramaTextMeasure& tm)
         }
         main_leftover = std::max(0.0F, cw - flow_total);
     }
-    const auto main_align_offset = [main_leftover](bool center, bool end) {
-        return center ? main_leftover * 0.5F : (end ? main_leftover : 0.0F);
-    };
+    const auto main_align_offset = [main_leftover](bool end) { return end ? main_leftover : 0.0F; };
 
     float pen_x = flow == PanoramaFlow::Left ? box.content_x + cw : box.content_x;
     float pen_y = flow == PanoramaFlow::Up ? box.content_y + ch : box.content_y;
@@ -1443,7 +1457,7 @@ void resolve_node(PanoramaNode& node, const PanoramaTextMeasure& tm)
             {
                 x = pen_x + cs.margin.left;
                 pen_x = x + w + cs.margin.right;
-                x += main_align_offset(cs.halign == PanoramaHAlign::Center, cs.halign == PanoramaHAlign::Right);
+                x += main_align_offset(cs.halign == PanoramaHAlign::Right);
             }
             y = box.content_y + aligned_offset_v(cs.valign, ch, h, cs.margin.top, cs.margin.bottom);
         }
